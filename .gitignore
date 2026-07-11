@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+.DS_Store
+.agents/
+.codex/
+
+# Large or private datasets are never committed.
+data/*.csv
+data/*.parquet
+data/*.zip
+!data/.gitkeep
+
+# Local training runs; the reproducible demo report is explicitly unignored.
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/demo/
+!artifacts/demo/metrics.json
+!artifacts/demo/metadata.json
+!artifacts/demo/report.md
+!artifacts/demo/model_bundle.joblib

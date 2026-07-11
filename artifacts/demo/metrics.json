@@ -1,0 +1,17 @@
+{
+  "on_time": {
+    "accuracy_at_0_5": 0.6558333333333334,
+    "baseline_brier_score": 0.23745891794217688,
+    "brier_score": 0.22359468001130428,
+    "log_loss": 0.6397758979390878,
+    "roc_auc": 0.6287383033780635
+  },
+  "price": {
+    "baseline_mae_usd": 112.57075555555556,
+    "interval_80_empirical_coverage": 0.7822222222222223,
+    "interval_80_mean_width_usd": 86.04413791739054,
+    "mae_usd": 31.354145857953885,
+    "r2": 0.9309688278675164,
+    "rmse_usd": 48.807468201034744
+  }
+}

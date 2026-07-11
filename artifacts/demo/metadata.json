@@ -1,0 +1,38 @@
+{
+  "artifact_schema_version": 1,
+  "data_fingerprints": {
+    "on_time_sha256": "3985ed267c51f366bdc0976958431cb5ec3d317b5e3e40a3808dff7e52536946",
+    "price_sha256": "c86ca74db50f41e9a6b6d22ca6182d7f1ef016ddb882d68cd3789e3851afdefe"
+  },
+  "data_mode": "synthetic_demo",
+  "data_time_ranges": {
+    "on_time": {
+      "end": "2025-09-26T20:00:00+00:00",
+      "start": "2023-01-01T05:00:00+00:00"
+    },
+    "price": {
+      "end": "2025-09-26T22:00:00+00:00",
+      "start": "2023-01-01T04:00:00+00:00"
+    }
+  },
+  "model_version": "0.1.0",
+  "random_state": 42,
+  "row_counts": {
+    "on_time": 8000,
+    "price": 6000
+  },
+  "runtime": {
+    "pandas": "3.0.3",
+    "python": "3.12.13",
+    "scikit_learn": "1.9.0"
+  },
+  "target_definitions": {
+    "on_time": "not cancelled and arrival delay below 15 minutes",
+    "price": "USD fare estimate conditional on itinerary and booking lead time"
+  },
+  "test_row_counts": {
+    "on_time": 1200,
+    "price": 900
+  },
+  "trained_at_utc": "2026-07-11T18:57:20.660853+00:00"
+}
