@@ -8,6 +8,7 @@ still possible when a free service is unavailable or has exhausted its quota.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -22,6 +23,9 @@ CACHE_TTL_SECONDS = 300.0
 MAX_CACHE_ENTRIES = 512
 MAX_JSON_RESPONSE_BYTES = 5_000_000
 NOAA_MAX_LEAD_HOURS = 30
+CURRENT_WEATHER_MAX_LEAD_HOURS = 2
+CURRENT_WEATHER_MAX_AGE_MINUTES = 90
+METAR_MAX_AGE_HOURS = 2
 CURRENT_OPERATIONS_MAX_LEAD_HOURS = 6
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -50,7 +54,23 @@ def _utc(value: datetime) -> datetime:
 def _parse_datetime(value: Any) -> datetime | None:
     if not value:
         return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        try:
+            return datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
     text = str(value).strip()
+    if re.fullmatch(r"\d{9,13}(?:\.\d+)?", text):
+        timestamp = float(text)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        try:
+            return datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
     formats = ("%Y%m%dT%H%M%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ")
     for date_format in formats:
         try:
@@ -134,6 +154,8 @@ class _UrllibResponse:
             raise RuntimeError(f"HTTP {self.status_code}")
 
     def json(self) -> Any:
+        if not self._body:
+            return []
         return json.loads(self._body.decode("utf-8"))
 
 
@@ -179,6 +201,7 @@ class ContextProvider:
         self.context_priors = context_priors or {}
         self._cache: dict[tuple[Any, ...], tuple[float, PredictionContext]] = {}
         self._route_cache: dict[tuple[str, str], tuple[float, set[str] | None]] = {}
+        self._noaa_cache: dict[tuple[str, str], tuple[float, Any]] = {}
         self._cache_lock = threading.Lock()
 
     def resolve(
@@ -301,95 +324,301 @@ class ContextProvider:
         icao: str | None,
         fetched_at: datetime,
     ) -> WeatherSignal:
+        open_meteo: WeatherSignal | None = None
         try:
-            payload = self._get_json(
-                OPEN_METEO_URL,
-                {
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "hourly": (
-                        "temperature_2m,weather_code,wind_speed_10m,"
-                        "wind_gusts_10m,precipitation_probability,visibility"
-                    ),
-                    "timezone": "UTC",
-                    "forecast_days": 16,
-                },
-            )
-            hourly = payload.get("hourly") if isinstance(payload, dict) else None
-            if not isinstance(hourly, dict):
-                raise LookupError("Open-Meteo hourly data missing")
-            times = hourly.get("time")
-            if not isinstance(times, list) or not times:
-                raise LookupError("Open-Meteo forecast times missing")
-            parsed_times = [_parse_datetime(value) for value in times]
-            choices = [(index, value) for index, value in enumerate(parsed_times) if value]
-            if not choices:
-                raise LookupError("Open-Meteo forecast times invalid")
-            index, forecast_time = min(choices, key=lambda item: abs(item[1] - departure))
-            if abs(forecast_time - departure) > timedelta(hours=2):
-                raise LookupError("Departure is outside the available forecast horizon")
-
-            weather_code = self._hourly_value(hourly, "weather_code", index, 0)
-            wind = self._hourly_value(hourly, "wind_speed_10m", index, 0)
-            gust = self._hourly_value(hourly, "wind_gusts_10m", index, wind)
-            precipitation = self._hourly_value(
-                hourly, "precipitation_probability", index, 0
-            )
-            visibility = self._hourly_value(hourly, "visibility", index, 10_000)
-            severity = max(
-                self._weather_code_risk(weather_code),
-                _bounded(float(wind) / 100),
-                _bounded(float(gust) / 130),
-                _bounded(float(precipitation) / 100 * 0.7),
-                _bounded((10_000 - float(visibility)) / 10_000),
-            )
-            source = "open_meteo"
-            lead = departure - fetched_at
-            if icao and timedelta(hours=-2) <= lead <= timedelta(
-                hours=NOAA_MAX_LEAD_HOURS
-            ):
-                noaa_risk = self._noaa_risk(
-                    icao,
-                    include_metar=lead <= timedelta(hours=2),
-                )
-                if noaa_risk is not None:
-                    severity = max(severity, noaa_risk)
-                    source = "open_meteo+noaa_aviation_weather"
-            return WeatherSignal(
-                severity,
-                "forecast",
-                source,
-                forecast_time,
-                f"自动天气风险 {severity:.0%}；阵风约 {float(gust):.0f} km/h。",
-                f"Automatic weather risk {severity:.0%}; gusts about {float(gust):.0f} km/h.",
+            open_meteo = self._open_meteo_weather(
+                departure,
+                latitude,
+                longitude,
+                fetched_at,
             )
         except Exception:
-            return self._weather_prior(departure, latitude, fetched_at)
+            pass
 
-    def _noaa_risk(self, icao: str, *, include_metar: bool) -> float | None:
-        risks: list[float] = []
-        urls = (NOAA_TAF_URL, NOAA_METAR_URL) if include_metar else (NOAA_TAF_URL,)
-        for url in urls:
+        lead = departure - fetched_at
+        aviation: WeatherSignal | None = None
+        if icao and timedelta(hours=-2) <= lead <= timedelta(hours=NOAA_MAX_LEAD_HOURS):
+            aviation = self._noaa_weather(
+                icao,
+                departure,
+                fetched_at,
+                include_metar=lead <= timedelta(hours=CURRENT_WEATHER_MAX_LEAD_HOURS),
+            )
+
+        if open_meteo and aviation:
+            severity = max(open_meteo.value, aviation.value)
+            status = "live" if "live" in {open_meteo.status, aviation.status} else "forecast"
+            return WeatherSignal(
+                severity,
+                status,
+                f"{open_meteo.source}+{aviation.source}",
+                max(open_meteo.observed_at, aviation.observed_at),
+                (
+                    f"{open_meteo.summary_zh.rstrip('。')}；已结合 NOAA 航空气象，"
+                    f"综合风险 {severity:.0%}。"
+                ),
+                (
+                    f"{open_meteo.summary_en.rstrip('.')}; combined with NOAA aviation "
+                    f"weather, the overall risk is {severity:.0%}."
+                ),
+            )
+        if open_meteo:
+            return open_meteo
+        if aviation:
+            return aviation
+        return self._weather_prior(departure, latitude, fetched_at)
+
+    def _open_meteo_weather(
+        self,
+        departure: datetime,
+        latitude: float,
+        longitude: float,
+        fetched_at: datetime,
+    ) -> WeatherSignal:
+        payload = self._get_json(
+            OPEN_METEO_URL,
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "current": (
+                    "temperature_2m,weather_code,wind_speed_10m,"
+                    "wind_gusts_10m,precipitation,visibility"
+                ),
+                "hourly": (
+                    "temperature_2m,weather_code,wind_speed_10m,"
+                    "wind_gusts_10m,precipitation_probability,visibility"
+                ),
+                "timezone": "UTC",
+                "forecast_days": 16,
+            },
+        )
+        if not isinstance(payload, dict):
+            raise LookupError("Open-Meteo response is not an object")
+
+        lead = departure - fetched_at
+        if timedelta(hours=-2) <= lead <= timedelta(
+            hours=CURRENT_WEATHER_MAX_LEAD_HOURS
+        ):
+            current_signal = self._open_meteo_current(payload, fetched_at)
+            if current_signal is not None:
+                return current_signal
+
+        hourly = payload.get("hourly")
+        if not isinstance(hourly, dict):
+            raise LookupError("Open-Meteo hourly data missing")
+        times = hourly.get("time")
+        if not isinstance(times, list) or not times:
+            raise LookupError("Open-Meteo forecast times missing")
+        parsed_times = [_parse_datetime(value) for value in times]
+        choices = [(index, value) for index, value in enumerate(parsed_times) if value]
+        if not choices:
+            raise LookupError("Open-Meteo forecast times invalid")
+        index, forecast_time = min(choices, key=lambda item: abs(item[1] - departure))
+        if abs(forecast_time - departure) > timedelta(hours=2):
+            raise LookupError("Departure is outside the available forecast horizon")
+
+        weather_code = self._hourly_value(hourly, "weather_code", index, 0)
+        wind = self._hourly_value(hourly, "wind_speed_10m", index, 0)
+        gust = self._hourly_value(hourly, "wind_gusts_10m", index, wind)
+        precipitation = self._hourly_value(
+            hourly,
+            "precipitation_probability",
+            index,
+            0,
+        )
+        visibility = self._hourly_value(hourly, "visibility", index, 10_000)
+        temperature = self._hourly_value(hourly, "temperature_2m", index, None)
+        severity = self._weather_severity(
+            weather_code,
+            wind,
+            gust,
+            precipitation,
+            visibility,
+            precipitation_is_probability=True,
+        )
+        temperature_zh, temperature_en = self._temperature_fragments(temperature)
+        return WeatherSignal(
+            severity,
+            "forecast",
+            "open_meteo_forecast",
+            forecast_time,
+            (
+                f"出发时段 Open-Meteo 预报风险 {severity:.0%}{temperature_zh}；"
+                f"阵风约 {self._number(gust):.0f} km/h。"
+            ),
+            (
+                f"Open-Meteo departure-time forecast risk {severity:.0%}{temperature_en}; "
+                f"gusts about {self._number(gust):.0f} km/h."
+            ),
+        )
+
+    def _open_meteo_current(
+        self,
+        payload: dict[str, Any],
+        fetched_at: datetime,
+    ) -> WeatherSignal | None:
+        current = payload.get("current")
+        if not isinstance(current, dict):
+            return None
+        observed_at = _parse_datetime(current.get("time"))
+        if observed_at is None:
+            return None
+        age = fetched_at - observed_at
+        if not timedelta(minutes=-15) <= age <= timedelta(
+            minutes=CURRENT_WEATHER_MAX_AGE_MINUTES
+        ):
+            return None
+
+        weather_code = self._optional_number(current.get("weather_code"))
+        wind = self._optional_number(current.get("wind_speed_10m"))
+        gust = self._optional_number(current.get("wind_gusts_10m"))
+        if weather_code is None or wind is None or gust is None:
+            return None
+        precipitation = current.get("precipitation", 0)
+        visibility = current.get("visibility", 10_000)
+        if visibility is None:
+            visibility = 10_000
+        temperature = current.get("temperature_2m")
+        severity = self._weather_severity(
+            weather_code,
+            wind,
+            gust,
+            precipitation,
+            visibility,
+            precipitation_is_probability=False,
+        )
+        temperature_zh, temperature_en = self._temperature_fragments(temperature)
+        return WeatherSignal(
+            severity,
+            "live",
+            "open_meteo_current_model",
+            observed_at,
+            (
+                f"Open-Meteo 15 分钟模型当前天气风险 {severity:.0%}{temperature_zh}；"
+                f"阵风约 {self._number(gust):.0f} km/h。"
+            ),
+            (
+                f"Open-Meteo 15-minute model current-weather risk {severity:.0%}"
+                f"{temperature_en}; gusts about {self._number(gust):.0f} km/h."
+            ),
+        )
+
+    def _noaa_weather(
+        self,
+        icao: str,
+        departure: datetime,
+        fetched_at: datetime,
+        *,
+        include_metar: bool,
+    ) -> WeatherSignal | None:
+        signals: list[WeatherSignal] = []
+        taf = self._noaa_product_signal(NOAA_TAF_URL, icao, departure, fetched_at)
+        if taf is not None:
+            signals.append(taf)
+        if include_metar:
+            metar = self._noaa_product_signal(NOAA_METAR_URL, icao, departure, fetched_at)
+            if metar is not None:
+                signals.append(metar)
+        if not signals:
+            return None
+
+        severity = max(signal.value for signal in signals)
+        status = "live" if any(signal.status == "live" for signal in signals) else "forecast"
+        source = "+".join(signal.source for signal in signals)
+        observed_at = max(signal.observed_at for signal in signals)
+        products_zh = "METAR 机场实况与 TAF 航站预报" if len(signals) > 1 else (
+            "METAR 机场实况" if signals[0].source == "noaa_metar" else "TAF 航站预报"
+        )
+        products_en = "METAR observation and TAF forecast" if len(signals) > 1 else (
+            "METAR airport observation"
+            if signals[0].source == "noaa_metar"
+            else "TAF terminal forecast"
+        )
+        return WeatherSignal(
+            severity,
+            status,
+            source,
+            observed_at,
+            f"NOAA {products_zh}风险 {severity:.0%}。",
+            f"NOAA {products_en} risk {severity:.0%}.",
+        )
+
+    def _noaa_product_signal(
+        self,
+        url: str,
+        icao: str,
+        departure: datetime,
+        fetched_at: datetime,
+    ) -> WeatherSignal | None:
+        cache_key = (url, icao)
+        found, payload = self._cache_get(self._noaa_cache, cache_key)
+        if not found:
             try:
                 payload = self._get_json(url, {"ids": icao, "format": "json"})
-                rows = payload if isinstance(payload, list) else payload.get("data", [])
-                if not isinstance(rows, list) or not rows:
-                    continue
-                raw = " ".join(
-                    str(
-                        row.get("rawTAF")
-                        or row.get("rawOb")
-                        or row.get("raw_text")
-                        or row.get("raw")
-                        or ""
-                    )
-                    for row in rows
-                    if isinstance(row, dict)
-                ).upper()
-                risks.append(self._aviation_weather_text_risk(raw))
             except Exception:
+                payload = None
+            self._cache_set(self._noaa_cache, cache_key, payload)
+        rows = payload if isinstance(payload, list) else (
+            payload.get("data", []) if isinstance(payload, dict) else []
+        )
+        if not isinstance(rows, list):
+            return None
+
+        candidates: list[tuple[float, datetime]] = []
+        for row in rows:
+            if not isinstance(row, dict):
                 continue
-        return max(risks) if risks else None
+            if url == NOAA_METAR_URL:
+                observed_at = self._first_datetime(
+                    row,
+                    "obsTime",
+                    "reportTime",
+                    "receiptTime",
+                )
+                if observed_at is None:
+                    continue
+                age = fetched_at - observed_at
+                if not timedelta(minutes=-15) <= age <= timedelta(hours=METAR_MAX_AGE_HOURS):
+                    continue
+                raw = row.get("rawOb") or row.get("raw_text") or row.get("raw") or ""
+                risk = self._aviation_structured_risk(row, weather_text=str(raw))
+            else:
+                observed_at = self._first_datetime(
+                    row,
+                    "issueTime",
+                    "bulletinTime",
+                    "dbPopTime",
+                )
+                if observed_at is None or fetched_at - observed_at > timedelta(hours=24):
+                    continue
+                if observed_at - fetched_at > timedelta(hours=1):
+                    continue
+                valid_from = self._first_datetime(row, "validTimeFrom")
+                valid_to = self._first_datetime(row, "validTimeTo")
+                if valid_from is not None and departure < valid_from:
+                    continue
+                if valid_to is not None and departure > valid_to:
+                    continue
+                forecasts = row.get("fcsts")
+                if not isinstance(forecasts, list):
+                    continue
+                overlapping = [
+                    forecast
+                    for forecast in forecasts
+                    if isinstance(forecast, dict)
+                    and self._forecast_covers(forecast, departure)
+                ]
+                if not overlapping:
+                    continue
+                risk = max(self._aviation_structured_risk(forecast) for forecast in overlapping)
+            candidates.append((risk, observed_at))
+        if not candidates:
+            return None
+
+        risk, observed_at = max(candidates, key=lambda candidate: candidate[0])
+        source = "noaa_metar" if url == NOAA_METAR_URL else "noaa_taf"
+        status = "live" if source == "noaa_metar" else "forecast"
+        return WeatherSignal(risk, status, source, observed_at, "", "")
 
     def _operations(
         self,
@@ -678,6 +907,48 @@ class ContextProvider:
             return default
         return values[index]
 
+    @classmethod
+    def _weather_severity(
+        cls,
+        weather_code: Any,
+        wind: Any,
+        gust: Any,
+        precipitation: Any,
+        visibility: Any,
+        *,
+        precipitation_is_probability: bool,
+    ) -> float:
+        precipitation_value = cls._number(precipitation)
+        if precipitation_is_probability:
+            precipitation_risk = _bounded(precipitation_value / 100 * 0.7)
+        else:
+            precipitation_risk = _bounded(precipitation_value / 10 * 0.7)
+        return max(
+            cls._weather_code_risk(weather_code),
+            _bounded(cls._number(wind) / 100),
+            _bounded(cls._number(gust) / 130),
+            precipitation_risk,
+            _bounded((10_000 - cls._number(visibility)) / 10_000),
+        )
+
+    @classmethod
+    def _temperature_fragments(cls, value: Any) -> tuple[str, str]:
+        if value is None:
+            return "", ""
+        try:
+            temperature = float(value)
+        except (TypeError, ValueError):
+            return "", ""
+        return f"；气温约 {temperature:.0f}°C", f"; temperature about {temperature:.0f}°C"
+
+    @staticmethod
+    def _first_datetime(row: dict[str, Any], *fields: str) -> datetime | None:
+        for field in fields:
+            parsed = _parse_datetime(row.get(field))
+            if parsed is not None:
+                return parsed
+        return None
+
     @staticmethod
     def _weather_code_risk(code: Any) -> float:
         code_number = int(ContextProvider._number(code))
@@ -692,6 +963,90 @@ class ContextProvider:
         if code_number in {51, 53, 56, 61, 80}:
             return 0.32
         return 0.08 if code_number in {1, 2, 3} else 0.03
+
+    @staticmethod
+    def _forecast_covers(forecast: dict[str, Any], departure: datetime) -> bool:
+        time_from = _parse_datetime(forecast.get("timeFrom"))
+        time_to = _parse_datetime(forecast.get("timeTo"))
+        return bool(time_from and time_to and time_from <= departure < time_to)
+
+    @classmethod
+    def _aviation_structured_risk(
+        cls,
+        row: dict[str, Any],
+        *,
+        weather_text: str = "",
+    ) -> float:
+        text = " ".join(
+            value
+            for value in (
+                weather_text,
+                str(row.get("wxString") or ""),
+                str(row.get("notDecoded") or ""),
+            )
+            if value
+        )
+        risks = [cls._aviation_weather_text_risk(text.upper())]
+
+        wind = cls._optional_number(row.get("wspd"))
+        gust = cls._optional_number(row.get("wgst"))
+        if wind is not None:
+            risks.append(_bounded(wind * 1.852 / 100))
+        if gust is not None:
+            risks.append(_bounded(gust * 1.852 / 130))
+
+        visibility = cls._visibility_meters(row.get("visib"))
+        if visibility is not None:
+            risks.append(_bounded((10_000 - visibility) / 10_000))
+
+        flight_category = str(row.get("fltCat") or "").upper()
+        risks.append({"LIFR": 0.95, "IFR": 0.75, "MVFR": 0.45}.get(flight_category, 0.0))
+
+        ceiling_values: list[float] = []
+        vertical_visibility = cls._optional_number(row.get("vertVis"))
+        if vertical_visibility is not None:
+            ceiling_values.append(vertical_visibility)
+        clouds = row.get("clouds")
+        if isinstance(clouds, list):
+            for cloud in clouds:
+                if not isinstance(cloud, dict):
+                    continue
+                if str(cloud.get("cover") or "").upper() not in {"BKN", "OVC", "VV"}:
+                    continue
+                base = cls._optional_number(cloud.get("base"))
+                if base is not None:
+                    ceiling_values.append(base)
+        if ceiling_values:
+            ceiling = min(ceiling_values)
+            if ceiling <= 200:
+                risks.append(0.95)
+            elif ceiling <= 500:
+                risks.append(0.8)
+            elif ceiling <= 1_000:
+                risks.append(0.6)
+            elif ceiling <= 3_000:
+                risks.append(0.3)
+        return max(risks)
+
+    @staticmethod
+    def _visibility_meters(value: Any) -> float | None:
+        if value is None:
+            return None
+        text = str(value).strip().upper().removesuffix("SM")
+        text = text.replace("+", "").lstrip("PM")
+        if not text:
+            return None
+        miles = 0.0
+        try:
+            for part in text.split():
+                if "/" in part:
+                    numerator, denominator = part.split("/", maxsplit=1)
+                    miles += float(numerator) / float(denominator)
+                else:
+                    miles += float(part)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+        return max(0.0, miles * 1_609.344)
 
     @staticmethod
     def _aviation_weather_text_risk(text: str) -> float:
@@ -734,6 +1089,16 @@ class ContextProvider:
             return float(value or 0)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _optional_number(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
 
     @staticmethod
     def _airport_code(value: Any) -> str:

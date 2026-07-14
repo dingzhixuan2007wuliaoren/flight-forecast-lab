@@ -8,7 +8,7 @@ substituted for a live bookable fare.
 
 | Signal | Preferred source | Fallback | Meaning in the response |
 | --- | --- | --- | --- |
-| Weather | NOAA Aviation Weather and/or Open-Meteo forecast | Clearly labelled synthetic month/latitude prior | `forecast` or `proxy` |
+| Weather | Open-Meteo current/forecast plus NOAA METAR/TAF | Clearly labelled synthetic month/latitude prior | `live`, `forecast`, or `proxy` |
 | Airport operations | AirLabs schedules or ADSB.lol near the departure time | Clearly labelled synthetic airport/time prior | `live` or `proxy` |
 | Disruption news | GDELT DOC 2.0 articles from the recent seven-day window | Neutral value with no articles | `live` or `neutral` |
 | Route airlines | AirLabs route records when a key is configured | Global connecting model-scenario catalog | `provider_confirmed` or `model_scenario` |
@@ -17,7 +17,17 @@ The service catches provider timeouts, malformed payloads, quota exhaustion, and
 It then returns a labelled fallback rather than failing the whole prediction. Set
 `EXTERNAL_CONTEXT_ENABLED=0` for deterministic offline development.
 
-NOAA TAF is only blended within 30 hours of departure, and current METAR within two hours. Current AirLabs schedules and
+Within two hours of departure, the service uses fresh Open-Meteo current model conditions and
+can blend NOAA METAR airport observations with TAF. From two to 30 hours it blends the
+departure-hour Open-Meteo forecast with TAF; after that, it uses Open-Meteo hourly forecasts up
+to the provider's 16-day limit. Open-Meteo current conditions are based on 15-minute model data,
+not an airport sensor observation. If Open-Meteo is unavailable near departure, a fresh METAR
+can now serve as the independent `live` fallback. NOAA responses are cached for five minutes to
+stay below the provider's per-thread frequency guidance. TAF risk is calculated only from decoded
+forecast segments that cover the requested departure time; METAR risk also reads structured wind,
+gust, visibility, flight category, and ceiling fields rather than relying on weather keywords alone.
+
+Current AirLabs schedules and
 ADSB.lol density are only used within six hours; later departures receive `proxy` averages
 computed from training rows only (the demo source is `synthetic_demo_training_average`).
 The demo has no validated historical aggregate, so it never labels those hand-built priors as
@@ -74,6 +84,7 @@ usually differ, later criteria most often act as tie-breakers.
 
 - [NOAA Aviation Weather Data API](https://aviationweather.gov/data/api/)
 - [Open-Meteo forecast API](https://open-meteo.com/en/docs)
+- [Open-Meteo free API terms and attribution](https://open-meteo.com/en/terms)
 - [AirLabs schedules API](https://airlabs.co/docs/schedules)
 - [ADSB.lol public API](https://api.adsb.lol/)
 - [GDELT DOC 2.0 API](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/)

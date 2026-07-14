@@ -16,7 +16,7 @@ Flight Forecast Lab is a reproducible two-model project for comparing **estimate
 - 60 家全球主要航司及其可比较舱位场景；配置 AirLabs 免费密钥后，优先使用其返回的航线航司。
 - 三类完整排序：直飞优先、低价优先、学生友好优先。
 - 学生友好排序严格采用：最低价格 → 已确认免费托运行李 → 已确认实际学生折扣 → 已确认免费改签/退票 → 年龄与验证要求。
-- Open-Meteo 与 NOAA 航空气象、AirLabs 或 ADSB.lol 机场运行信号、GDELT 近期新闻信号。
+- 无需密钥的 Open-Meteo 当前天气/小时预报与 NOAA METAR/TAF 航空气象；另结合 AirLabs 或 ADSB.lol 机场运行信号、GDELT 近期新闻信号。
 - 外部服务超时、无数据或额度不足时，自动使用明确标注的历史/模型平均值或中性新闻值。
 - FastAPI、OpenAPI 文档、CLI 训练入口、时间切分评估和自动测试。
 
@@ -26,12 +26,16 @@ The UI always labels external context as `live`, `forecast`, `proxy`, `historica
 
 | 数据 | 默认来源 | 无法获取时 |
 | --- | --- | --- |
-| 天气 | Open-Meteo；30 小时内可结合 NOAA TAF，2 小时内还可结合 METAR | 明确标记的合成训练集同月平均值 |
+| 天气 | 2 小时内使用 Open-Meteo 当前模型天气并结合 NOAA METAR/TAF；2–30 小时结合小时预报与 TAF；其后至 16 天使用 Open-Meteo 小时预报 | 明确标记的合成训练集同月平均值 |
 | 机场运行 | 出发前 6 小时内使用 AirLabs 或 ADSB.lol 当前信号 | 明确标记的合成训练集机场平均值 |
 | 时事新闻 | GDELT DOC 2.0 最近 7 天相关中断新闻 | 中性值，不生成新闻 |
 | 航线航司 | 配置密钥时使用 AirLabs routes | 60 家全球模型比较目录 |
 
-AirLabs 密钥是可选项。没有任何密钥时项目仍可运行。免费额度、覆盖和条款可能变化，公开部署前应重新检查来源要求，详见 [运行时数据与回退](docs/runtime-context.md)。
+AirLabs 密钥是可选项。没有任何密钥时项目仍可运行。Open-Meteo 公共免费端点限非商业用途并采用 CC BY 4.0；免费额度、覆盖和条款可能变化，公开部署前应重新检查[官方条款](https://open-meteo.com/en/terms)与其他来源要求，详见 [运行时数据与回退](docs/runtime-context.md)。
+
+Open-Meteo 的“当前天气”来自约 15 分钟分辨率的天气模型，并非机场传感器实测；NOAA METAR 才是机场观测。页面会分别标记 `open_meteo_current_model`、`noaa_metar`、`forecast`、`live` 或 `proxy`，不会把远期历史平均值冒充实时天气。
+
+Open-Meteo current conditions are model-derived at roughly 15-minute resolution, while NOAA METAR provides airport observations. Departures beyond the free forecast horizon keep using the clearly labelled training-average fallback rather than today's weather.
 
 ## 快速运行 / Quick start
 

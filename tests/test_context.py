@@ -62,8 +62,13 @@ class FailingClient:
         raise TimeoutError("provider unavailable")
 
 
-def _open_meteo_payload(departure: datetime, weather_code: int = 1) -> dict[str, Any]:
-    return {
+def _open_meteo_payload(
+    departure: datetime,
+    weather_code: int = 1,
+    *,
+    current_time: datetime | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "hourly": {
             "time": [departure.replace(tzinfo=None).isoformat(timespec="minutes")],
             "temperature_2m": [21],
@@ -74,6 +79,17 @@ def _open_meteo_payload(departure: datetime, weather_code: int = 1) -> dict[str,
             "visibility": [10_000],
         }
     }
+    if current_time is not None:
+        payload["current"] = {
+            "time": current_time.replace(tzinfo=None).isoformat(timespec="minutes"),
+            "temperature_2m": 19,
+            "weather_code": weather_code,
+            "wind_speed_10m": 18,
+            "wind_gusts_10m": 30,
+            "precipitation": 0.2,
+            "visibility": 10_000,
+        }
+    return payload
 
 
 @pytest.fixture(autouse=True)
@@ -119,7 +135,7 @@ def test_live_weather_proxy_operations_and_news_scoring() -> None:
     )
 
     assert context.weather.status == "forecast"
-    assert context.weather.source == "open_meteo"
+    assert context.weather.source == "open_meteo_forecast"
     assert context.weather.value == pytest.approx(0.92)
     assert context.operations.status == "proxy"
     assert context.operations.source == "adsb_lol"
@@ -173,13 +189,36 @@ def test_airlabs_schedules_and_route_airline_cache() -> None:
 
 
 def test_noaa_aviation_weather_supplements_open_meteo() -> None:
-    departure = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    now = datetime.now(UTC)
+    departure = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     adsb_url = ADSB_LOL_URL.format(latitude=40.6413, longitude=-73.7781)
     client = FakeClient(
         {
             OPEN_METEO_URL: _open_meteo_payload(departure),
-            NOAA_TAF_URL: [{"rawTAF": "KJFK 141700Z 1418/1524 +TSRA BKN015"}],
-            NOAA_METAR_URL: [{"rawOb": "KJFK 141651Z 20010KT 10SM FEW020"}],
+            NOAA_TAF_URL: [
+                {
+                    "rawTAF": "KJFK 141700Z 1418/1524 +TSRA BKN015",
+                    "issueTime": now.isoformat(),
+                    "validTimeFrom": int((now - timedelta(hours=1)).timestamp()),
+                    "validTimeTo": int((now + timedelta(hours=30)).timestamp()),
+                    "fcsts": [
+                        {
+                            "timeFrom": int((now - timedelta(hours=1)).timestamp()),
+                            "timeTo": int((now + timedelta(hours=30)).timestamp()),
+                            "wxString": "+TSRA",
+                            "wspd": 10,
+                            "visib": "6+",
+                            "clouds": [{"cover": "BKN", "base": 1_500}],
+                        }
+                    ],
+                }
+            ],
+            NOAA_METAR_URL: [
+                {
+                    "rawOb": "KJFK 141651Z 20010KT 10SM FEW020",
+                    "obsTime": int(now.timestamp()),
+                }
+            ],
             adsb_url: {"ac": []},
             GDELT_DOC_URL: {"articles": []},
         }
@@ -189,16 +228,35 @@ def test_noaa_aviation_weather_supplements_open_meteo() -> None:
         "JFK", "LAX", departure, 40.6413, -73.7781, icao_code="KJFK"
     )
 
-    assert context.weather.source == "open_meteo+noaa_aviation_weather"
+    assert context.weather.status == "live"
+    assert context.weather.source == "open_meteo_forecast+noaa_taf+noaa_metar"
     assert context.weather.value == pytest.approx(0.95)
 
 
 def test_taf_but_not_current_metar_is_used_for_later_same_day() -> None:
-    departure = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=12)
+    now = datetime.now(UTC)
+    departure = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=12)
     client = FakeClient(
         {
             OPEN_METEO_URL: _open_meteo_payload(departure),
-            NOAA_TAF_URL: [{"rawTAF": "KJFK 141700Z 1418/1524 TSRA BKN015"}],
+            NOAA_TAF_URL: [
+                {
+                    "rawTAF": "KJFK 141700Z 1418/1524 TSRA BKN015",
+                    "issueTime": now.isoformat(),
+                    "validTimeFrom": int((now - timedelta(hours=1)).timestamp()),
+                    "validTimeTo": int((now + timedelta(hours=30)).timestamp()),
+                    "fcsts": [
+                        {
+                            "timeFrom": int((now - timedelta(hours=1)).timestamp()),
+                            "timeTo": int((now + timedelta(hours=30)).timestamp()),
+                            "wxString": "TSRA",
+                            "wspd": 10,
+                            "visib": "6+",
+                            "clouds": [{"cover": "BKN", "base": 1_500}],
+                        }
+                    ],
+                }
+            ],
             GDELT_DOC_URL: {"articles": []},
         }
     )
@@ -208,9 +266,230 @@ def test_taf_but_not_current_metar_is_used_for_later_same_day() -> None:
     )
 
     called_urls = {url for url, _, _ in client.calls}
-    assert context.weather.source == "open_meteo+noaa_aviation_weather"
+    assert context.weather.source == "open_meteo_forecast+noaa_taf"
     assert NOAA_TAF_URL in called_urls
     assert NOAA_METAR_URL not in called_urls
+
+
+def test_near_departure_uses_fresh_open_meteo_current_conditions() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    adsb_url = ADSB_LOL_URL.format(latitude=40.6413, longitude=-73.7781)
+    client = FakeClient(
+        {
+            OPEN_METEO_URL: _open_meteo_payload(
+                departure,
+                weather_code=95,
+                current_time=now,
+            ),
+            adsb_url: {"ac": []},
+            GDELT_DOC_URL: {"articles": []},
+        }
+    )
+
+    context = ContextProvider(client=client).resolve(
+        "JFK",
+        "LAX",
+        departure,
+        40.6413,
+        -73.7781,
+    )
+
+    weather_call = next(params for url, params, _ in client.calls if url == OPEN_METEO_URL)
+    assert "current" in weather_call
+    assert context.weather.status == "live"
+    assert context.weather.source == "open_meteo_current_model"
+    assert context.weather.value == pytest.approx(0.92)
+    assert context.weather.observed_at == now
+    assert "15-minute model current-weather" in context.weather.summary_en
+
+
+def test_stale_current_conditions_fall_back_to_departure_forecast() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    client = FakeClient(
+        {
+            OPEN_METEO_URL: _open_meteo_payload(
+                departure,
+                current_time=now - timedelta(hours=3),
+            ),
+        }
+    )
+
+    weather = ContextProvider(client=client)._weather(
+        departure,
+        40.6413,
+        -73.7781,
+        None,
+        now,
+    )
+
+    assert weather.status == "forecast"
+    assert weather.source == "open_meteo_forecast"
+    assert weather.observed_at == departure
+
+
+def test_incomplete_current_conditions_fall_back_to_departure_forecast() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    payload = _open_meteo_payload(departure)
+    payload["current"] = {"time": now.replace(tzinfo=None).isoformat(timespec="minutes")}
+    client = FakeClient({OPEN_METEO_URL: payload})
+
+    weather = ContextProvider(client=client)._weather(
+        departure,
+        40.6413,
+        -73.7781,
+        None,
+        now,
+    )
+
+    assert weather.status == "forecast"
+    assert weather.source == "open_meteo_forecast"
+
+
+def test_fresh_noaa_metar_is_used_when_open_meteo_is_unavailable() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    client = FakeClient(
+        {
+            OPEN_METEO_URL: TimeoutError("Open-Meteo unavailable"),
+            NOAA_TAF_URL: [],
+            NOAA_METAR_URL: [
+                {
+                    "rawOb": "KJFK 141651Z 20010KT 1SM +TSRA BKN010",
+                    "obsTime": int(now.timestamp()),
+                }
+            ],
+        }
+    )
+
+    weather = ContextProvider(client=client)._weather(
+        departure,
+        40.6413,
+        -73.7781,
+        "KJFK",
+        now,
+    )
+
+    assert weather.status == "live"
+    assert weather.source == "noaa_metar"
+    assert weather.value == pytest.approx(0.95)
+
+
+def test_metar_structured_wind_visibility_and_ceiling_raise_risk() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    client = FakeClient(
+        {
+            NOAA_METAR_URL: [
+                {
+                    "rawOb": "KJFK 141651Z 20055G75KT M1/4SM OVC001",
+                    "obsTime": int(now.timestamp()),
+                    "wspd": 55,
+                    "wgst": 75,
+                    "visib": "1/4",
+                    "fltCat": "LIFR",
+                    "clouds": [{"cover": "OVC", "base": 100}],
+                }
+            ]
+        }
+    )
+
+    weather = ContextProvider(client=client)._noaa_product_signal(
+        NOAA_METAR_URL,
+        "KJFK",
+        now + timedelta(hours=1),
+        now,
+    )
+
+    assert weather is not None
+    assert weather.status == "live"
+    assert weather.value == 1
+
+
+def test_taf_scores_only_segments_overlapping_departure() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    client = FakeClient(
+        {
+            NOAA_TAF_URL: [
+                {
+                    "rawTAF": "KJFK CLEAR TEMPO LATER +TSRA",
+                    "issueTime": now.isoformat(),
+                    "validTimeFrom": int((now - timedelta(hours=1)).timestamp()),
+                    "validTimeTo": int((now + timedelta(hours=8)).timestamp()),
+                    "fcsts": [
+                        {
+                            "timeFrom": int((now - timedelta(hours=1)).timestamp()),
+                            "timeTo": int((now + timedelta(hours=2)).timestamp()),
+                            "wspd": 10,
+                            "visib": "10+",
+                            "clouds": [{"cover": "FEW", "base": 5_000}],
+                        },
+                        {
+                            "timeFrom": int((now + timedelta(hours=2)).timestamp()),
+                            "timeTo": int((now + timedelta(hours=5)).timestamp()),
+                            "wxString": "+TSRA",
+                            "wspd": 25,
+                            "visib": "2",
+                            "clouds": [{"cover": "BKN", "base": 500}],
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    weather = ContextProvider(client=client)._noaa_product_signal(
+        NOAA_TAF_URL,
+        "KJFK",
+        departure,
+        now,
+    )
+
+    assert weather is not None
+    assert weather.status == "forecast"
+    assert weather.value == pytest.approx(0.1852)
+
+
+def test_noaa_products_are_cached_to_respect_frequency_guidance() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    client = FakeClient(
+        {
+            NOAA_TAF_URL: [
+                {
+                    "rawTAF": "KJFK 141700Z 1418/1524 SCT020",
+                    "issueTime": now.isoformat(),
+                    "validTimeFrom": int((now - timedelta(hours=1)).timestamp()),
+                    "validTimeTo": int((now + timedelta(hours=30)).timestamp()),
+                    "fcsts": [
+                        {
+                            "timeFrom": int((now - timedelta(hours=1)).timestamp()),
+                            "timeTo": int((now + timedelta(hours=30)).timestamp()),
+                            "wspd": 10,
+                            "visib": "10+",
+                            "clouds": [{"cover": "FEW", "base": 5_000}],
+                        }
+                    ],
+                }
+            ],
+            NOAA_METAR_URL: [
+                {
+                    "rawOb": "KJFK 141651Z 20010KT 10SM FEW020",
+                    "obsTime": int(now.timestamp()),
+                }
+            ],
+        }
+    )
+    provider = ContextProvider(client=client)
+
+    first = provider._noaa_weather("KJFK", departure, now, include_metar=True)
+    second = provider._noaa_weather("KJFK", departure, now, include_metar=True)
+
+    assert first == second
+    assert sum(url == NOAA_TAF_URL for url, _, _ in client.calls) == 1
+    assert sum(url == NOAA_METAR_URL for url, _, _ in client.calls) == 1
 
 
 def test_provider_failures_return_priors_and_cache_result() -> None:

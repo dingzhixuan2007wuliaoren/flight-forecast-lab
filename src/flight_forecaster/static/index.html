@@ -907,6 +907,10 @@
 
     footer p { max-width: 900px; margin: 0; }
 
+    .footer-copy { display: grid; gap: 6px; }
+
+    footer a { color: inherit; }
+
     .api-path {
       flex: 0 0 auto;
       color: var(--slate-600);
@@ -1152,7 +1156,7 @@
                     <path d="M7 18h10a4 4 0 0 0 .6-7.9A6 6 0 0 0 6.2 8.8 4.6 4.6 0 0 0 7 18Z"/><path d="M8 21h8"/>
                   </svg>
                 </span>
-                <span id="weather-title" data-i18n="weather">航空天气</span>
+                <span id="weather-title" data-i18n="weather">实时 / 预测航空天气</span>
               </div>
               <span id="weather-status" class="status-badge neutral">—</span>
             </div>
@@ -1264,7 +1268,10 @@
     </main>
 
     <footer>
-      <p data-i18n="footerNote">结果仅用于决策参考。模型估价、准点概率、天气、机场运行与新闻信号都可能存在延迟或误差；预订前请以航司或出票平台的实时条款为准。</p>
+      <div class="footer-copy">
+        <p data-i18n="footerNote">结果仅用于决策参考。模型估价、准点概率、天气、机场运行与新闻信号都可能存在延迟或误差；预订前请以航司或出票平台的实时条款为准。</p>
+        <p><span data-i18n="weatherAttribution">天气数据：</span> <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo</a> (CC BY 4.0) · <a href="https://aviationweather.gov/" target="_blank" rel="noopener noreferrer">NOAA Aviation Weather</a></p>
+      </div>
       <span class="api-path">POST /v1/compare</span>
     </footer>
   </div>
@@ -1299,7 +1306,7 @@
           generatedAt: "结果生成时间",
           contextTitle: "预测上下文",
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
-          weather: "航空天气",
+          weather: "实时 / 预测航空天气",
           operations: "机场运行",
           news: "相关新闻",
           offersTitle: "航司与舱位比较",
@@ -1324,6 +1331,7 @@
           emptyTitle: "此分类暂无可比较结果",
           emptyBody: "免费数据源可能未覆盖该航线或当前排序。请尝试其他分类、日期或机场。",
           footerNote: "结果仅用于决策参考。模型估价、准点概率、天气、机场运行与新闻信号都可能存在延迟或误差；预订前请以航司或出票平台的实时条款为准。",
+          weatherAttribution: "天气数据：",
           live: "实时",
           forecast: "预报",
           proxy: "代理指标",
@@ -1403,7 +1411,7 @@
           generatedAt: "Results generated",
           contextTitle: "Forecast context",
           contextHint: "Every card shows its data status, source, and observation time.",
-          weather: "Aviation weather",
+          weather: "Live / forecast aviation weather",
           operations: "Airport operations",
           news: "Current news",
           offersTitle: "Airline and cabin comparison",
@@ -1428,6 +1436,7 @@
           emptyTitle: "No comparable results in this category",
           emptyBody: "The free data sources may not cover this route or ranking. Try another category, date, or airport.",
           footerNote: "Results are decision support only. Model prices, punctuality, weather, airport operations, and news signals may be delayed or inaccurate. Confirm live prices and terms with the airline or booking platform before purchase.",
+          weatherAttribution: "Weather data:",
           live: "Live",
           forecast: "Forecast",
           proxy: "Proxy",
@@ -1522,7 +1531,7 @@
 
       function setDefaultDeparture() {
         var date = new Date();
-        date.setDate(date.getDate() + 21);
+        date.setDate(date.getDate() + 7);
         date.setHours(9, 0, 0, 0);
         byId("departure-time").value = localInputValue(date);
       }

@@ -92,7 +92,7 @@ NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预
 | 信号 | 优先来源 | 无法获取时 |
 | --- | --- | --- |
 | 全球机场坐标 | [OurAirports public-domain data](https://ourairports.com/data/) | 内置主要全球机场目录；未知代码返回校验错误 |
-| 天气预报 | [Open-Meteo](https://open-meteo.com/en/docs) 与 [NOAA Aviation Weather](https://aviationweather.gov/data/api/) | 月份、纬度与机场类型的历史先验 |
+| 当前天气与预报 | [Open-Meteo](https://open-meteo.com/en/docs) 当前模型天气/小时预报与 [NOAA Aviation Weather](https://aviationweather.gov/data/api/) METAR/TAF | 同月训练平均值或季节模型先验，并明确标为 `proxy` |
 | 机场运行 | 配置免费 AirLabs key 后使用 [AirLabs schedules](https://airlabs.co/docs/schedules) | [ADSB.lol](https://api.adsb.lol/) 密度代理，再回退机场/时段先验 |
 | 时事新闻 | [GDELT DOC 2.0](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) 近七日中断类新闻 | 中性值且不虚构文章 |
 | 航线航司 | AirLabs route records | 60 家全球航司的模型比较场景，并标为 `model_scenario` |
