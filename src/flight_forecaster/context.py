@@ -12,11 +12,14 @@ import math
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from time import monotonic
 from typing import Any
 from urllib import parse, request
+from xml.etree import ElementTree
 
 REQUEST_TIMEOUT_SECONDS = 3.0
 CACHE_TTL_SECONDS = 300.0
@@ -27,6 +30,13 @@ CURRENT_WEATHER_MAX_LEAD_HOURS = 2
 CURRENT_WEATHER_MAX_AGE_MINUTES = 90
 METAR_MAX_AGE_HOURS = 2
 CURRENT_OPERATIONS_MAX_LEAD_HOURS = 6
+GDELT_REQUEST_TIMEOUT_SECONDS = 15.0
+NEWS_CACHE_TTL_SECONDS = 900.0
+NEWS_STALE_TTL_SECONDS = 21_600.0
+NEWS_FAILURE_TTL_SECONDS = 60.0
+MAX_NEWS_TITLE_CHARS = 300
+MAX_NEWS_URL_CHARS = 2_048
+MAX_NEWS_SOURCE_CHARS = 255
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 NOAA_TAF_URL = "https://aviationweather.gov/api/data/taf"
@@ -35,6 +45,9 @@ AIRLABS_SCHEDULES_URL = "https://airlabs.co/api/v9/schedules"
 AIRLABS_ROUTES_URL = "https://airlabs.co/api/v9/routes"
 ADSB_LOL_URL = "https://api.adsb.lol/v2/lat/{latitude}/lon/{longitude}/dist/100"
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+GDELT_GAL_RSS_URL = (
+    "https://storage.googleapis.com/data.gdeltproject.org/gdeltv3/gal/feed.rss"
+)
 
 
 def _bounded(value: Any) -> float:
@@ -116,10 +129,14 @@ class NewsArticle:
     url: str
     source: str
     published_at: datetime | None = None
+    language: str | None = None
 
     def __post_init__(self) -> None:
         if self.published_at is not None:
             object.__setattr__(self, "published_at", _utc(self.published_at))
+        if self.language is not None:
+            language = re.sub(r"[^a-z0-9-]", "", self.language.lower())[:16]
+            object.__setattr__(self, "language", language or None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +174,10 @@ class _UrllibResponse:
         if not self._body:
             return []
         return json.loads(self._body.decode("utf-8"))
+
+    @property
+    def text(self) -> str:
+        return self._body.decode("utf-8")
 
 
 class _UrllibClient:
@@ -202,6 +223,9 @@ class ContextProvider:
         self._cache: dict[tuple[Any, ...], tuple[float, PredictionContext]] = {}
         self._route_cache: dict[tuple[str, str], tuple[float, set[str] | None]] = {}
         self._noaa_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._news_cache: dict[tuple[str, ...], tuple[float, NewsSignal]] = {}
+        self._news_failure_cache: dict[tuple[str, ...], tuple[float, NewsSignal]] = {}
+        self._news_locks = tuple(threading.Lock() for _ in range(16))
         self._cache_lock = threading.Lock()
 
     def resolve(
@@ -250,24 +274,36 @@ class ContextProvider:
             return cached
 
         if self.external_context_enabled:
-            weather = self._weather(
-                departure, latitude_value, longitude_value, icao, resolved_at
-            )
-            operations = self._operations(
-                origin_code,
-                departure_local,
-                latitude_value,
-                longitude_value,
-                airport_type,
-                resolved_at,
-            )
-            news = self._news(
-                origin_code,
-                destination_code,
-                resolved_at,
-                origin_name=origin_name,
-                destination_name=destination_name,
-            )
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="flight-context") as pool:
+                weather_future = pool.submit(
+                    self._weather,
+                    departure,
+                    latitude_value,
+                    longitude_value,
+                    icao,
+                    resolved_at,
+                )
+                operations_future = pool.submit(
+                    self._operations,
+                    origin_code,
+                    departure_local,
+                    latitude_value,
+                    longitude_value,
+                    airport_type,
+                    resolved_at,
+                )
+                news_future = pool.submit(
+                    self._news,
+                    origin_code,
+                    destination_code,
+                    departure,
+                    resolved_at,
+                    origin_name=origin_name,
+                    destination_name=destination_name,
+                )
+                weather = weather_future.result()
+                operations = operations_future.result()
+                news = news_future.result()
         else:
             weather = self._weather_prior(departure_local, latitude_value, resolved_at)
             operations = self._operations_prior(
@@ -699,20 +735,103 @@ class ContextProvider:
         self,
         origin: str,
         destination: str,
+        departure: datetime,
         fetched_at: datetime,
         *,
         origin_name: str | None = None,
         destination_name: str | None = None,
     ) -> NewsSignal:
-        route_terms = [origin, destination]
-        route_terms.extend(
-            f'"{name}"'
-            for name in (origin_name, destination_name)
-            if name and len(name.strip()) >= 4
+        cache_key = (
+            origin,
+            destination,
+            self._news_cache_name(origin_name),
+            self._news_cache_name(destination_name),
         )
+        _, stale = self._cache_peek(
+            self._news_cache,
+            cache_key,
+            max_age_seconds=NEWS_STALE_TTL_SECONDS,
+        )
+        found, cached = self._cache_get(
+            self._news_cache,
+            cache_key,
+            ttl_seconds=NEWS_CACHE_TTL_SECONDS,
+            evict_expired=False,
+        )
+        if found:
+            return self._news_for_departure(cached, departure, fetched_at)
+        failed, failure = self._cache_get(
+            self._news_failure_cache,
+            cache_key,
+            ttl_seconds=NEWS_FAILURE_TTL_SECONDS,
+        )
+        if failed:
+            return self._news_for_departure(failure, departure, fetched_at)
+
+        lock = self._news_locks[hash(cache_key) % len(self._news_locks)]
+        with lock:
+            found, cached = self._cache_get(
+                self._news_cache,
+                cache_key,
+                ttl_seconds=NEWS_CACHE_TTL_SECONDS,
+                evict_expired=False,
+            )
+            if found:
+                return self._news_for_departure(cached, departure, fetched_at)
+            failed, failure = self._cache_get(
+                self._news_failure_cache,
+                cache_key,
+                ttl_seconds=NEWS_FAILURE_TTL_SECONDS,
+            )
+            if failed:
+                return self._news_for_departure(failure, departure, fetched_at)
+            _, stale = self._cache_peek(
+                self._news_cache,
+                cache_key,
+                max_age_seconds=NEWS_STALE_TTL_SECONDS,
+            )
+            try:
+                base = self._fetch_news(
+                    origin,
+                    destination,
+                    fetched_at,
+                    origin_name=origin_name,
+                    destination_name=destination_name,
+                )
+            except Exception:
+                if isinstance(stale, NewsSignal):
+                    base = self._stale_news(stale)
+                else:
+                    base = self._neutral_news(fetched_at, "neutral_fallback")
+                self._cache_set(self._news_failure_cache, cache_key, base)
+            else:
+                self._cache_set(self._news_cache, cache_key, base)
+                with self._cache_lock:
+                    self._news_failure_cache.pop(cache_key, None)
+        return self._news_for_departure(base, departure, fetched_at)
+
+    def _fetch_news(
+        self,
+        origin: str,
+        destination: str,
+        fetched_at: datetime,
+        *,
+        origin_name: str | None,
+        destination_name: str | None,
+    ) -> NewsSignal:
+        route_terms = self._gdelt_route_terms(
+            origin,
+            destination,
+            origin_name,
+            destination_name,
+        )
+        if not route_terms:
+            raise LookupError("route terms unavailable for news lookup")
         query = (
             f"({' OR '.join(route_terms)}) (airport OR airline OR flight) "
-            '(strike OR closure OR conflict OR "extreme weather" OR disruption OR cancellation)'
+            "(strike OR closure OR closed OR conflict OR disruption OR cancellation OR "
+            'cancelled OR canceled OR "extreme weather" OR "ground stop" OR hurricane OR '
+            "typhoon OR wildfire OR flooding OR earthquake OR cyberattack)"
         )
         try:
             payload = self._get_json(
@@ -722,65 +841,221 @@ class ContextProvider:
                     "mode": "ArtList",
                     "maxrecords": 25,
                     "format": "json",
-                    "sort": "HybridRel",
+                    "sort": "DateDesc",
                     "timespan": "7d",
                 },
+                timeout=GDELT_REQUEST_TIMEOUT_SECONDS,
             )
-            rows = payload.get("articles") if isinstance(payload, dict) else None
-            if not isinstance(rows, list):
-                raise LookupError("GDELT article list missing")
-            scored: list[tuple[float, NewsArticle]] = []
-            seen_urls: set[str] = set()
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                title = str(row.get("title") or "").strip()
-                url = str(row.get("url") or "").strip()
-                if not title or not url:
-                    continue
-                normalized_url = url.split("#", 1)[0]
-                if normalized_url in seen_urls:
-                    continue
-                score = self._news_text_risk(title)
-                if score <= 0:
-                    continue
-                published_at = _parse_datetime(row.get("seendate") or row.get("published_at"))
-                if published_at and published_at < fetched_at - timedelta(days=7, hours=1):
-                    continue
-                article = NewsArticle(
-                    title,
-                    url,
-                    str(row.get("domain") or row.get("source") or "GDELT"),
-                    published_at,
-                )
-                scored.append((score, article))
-                seen_urls.add(normalized_url)
-            scored.sort(key=lambda item: item[0], reverse=True)
-            articles = tuple(article for _, article in scored[:5])
-            risk = _bounded(
-                max((score for score, _ in scored), default=0)
-                + 0.03 * max(0, len(scored) - 1)
-            )
-            if articles:
-                summary_zh = f"近 7 天发现 {len(articles)} 条相关中断新闻；风险 {risk:.0%}。"
-                summary_en = (
-                    f"Found {len(articles)} relevant disruption articles in 7 days; "
-                    f"risk {risk:.0%}."
-                )
-            else:
-                summary_zh = "近 7 天未发现可确认的航线中断新闻。"
-                summary_en = "No confirmed route-disruption articles found in the last 7 days."
-            return NewsSignal(
-                risk,
-                "live",
-                "gdelt_doc_2",
-                fetched_at,
-                summary_zh,
-                summary_en,
-                articles,
-            )
+            return self._news_from_doc(payload, fetched_at)
         except Exception:
-            return self._neutral_news(fetched_at, "neutral_fallback")
+            rss = self._get_text(GDELT_GAL_RSS_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+            return self._news_from_rss(
+                rss,
+                origin,
+                destination,
+                fetched_at,
+                origin_name=origin_name,
+                destination_name=destination_name,
+            )
+
+    def _news_from_doc(self, payload: Any, fetched_at: datetime) -> NewsSignal:
+        rows = payload.get("articles") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise LookupError("GDELT article list missing")
+        candidates: list[tuple[float, NewsArticle]] = []
+        seen_urls: set[str] = set()
+        seen_titles: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = self._clean_news_title(row.get("title"))
+            canonical = self._canonical_news_url(row.get("url"))
+            observed_at = _parse_datetime(row.get("seendate") or row.get("published_at"))
+            if title is None or canonical is None or observed_at is None:
+                continue
+            if not fetched_at - timedelta(days=7, hours=1) <= observed_at <= (
+                fetched_at + timedelta(minutes=15)
+            ):
+                continue
+            url_key, clean_url, domain = canonical
+            title_key = self._news_title_key(title)
+            if url_key in seen_urls or title_key in seen_titles:
+                continue
+            base_score = max(self._news_text_risk(title), 0.18)
+            score = _bounded(base_score * self._news_recency_factor(observed_at, fetched_at))
+            candidates.append(
+                (
+                    score,
+                    NewsArticle(
+                        title,
+                        clean_url,
+                        domain,
+                        observed_at,
+                        str(row.get("language") or "") or None,
+                    ),
+                )
+            )
+            seen_urls.add(url_key)
+            seen_titles.add(title_key)
+        return self._finalize_news(
+            candidates,
+            "gdelt_doc_2_near_realtime",
+            fetched_at,
+            window_zh="近 7 天",
+            window_en="the last 7 days",
+        )
+
+    def _news_from_rss(
+        self,
+        rss: str,
+        origin: str,
+        destination: str,
+        fetched_at: datetime,
+        *,
+        origin_name: str | None,
+        destination_name: str | None,
+    ) -> NewsSignal:
+        root = ElementTree.fromstring(rss)
+        candidates: list[tuple[float, NewsArticle]] = []
+        seen_urls: set[str] = set()
+        seen_titles: set[str] = set()
+        for item in root.findall(".//item"):
+            title = self._clean_news_title(item.findtext("title"))
+            canonical = self._canonical_news_url(item.findtext("link"))
+            observed_at = self._parse_rss_datetime(item.findtext("pubDate"))
+            if title is None or canonical is None or observed_at is None:
+                continue
+            if not fetched_at - timedelta(days=1) <= observed_at <= (
+                fetched_at + timedelta(minutes=15)
+            ):
+                continue
+            score = self._news_text_risk(title)
+            if score <= 0 or not self._title_mentions_route(
+                title,
+                origin,
+                destination,
+                origin_name,
+                destination_name,
+            ):
+                continue
+            url_key, clean_url, domain = canonical
+            title_key = self._news_title_key(title)
+            if url_key in seen_urls or title_key in seen_titles:
+                continue
+            score = _bounded(score * self._news_recency_factor(observed_at, fetched_at))
+            candidates.append((score, NewsArticle(title, clean_url, domain, observed_at)))
+            seen_urls.add(url_key)
+            seen_titles.add(title_key)
+        return self._finalize_news(
+            candidates,
+            "gdelt_gal_rss",
+            fetched_at,
+            window_zh="滚动最近 15 分钟",
+            window_en="the rolling last 15 minutes",
+        )
+
+    @staticmethod
+    def _finalize_news(
+        candidates: list[tuple[float, NewsArticle]],
+        source: str,
+        fetched_at: datetime,
+        *,
+        window_zh: str,
+        window_en: str,
+    ) -> NewsSignal:
+        candidates.sort(
+            key=lambda item: (item[1].published_at or datetime.min.replace(tzinfo=UTC), item[0]),
+            reverse=True,
+        )
+        articles: list[NewsArticle] = []
+        selected_domains: set[str] = set()
+        for _, article in candidates:
+            if article.source in selected_domains:
+                continue
+            articles.append(article)
+            selected_domains.add(article.source)
+            if len(articles) == 5:
+                break
+        high_risk_domains = {
+            article.source for score, article in candidates if score >= 0.4
+        }
+        risk = _bounded(
+            max((score for score, _ in candidates), default=0)
+            + 0.03 * max(0, len(high_risk_domains) - 1)
+        )
+        if candidates:
+            summary_zh = (
+                f"GDELT 近实时收录 {len(candidates)} 条航线中断相关报道；"
+                f"当前新闻风险 {risk:.0%}。"
+            )
+            summary_en = (
+                f"GDELT indexed {len(candidates)} near-real-time route-disruption reports in "
+                f"{window_en}; current news risk {risk:.0%}."
+            )
+        else:
+            summary_zh = f"GDELT {window_zh}未发现可确认的航线中断报道。"
+            summary_en = f"GDELT found no confirmed route-disruption reports in {window_en}."
+        return NewsSignal(
+            risk,
+            "live",
+            source,
+            fetched_at,
+            summary_zh,
+            summary_en,
+            tuple(articles),
+        )
+
+    @staticmethod
+    def _news_for_departure(
+        signal: NewsSignal,
+        departure: datetime,
+        fetched_at: datetime,
+    ) -> NewsSignal:
+        lead_hours = max(0.0, (departure - fetched_at).total_seconds() / 3_600)
+        if lead_hours <= 72:
+            factor = 1.0
+        elif lead_hours <= 7 * 24:
+            factor = 0.75
+        elif lead_hours <= 14 * 24:
+            factor = 0.45
+        elif lead_hours <= 30 * 24:
+            factor = 0.2
+        else:
+            factor = 0.1
+        if factor == 1 or signal.value == 0:
+            return signal
+        adjusted = _bounded(signal.value * factor)
+        return NewsSignal(
+            adjusted,
+            signal.status,
+            signal.source,
+            signal.observed_at,
+            (
+                f"{signal.summary_zh.rstrip('。')}；因距起飞较远，"
+                f"模型影响衰减至 {adjusted:.0%}。"
+            ),
+            (
+                f"{signal.summary_en.rstrip('.')} Because departure is farther away, "
+                f"the model effect is attenuated to {adjusted:.0%}."
+            ),
+            signal.articles,
+        )
+
+    @staticmethod
+    def _stale_news(signal: NewsSignal) -> NewsSignal:
+        risk = _bounded(signal.value * 0.5)
+        return NewsSignal(
+            risk,
+            "historical",
+            f"{signal.source}_stale_cache",
+            signal.observed_at,
+            f"实时新闻查询失败；使用最近成功缓存，新闻风险降权至 {risk:.0%}。",
+            (
+                "Live news refresh failed; using the latest successful cache with news "
+                f"risk reduced to {risk:.0%}."
+            ),
+            signal.articles,
+        )
 
     @staticmethod
     def _neutral_news(fetched_at: datetime, source: str) -> NewsSignal:
@@ -886,19 +1161,49 @@ class ContextProvider:
             ),
         )
 
-    def _get_json(self, url: str, params: dict[str, Any]) -> Any:
+    def _get_json(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> Any:
         response = self.client.get(
             url,
             params=params,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "flight-forecast-lab/0.1 (context data client)",
+                "User-Agent": "flight-forecast-lab/0.2 (context data client)",
             },
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
         return response.json()
+
+    def _get_text(self, url: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> str:
+        response = self.client.get(
+            url,
+            params={},
+            headers={
+                "Accept": "application/rss+xml, application/xml, text/xml",
+                "User-Agent": "flight-forecast-lab/0.2 (context data client)",
+            },
+            timeout=timeout,
+        )
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
+        value = getattr(response, "text", None)
+        if callable(value):
+            value = value()
+        if value is None:
+            content = getattr(response, "content", b"")
+            value = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+        if not isinstance(value, str):
+            value = str(value)
+        if len(value.encode("utf-8")) > MAX_JSON_RESPONSE_BYTES:
+            raise RuntimeError("provider response exceeded the 5 MB safety limit")
+        return value
 
     @staticmethod
     def _hourly_value(hourly: dict[str, Any], field: str, index: int, default: Any) -> Any:
@@ -1059,27 +1364,218 @@ class ContextProvider:
         return 0.08
 
     @staticmethod
+    def _news_cache_name(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).casefold()[:100]
+
+    @staticmethod
+    def _gdelt_phrase(value: Any) -> str | None:
+        cleaned = re.sub(r"[\"\\()\[\]{}:]+", " ", str(value or ""))
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()[:100]
+        return f'"{cleaned}"' if len(cleaned) >= 3 else None
+
+    @classmethod
+    def _gdelt_route_terms(
+        cls,
+        origin: str,
+        destination: str,
+        origin_name: str | None,
+        destination_name: str | None,
+    ) -> list[str]:
+        values: list[str] = [
+            f"{code} airport" for code in (origin, destination) if code.strip()
+        ]
+        values.extend(
+            name.strip()
+            for name in (origin_name, destination_name)
+            if name and len(name.strip()) >= 4
+        )
+        terms: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            phrase = cls._gdelt_phrase(value)
+            if phrase is None or phrase.casefold() in seen:
+                continue
+            terms.append(phrase)
+            seen.add(phrase.casefold())
+        return terms
+
+    @staticmethod
+    def _clean_news_title(value: Any) -> str | None:
+        title = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not title or len(title) > MAX_NEWS_TITLE_CHARS:
+            return None
+        if any(ord(character) < 32 for character in title):
+            return None
+        return title
+
+    @staticmethod
+    def _news_title_key(title: str) -> str:
+        return re.sub(r"[^\w]+", " ", title.casefold(), flags=re.UNICODE).strip()
+
+    @staticmethod
+    def _canonical_news_url(value: Any) -> tuple[str, str, str] | None:
+        raw_url = str(value or "").strip()
+        if (
+            not raw_url
+            or len(raw_url) > MAX_NEWS_URL_CHARS
+            or any(ord(character) < 32 for character in raw_url)
+        ):
+            return None
+        try:
+            parts = parse.urlsplit(raw_url)
+            scheme = parts.scheme.lower()
+            hostname = parts.hostname
+            port = parts.port
+        except (TypeError, ValueError):
+            return None
+        if scheme not in {"http", "https"} or not hostname:
+            return None
+        if parts.username is not None or parts.password is not None:
+            return None
+        try:
+            domain = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return None
+        if not domain or len(domain) > MAX_NEWS_SOURCE_CHARS:
+            return None
+        display_host = f"[{domain}]" if ":" in domain else domain
+        default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+        netloc = display_host if port is None or default_port else f"{display_host}:{port}"
+        tracking_keys = {
+            "fbclid",
+            "gclid",
+            "dclid",
+            "mc_cid",
+            "mc_eid",
+            "mkt_tok",
+            "ref_src",
+        }
+        query_items = []
+        for key, item_value in parse.parse_qsl(parts.query, keep_blank_values=True):
+            normalized_key = key.casefold()
+            if normalized_key.startswith("utm_") or normalized_key in tracking_keys:
+                continue
+            query_items.append((key, item_value))
+        query = parse.urlencode(query_items, doseq=True)
+        path = parts.path or "/"
+        clean_url = parse.urlunsplit((scheme, netloc, path, query, ""))
+        if len(clean_url) > MAX_NEWS_URL_CHARS:
+            return None
+        dedup_path = re.sub(r"/(?:amp|amp/)$", "/", path, flags=re.IGNORECASE)
+        dedup_path = dedup_path.rstrip("/") or "/"
+        key = parse.urlunsplit((scheme, netloc, dedup_path, query, ""))
+        return key, clean_url, domain
+
+    @staticmethod
+    def _parse_rss_datetime(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = parsedate_to_datetime(str(value).strip())
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return _utc(parsed)
+
+    @staticmethod
+    def _news_recency_factor(observed_at: datetime, fetched_at: datetime) -> float:
+        age_hours = max(0.0, (fetched_at - observed_at).total_seconds() / 3_600)
+        if age_hours <= 6:
+            return 1.0
+        if age_hours <= 24:
+            return 0.9
+        if age_hours <= 72:
+            return 0.7
+        return 0.45
+
+    @classmethod
+    def _title_mentions_route(
+        cls,
+        title: str,
+        origin: str,
+        destination: str,
+        origin_name: str | None,
+        destination_name: str | None,
+    ) -> bool:
+        for code in (origin, destination):
+            if len(code) >= 3 and re.search(
+                rf"(?<![A-Z0-9]){re.escape(code.upper())}(?![A-Z0-9])",
+                title,
+            ):
+                return True
+        normalized_title = re.sub(r"[^\w]+", " ", title.casefold()).strip()
+        ignored = {"airport", "international", "intl", "terminal", "airfield"}
+        for name in (origin_name, destination_name):
+            normalized_name = cls._news_title_key(str(name or ""))
+            if not normalized_name:
+                continue
+            if normalized_name in normalized_title:
+                return True
+            meaningful = {
+                token
+                for token in normalized_name.split()
+                if len(token) >= 4 and token not in ignored
+            }
+            if any(
+                re.search(rf"(?<!\w){re.escape(token)}(?!\w)", normalized_title)
+                for token in meaningful
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _news_text_risk(text: str) -> float:
         normalized = re.sub(r"\s+", " ", text.lower())
-        groups = (
-            (
-                0.95,
-                (
-                    "airspace closure",
-                    "airport closure",
-                    "airport closed",
-                    "closed airport",
-                    "volcanic ash",
-                    "missile strike",
-                ),
-            ),
-            (0.9, ("armed conflict", "war zone", "hostilities", "hurricane", "typhoon")),
-            (0.82, ("strike", "cyclone", "blizzard", "extreme weather", "grounded")),
-            (0.58, ("mass cancellation", "flight cancellation", "cancelled flights")),
-            (0.42, ("disruption", "delays", "flight delay", "cancellation")),
+        normalized = re.sub(
+            r"\bstrikes?\s+(?:a|the)\s+(?:deal|agreement)\b|"
+            r"\b(?:deal|agreement)\s+(?:averts?|ends?)\s+(?:a\s+)?strike\b|"
+            r"\bstrike\s+(?:averted|called off|ends?)\b",
+            " ",
+            normalized,
+        )
+        groups: tuple[tuple[float, tuple[str, ...]], ...] = (
+            (0.95, (
+                r"\b(?:airspace|airport|runway)\s+(?:closure|closed|shut(?:down)?)\b",
+                r"\bclosed\s+(?:airspace|airport|runway)\b",
+                r"\bvolcanic ash\b",
+                r"\b(?:missile|drone)\s+(?:strike|attack)\b",
+                r"\bairport\s+evacuat(?:ed|ion)\b",
+            )),
+            (0.9, (
+                r"\barmed conflict\b",
+                r"\bwar zone\b",
+                r"\bhostilities\b",
+                r"\b(?:hurricane|typhoon)\b",
+            )),
+            (0.82, (
+                r"\bstrikes?\b",
+                r"\b(?:cyclone|blizzard)\b",
+                r"\bextreme weather\b",
+                r"\bground stop\b",
+                r"\bgrounded\s+flights?\b",
+            )),
+            (0.72, (
+                r"\b(?:wildfire|wildfires|flood|flooding|earthquake|cyberattack)\b",
+                r"\bairspace restriction(?:s)?\b",
+                r"\brunway closure\b",
+            )),
+            (0.58, (
+                r"\bmass cancellations?\b",
+                r"\bflights?\s+(?:are\s+|were\s+)?(?:cancelled|canceled)\b",
+                r"\bflight cancellations?\b",
+            )),
+            (0.42, (
+                r"\bdisrupt(?:ion|ions|ed)\b",
+                r"\bflight delays?\b",
+                r"\bdelayed flights?\b",
+                r"\bcancellations?\b",
+            )),
         )
         return max(
-            (weight for weight, terms in groups if any(term in normalized for term in terms)),
+            (
+                weight
+                for weight, patterns in groups
+                if any(re.search(pattern, normalized) for pattern in patterns)
+            ),
             default=0.0,
         )
 
@@ -1104,13 +1600,38 @@ class ContextProvider:
     def _airport_code(value: Any) -> str:
         return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())[:4]
 
-    def _cache_get(self, cache: dict[Any, tuple[float, Any]], key: Any) -> tuple[bool, Any]:
+    def _cache_get(
+        self,
+        cache: dict[Any, tuple[float, Any]],
+        key: Any,
+        *,
+        ttl_seconds: float = CACHE_TTL_SECONDS,
+        evict_expired: bool = True,
+    ) -> tuple[bool, Any]:
         with self._cache_lock:
             entry = cache.get(key)
             if not entry:
                 return False, None
             stored_at, value = entry
-            if monotonic() - stored_at > CACHE_TTL_SECONDS:
+            if monotonic() - stored_at > ttl_seconds:
+                if evict_expired:
+                    cache.pop(key, None)
+                return False, None
+            return True, value
+
+    def _cache_peek(
+        self,
+        cache: dict[Any, tuple[float, Any]],
+        key: Any,
+        *,
+        max_age_seconds: float,
+    ) -> tuple[bool, Any]:
+        with self._cache_lock:
+            entry = cache.get(key)
+            if not entry:
+                return False, None
+            stored_at, value = entry
+            if monotonic() - stored_at > max_age_seconds:
                 cache.pop(key, None)
                 return False, None
             return True, value

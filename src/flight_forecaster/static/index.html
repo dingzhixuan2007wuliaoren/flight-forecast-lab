@@ -690,6 +690,13 @@
       font-weight: 550;
     }
 
+    .news-semantics {
+      margin: 9px 0 0;
+      color: var(--slate-500);
+      font-size: 8px;
+      line-height: 1.5;
+    }
+
     .response-warning {
       display: none;
       gap: 10px;
@@ -1196,7 +1203,7 @@
                     <path d="M5 4h12a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2V4Z"/><path d="M8 8h7M8 12h7M8 16h4M19 8h2v10a2 2 0 0 1-2 2"/>
                   </svg>
                 </span>
-                <span id="news-title" data-i18n="news">相关新闻</span>
+                <span id="news-title" data-i18n="news">近实时航空中断新闻</span>
               </div>
               <span id="news-status" class="status-badge neutral">—</span>
             </div>
@@ -1206,6 +1213,7 @@
               <span id="news-source" class="context-source">—</span>
               <time id="news-time">—</time>
             </div>
+            <p class="news-semantics" data-i18n="newsSemantics">文章时间为 GDELT 观察 / 索引时间，不一定是媒体发布时间；标题保留来源语言。</p>
             <ul id="news-links" class="news-links"></ul>
           </article>
         </div>
@@ -1271,6 +1279,7 @@
       <div class="footer-copy">
         <p data-i18n="footerNote">结果仅用于决策参考。模型估价、准点概率、天气、机场运行与新闻信号都可能存在延迟或误差；预订前请以航司或出票平台的实时条款为准。</p>
         <p><span data-i18n="weatherAttribution">天气数据：</span> <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo</a> (CC BY 4.0) · <a href="https://aviationweather.gov/" target="_blank" rel="noopener noreferrer">NOAA Aviation Weather</a></p>
+        <p><span data-i18n="newsAttribution">近实时新闻数据：</span> <a href="https://www.gdeltproject.org/" target="_blank" rel="noopener noreferrer">GDELT Project</a></p>
       </div>
       <span class="api-path">POST /v1/compare</span>
     </footer>
@@ -1308,7 +1317,8 @@
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
           weather: "实时 / 预测航空天气",
           operations: "机场运行",
-          news: "相关新闻",
+          news: "近实时航空中断新闻",
+          newsSemantics: "文章时间为 GDELT 观察 / 索引时间，不一定是媒体发布时间；标题保留来源语言。",
           offersTitle: "航司与舱位比较",
           directFirst: "直飞优先",
           lowestPrice: "低价优先",
@@ -1332,6 +1342,7 @@
           emptyBody: "免费数据源可能未覆盖该航线或当前排序。请尝试其他分类、日期或机场。",
           footerNote: "结果仅用于决策参考。模型估价、准点概率、天气、机场运行与新闻信号都可能存在延迟或误差；预订前请以航司或出票平台的实时条款为准。",
           weatherAttribution: "天气数据：",
+          newsAttribution: "近实时新闻数据：",
           live: "实时",
           forecast: "预报",
           proxy: "代理指标",
@@ -1413,7 +1424,8 @@
           contextHint: "Every card shows its data status, source, and observation time.",
           weather: "Live / forecast aviation weather",
           operations: "Airport operations",
-          news: "Current news",
+          news: "Near-real-time aviation disruption news",
+          newsSemantics: "Article times are GDELT observed/indexed times, not necessarily publisher timestamps; headlines remain in their source language.",
           offersTitle: "Airline and cabin comparison",
           directFirst: "Direct first",
           lowestPrice: "Lowest price",
@@ -1437,6 +1449,7 @@
           emptyBody: "The free data sources may not cover this route or ranking. Try another category, date, or airport.",
           footerNote: "Results are decision support only. Model prices, punctuality, weather, airport operations, and news signals may be delayed or inaccurate. Confirm live prices and terms with the airline or booking platform before purchase.",
           weatherAttribution: "Weather data:",
+          newsAttribution: "Near-real-time news data:",
           live: "Live",
           forecast: "Forecast",
           proxy: "Proxy",
@@ -1770,6 +1783,7 @@
           var meta = document.createElement("small");
           var parts = [];
           if (hasValue(article.source)) parts.push(article.source);
+          if (hasValue(article.language)) parts.push(String(article.language).toUpperCase());
           if (hasValue(article.published_at)) parts.push(formatDate(article.published_at));
           meta.textContent = parts.join(" · ");
           link.appendChild(meta);

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 
 import pytest
@@ -10,6 +11,9 @@ from flight_forecaster.context import (
     AIRLABS_ROUTES_URL,
     AIRLABS_SCHEDULES_URL,
     GDELT_DOC_URL,
+    GDELT_GAL_RSS_URL,
+    GDELT_REQUEST_TIMEOUT_SECONDS,
+    NEWS_CACHE_TTL_SECONDS,
     NOAA_METAR_URL,
     NOAA_TAF_URL,
     OPEN_METEO_URL,
@@ -28,6 +32,14 @@ class FakeResponse:
 
     def json(self) -> Any:
         return self.payload
+
+    @property
+    def text(self) -> str:
+        if isinstance(self.payload, bytes):
+            return self.payload.decode("utf-8")
+        if isinstance(self.payload, str):
+            return self.payload
+        raise TypeError("FakeResponse text payload must be str or bytes")
 
 
 class FakeClient:
@@ -141,7 +153,7 @@ def test_live_weather_proxy_operations_and_news_scoring() -> None:
     assert context.operations.source == "adsb_lol"
     assert 0.4 < context.operations.value < 0.5
     assert context.news.status == "live"
-    assert context.news.source == "gdelt_doc_2"
+    assert context.news.source == "gdelt_doc_2_near_realtime"
     assert context.news.value == pytest.approx(0.98)
     assert [article.url for article in context.news.articles] == [
         "https://example.test/closure",
@@ -150,7 +162,290 @@ def test_live_weather_proxy_operations_and_news_scoring() -> None:
     assert context.weather.summary_zh and context.weather.summary_en
     signals = (context.weather, context.operations, context.news)
     assert all(0 <= signal.value <= 1 for signal in signals)
-    assert all(timeout == 3.0 for _, _, timeout in client.calls)
+    gdelt_call = next(call for call in client.calls if call[0] == GDELT_DOC_URL)
+    assert gdelt_call[1]["sort"] == "DateDesc"
+    assert gdelt_call[2] == GDELT_REQUEST_TIMEOUT_SECONDS
+    assert all(
+        timeout == 3.0
+        for url, _, timeout in client.calls
+        if url != GDELT_DOC_URL
+    )
+
+
+def test_news_cache_is_route_scoped_across_departure_dates_and_attenuates_far_news() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    client = FakeClient(
+        {
+            GDELT_DOC_URL: {
+                "articles": [
+                    {
+                        "title": "JFK airport closure disrupts flights to LAX",
+                        "url": "https://news.test/jfk-closure",
+                        "domain": "news.test",
+                        "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                    }
+                ]
+            }
+        }
+    )
+    provider = ContextProvider(client=client)
+
+    near = provider._news("JFK", "LAX", now + timedelta(hours=2), now)
+    far = provider._news("JFK", "LAX", now + timedelta(days=45), now)
+
+    assert sum(url == GDELT_DOC_URL for url, _, _ in client.calls) == 1
+    assert near.value == pytest.approx(0.95)
+    assert far.value == pytest.approx(near.value * 0.1)
+    assert far.articles == near.articles
+    assert "attenuated" in far.summary_en
+
+
+def test_gdelt_keeps_provider_matched_non_english_titles() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    signal = ContextProvider()._news_from_doc(
+        {
+            "articles": [
+                {
+                    "title": "机场运营受到影响，部分航班调整",
+                    "url": "https://example.cn/aviation/update",
+                    "domain": "example.cn",
+                    "language": "zh",
+                    "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                }
+            ]
+        },
+        now,
+    )
+
+    assert signal.value == pytest.approx(0.18)
+    assert len(signal.articles) == 1
+    assert signal.articles[0].title == "机场运营受到影响，部分航班调整"
+    assert signal.articles[0].language == "zh"
+
+
+def test_gdelt_recency_decay_reduces_older_article_risk() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    provider = ContextProvider()
+
+    fresh = provider._news_from_doc(
+        {
+            "articles": [
+                {
+                    "title": "Flight disruption at JFK airport",
+                    "url": "https://fresh.test/disruption",
+                    "seendate": (now - timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ"),
+                }
+            ]
+        },
+        now,
+    )
+    older = provider._news_from_doc(
+        {
+            "articles": [
+                {
+                    "title": "Flight disruption at JFK airport",
+                    "url": "https://older.test/disruption",
+                    "seendate": (now - timedelta(days=4)).strftime("%Y%m%dT%H%M%SZ"),
+                }
+            ]
+        },
+        now,
+    )
+
+    assert fresh.value == pytest.approx(0.42)
+    assert older.value == pytest.approx(0.189)
+    assert older.value < fresh.value
+
+
+def test_gdelt_filters_invalid_dates_and_urls_and_deduplicates_tracking_variants() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    provider = ContextProvider()
+    canonical_a = provider._canonical_news_url(
+        "https://Example.test/story?utm_source=feed#section"
+    )
+    canonical_b = provider._canonical_news_url(
+        "https://example.test/story?utm_medium=email&fbclid=123"
+    )
+
+    assert canonical_a is not None
+    assert canonical_b is not None
+    assert canonical_a[0] == canonical_b[0]
+    assert canonical_a[1] == "https://example.test/story"
+    assert provider._news_title_key("JFK Airport Closure!") == provider._news_title_key(
+        " jfk airport closure "
+    )
+
+    signal = provider._news_from_doc(
+        {
+            "articles": [
+                {
+                    "title": "JFK airport closure disrupts flights",
+                    "url": "https://Example.test/story?utm_source=feed#section",
+                    "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                },
+                {
+                    "title": "Airline strike grounds JFK flights",
+                    "url": "https://example.test/story?utm_medium=email&fbclid=123",
+                    "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                },
+                {
+                    "title": "jfk airport closure disrupts flights!",
+                    "url": "https://copy.test/reposted-story",
+                    "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                },
+                {
+                    "title": "Airport closure on unsafe page",
+                    "url": "javascript:alert(1)",
+                    "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                },
+                {
+                    "title": "Airport closure reported in the future",
+                    "url": "https://future.test/story",
+                    "seendate": (now + timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ"),
+                },
+                {
+                    "title": "Stale airport closure report",
+                    "url": "https://stale.test/story",
+                    "seendate": (now - timedelta(days=8)).strftime("%Y%m%dT%H%M%SZ"),
+                },
+                {
+                    "title": "x" * 301,
+                    "url": "https://oversized.test/story",
+                    "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                },
+            ]
+        },
+        now,
+    )
+
+    assert [article.url for article in signal.articles] == [
+        "https://example.test/story"
+    ]
+
+
+def test_news_text_risk_does_not_treat_strike_a_deal_as_labor_action() -> None:
+    provider = ContextProvider()
+
+    assert provider._news_text_risk("Airline and pilots strike a deal on pay") == 0
+    assert provider._news_text_risk("Pilot strike closes the airport") == pytest.approx(0.82)
+
+
+def test_gdelt_doc_failure_uses_free_gal_rss_fallback() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>JFK airport closure disrupts flights to LAX</title>
+        <link>https://rss-news.test/jfk-closure?utm_source=rss</link>
+        <pubDate>{pub_date}</pubDate>
+      </item>
+      <item>
+        <title>Unrelated airport closure</title>
+        <link>https://rss-news.test/unrelated</link>
+        <pubDate>{pub_date}</pubDate>
+      </item>
+    </channel></rss>"""
+    client = FakeClient(
+        {
+            GDELT_DOC_URL: TimeoutError("DOC API unavailable"),
+            GDELT_GAL_RSS_URL: rss,
+        }
+    )
+
+    signal = ContextProvider(client=client)._fetch_news(
+        "JFK",
+        "LAX",
+        now,
+        origin_name="John F. Kennedy International Airport",
+        destination_name="Los Angeles International Airport",
+    )
+
+    assert signal.source == "gdelt_gal_rss"
+    assert signal.value == pytest.approx(0.95)
+    assert [article.url for article in signal.articles] == [
+        "https://rss-news.test/jfk-closure"
+    ]
+    assert [(url, timeout) for url, _, timeout in client.calls] == [
+        (GDELT_DOC_URL, GDELT_REQUEST_TIMEOUT_SECONDS),
+        (GDELT_GAL_RSS_URL, 3.0),
+    ]
+
+
+def test_rss_route_matching_does_not_treat_lowercase_iata_word_as_airport_code() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Travelers can avoid disruption after schedule changes</title>
+        <link>https://rss-news.test/lowercase-can</link>
+        <pubDate>{pub_date}</pubDate>
+      </item>
+      <item>
+        <title>CAN airport disruption delays flights</title>
+        <link>https://rss-news.test/uppercase-can</link>
+        <pubDate>{pub_date}</pubDate>
+      </item>
+    </channel></rss>"""
+
+    signal = ContextProvider()._news_from_rss(
+        rss,
+        "CAN",
+        "PVG",
+        now,
+        origin_name=None,
+        destination_name=None,
+    )
+
+    assert [article.url for article in signal.articles] == [
+        "https://rss-news.test/uppercase-can"
+    ]
+
+
+def test_news_refresh_failure_uses_attenuated_stale_last_good_cache() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    client = FakeClient(
+        {
+            GDELT_DOC_URL: {
+                "articles": [
+                    {
+                        "title": "JFK airport closure disrupts flights to LAX",
+                        "url": "https://news.test/jfk-closure",
+                        "seendate": now.strftime("%Y%m%dT%H%M%SZ"),
+                    }
+                ]
+            }
+        }
+    )
+    provider = ContextProvider(client=client)
+    departure = now + timedelta(hours=2)
+
+    live = provider._news("JFK", "LAX", departure, now)
+    cache_key = next(iter(provider._news_cache))
+    _, cached_signal = provider._news_cache[cache_key]
+    provider._news_cache[cache_key] = (
+        monotonic() - NEWS_CACHE_TTL_SECONDS - 1,
+        cached_signal,
+    )
+    client.responses[GDELT_DOC_URL] = TimeoutError("DOC API unavailable")
+    client.responses[GDELT_GAL_RSS_URL] = TimeoutError("RSS unavailable")
+
+    stale = provider._news("JFK", "LAX", departure, now + timedelta(minutes=16))
+    provider_call_count = len(client.calls)
+    stale_again = provider._news("JFK", "LAX", departure, now + timedelta(minutes=17))
+
+    assert live.status == "live"
+    assert stale.status == "historical"
+    assert stale.source == "gdelt_doc_2_near_realtime_stale_cache"
+    assert stale.value == pytest.approx(live.value * 0.5)
+    assert stale.articles == live.articles
+    assert "latest successful cache" in stale.summary_en
+    assert stale_again.status == "historical"
+    assert stale_again.source == "gdelt_doc_2_near_realtime_stale_cache"
+    assert stale_again.value == stale.value
+    assert stale_again.articles == live.articles
+    assert len(client.calls) == provider_call_count
 
 
 def test_airlabs_schedules_and_route_airline_cache() -> None:

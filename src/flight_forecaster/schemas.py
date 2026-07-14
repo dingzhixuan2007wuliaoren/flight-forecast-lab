@@ -163,10 +163,11 @@ class ContextSignal(BaseModel):
 
 
 class NewsArticle(BaseModel):
-    title: str
-    url: str
-    source: str
+    title: str = Field(min_length=1, max_length=300)
+    url: str = Field(min_length=1, max_length=2048, pattern=r"^https?://")
+    source: str = Field(min_length=1, max_length=255)
     published_at: str | None = None
+    language: str | None = Field(default=None, max_length=16, pattern=r"^[a-z0-9-]+$")
 
 
 class NewsSignal(ContextSignal):

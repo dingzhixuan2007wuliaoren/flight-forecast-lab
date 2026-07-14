@@ -16,7 +16,7 @@ Flight Forecast Lab is a reproducible two-model project for comparing **estimate
 - 60 家全球主要航司及其可比较舱位场景；配置 AirLabs 免费密钥后，优先使用其返回的航线航司。
 - 三类完整排序：直飞优先、低价优先、学生友好优先。
 - 学生友好排序严格采用：最低价格 → 已确认免费托运行李 → 已确认实际学生折扣 → 已确认免费改签/退票 → 年龄与验证要求。
-- 无需密钥的 Open-Meteo 当前天气/小时预报与 NOAA METAR/TAF 航空气象；另结合 AirLabs 或 ADSB.lol 机场运行信号、GDELT 近期新闻信号。
+- 无需密钥的 Open-Meteo 当前天气/小时预报与 NOAA METAR/TAF 航空气象；另结合 AirLabs 或 ADSB.lol 机场运行信号，以及无需密钥的 GDELT 近实时新闻信号。
 - 外部服务超时、无数据或额度不足时，自动使用明确标注的历史/模型平均值或中性新闻值。
 - FastAPI、OpenAPI 文档、CLI 训练入口、时间切分评估和自动测试。
 
@@ -28,10 +28,10 @@ The UI always labels external context as `live`, `forecast`, `proxy`, `historica
 | --- | --- | --- |
 | 天气 | 2 小时内使用 Open-Meteo 当前模型天气并结合 NOAA METAR/TAF；2–30 小时结合小时预报与 TAF；其后至 16 天使用 Open-Meteo 小时预报 | 明确标记的合成训练集同月平均值 |
 | 机场运行 | 出发前 6 小时内使用 AirLabs 或 ADSB.lol 当前信号 | 明确标记的合成训练集机场平均值 |
-| 时事新闻 | GDELT DOC 2.0 最近 7 天相关中断新闻 | 中性值，不生成新闻 |
+| 时事新闻 | 无需密钥的 GDELT DOC 2.0 最近 7 天中断新闻，按最新观察时间排序；DOC 不可用时使用官方 GAL 滚动 RSS | 先使用最多 6 小时的带标签缓存并降低影响；没有缓存时返回中性值且不生成新闻 |
 | 航线航司 | 配置密钥时使用 AirLabs routes | 60 家全球模型比较目录 |
 
-AirLabs 密钥是可选项。没有任何密钥时项目仍可运行。Open-Meteo 公共免费端点限非商业用途并采用 CC BY 4.0；免费额度、覆盖和条款可能变化，公开部署前应重新检查[官方条款](https://open-meteo.com/en/terms)与其他来源要求，详见 [运行时数据与回退](docs/runtime-context.md)。
+AirLabs 密钥是可选项。没有任何密钥时项目仍可运行。Open-Meteo 公共免费端点限非商业用途并采用 CC BY 4.0；GDELT 允许免费使用，但使用或再分发其数据时须注明并链接 GDELT。免费额度、覆盖和条款可能变化，公开部署前应重新检查 [Open-Meteo 官方条款](https://open-meteo.com/en/terms)、[GDELT 项目说明](https://www.gdeltproject.org/about.html)与其他来源要求，详见 [运行时数据与回退](docs/runtime-context.md)。
 
 Open-Meteo 的“当前天气”来自约 15 分钟分辨率的天气模型，并非机场传感器实测；NOAA METAR 才是机场观测。页面会分别标记 `open_meteo_current_model`、`noaa_metar`、`forecast`、`live` 或 `proxy`，不会把远期历史平均值冒充实时天气。
 
@@ -145,9 +145,13 @@ For one-stop model scenarios, the offer duration adds a 90-minute connection and
 
 ## 新闻如何进入预测 / How news affects predictions
 
-系统查询 GDELT 最近 7 天内与起点、终点及航空中断词相关的文章，仅对真实返回的标题进行保守评分。所得 `news_disruption_index` 是票价和准点模型的正式输入特征。页面会显示最多 5 条来源文章；查询失败时值为 0、状态为 `neutral`，不会生成标题。
+系统通过无需 API 密钥的 GDELT DOC 2.0 查询最近 7 天内与起点、终点及航空中断词相关的文章，并使用 `DateDesc` 按 GDELT 最新观察时间排序。DOC 请求失败时会尝试 GDELT 官方 GAL RSS：该 RSS 每分钟更新，保留最近约 15 分钟的文章。相同航线的成功结果缓存 15 分钟；实时来源暂时失败时可返回不超过 6 小时、明确标为 `historical` 且降低模型影响的旧缓存；没有可用缓存才返回值 0、状态 `neutral`，且绝不虚构标题。
 
-The news relationship in the demo training data is synthetic. Article relevance does not prove that a particular flight will be affected, and the feature should be retrained and calibrated with lawful, representative historical snapshots before production use.
+仅对真实返回的标题进行保守评分，所得 `news_disruption_index` 是票价和准点模型的输入特征。页面最多显示 5 篇去重后的来源文章。页面中的文章时间是 GDELT 观察 / 索引该文章的时间，并不保证等于媒体标注的准确发布时间；标题保留来源语言，系统不伪装成机器翻译标题。
+
+The service queries the no-key GDELT DOC 2.0 API for route-related disruption coverage from the previous seven days and requests `DateDesc` ordering by GDELT's latest observed time. If DOC fails, it tries GDELT's official GAL RSS feed, which updates every minute and rolls over roughly the latest 15 minutes. A successful route result is fresh-cached for 15 minutes. When live providers fail, a cache no older than six hours may be returned as `historical` with reduced model influence; without a usable cache the signal is `neutral`, zero, and contains no invented headlines.
+
+Only real returned titles are scored, and the bounded `news_disruption_index` feeds both models. The page shows up to five deduplicated source articles. Article times are GDELT observed/indexed times and are not guaranteed to be exact publisher timestamps; headlines remain in their source language. The news relationship in the demo training data is synthetic. Article relevance does not prove that a particular flight will be affected, and the feature should be retrained and calibrated with lawful, representative historical snapshots before production use.
 
 ## 训练与验证 / Training and validation
 

@@ -340,6 +340,7 @@ class PredictionService:
                 published_at=(
                     article.published_at.isoformat() if article.published_at is not None else None
                 ),
+                language=article.language,
             )
             for article in context.news.articles
         ]

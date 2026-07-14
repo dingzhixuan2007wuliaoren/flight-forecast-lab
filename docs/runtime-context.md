@@ -10,7 +10,7 @@ substituted for a live bookable fare.
 | --- | --- | --- | --- |
 | Weather | Open-Meteo current/forecast plus NOAA METAR/TAF | Clearly labelled synthetic month/latitude prior | `live`, `forecast`, or `proxy` |
 | Airport operations | AirLabs schedules or ADSB.lol near the departure time | Clearly labelled synthetic airport/time prior | `live` or `proxy` |
-| Disruption news | GDELT DOC 2.0 articles from the recent seven-day window | Neutral value with no articles | `live` or `neutral` |
+| Disruption news | No-key GDELT DOC 2.0 articles from the recent seven-day window, ordered `DateDesc`; official GAL rolling RSS if DOC fails | Route cache no older than six hours with reduced influence, otherwise a neutral value with no articles | `live`, `historical`, or `neutral` |
 | Route airlines | AirLabs route records when a key is configured | Global connecting model-scenario catalog | `provider_confirmed` or `model_scenario` |
 
 The service catches provider timeouts, malformed payloads, quota exhaustion, and empty results.
@@ -48,16 +48,36 @@ on-time probability is the direct-leg probability squared. The response labels t
 
 ## News feature
 
-Recent news is queried with the origin and destination codes together with a narrow disruption
-vocabulary covering airport closure, strikes, conflict, severe disruption, cancellations, and
-related events. Only returned article titles are scored. The bounded score becomes
-`news_disruption_index`, which is a feature in both demo models.
+Recent news is queried without an API key through GDELT DOC 2.0, using the origin and destination
+codes/names together with a narrow disruption vocabulary covering airport closure, strikes,
+conflict, severe disruption, cancellations, and related events. The seven-day query requests
+`DateDesc`, so results are processed newest-observed first. GDELT's global source stream is
+near-real-time rather than instantaneous; its core data updates on an approximately 15-minute
+cycle.
+
+If the DOC request fails, the service tries GDELT's official Global Article List (GAL) RSS feed.
+That feed updates every minute and contains a rolling window of roughly the latest 15 minutes.
+Only route-relevant disruption titles are accepted from the global RSS stream. Successful results
+are cached by route for 15 minutes, independent of the requested departure date, which avoids
+repeating the same external query and reduces rate-limit pressure. Concurrent requests for the
+same route share a single refresh. If both live paths fail, a successful route cache no older than
+six hours may be returned as `historical`; its risk contribution is reduced. With no usable cache,
+the response is `neutral`, has value zero, and contains no articles.
+
+Only real returned article titles are scored. The bounded score becomes `news_disruption_index`,
+which is a feature in both demo models. Current news is less informative for departures farther in
+the future, so its model influence is attenuated as lead time increases. Articles are deduplicated
+by canonical URL and normalized title, and results prefer independent source domains instead of
+counting syndicated copies as separate corroboration.
 
 This is deliberately conservative:
 
-- no article is invented when GDELT is unavailable;
+- no article is invented when GDELT and the bounded stale cache are unavailable;
 - article presence does not prove that a particular flight will be affected;
-- the UI exposes article links, source, publication time, and the signal status;
+- the UI exposes article links, source, optional source language, observed/indexed time, and the
+  signal status;
+- GDELT's article time usually means when GDELT observed/indexed the URL, not a guaranteed exact
+  publisher timestamp; headlines remain in their source language;
 - the synthetic training relationship is an engineering demonstration, not validated causal
   evidence that news raises a particular fare or delay probability.
 
@@ -88,7 +108,11 @@ usually differ, later criteria most often act as tie-breakers.
 - [AirLabs schedules API](https://airlabs.co/docs/schedules)
 - [ADSB.lol public API](https://api.adsb.lol/)
 - [GDELT DOC 2.0 API](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/)
+- [GDELT Global Article List RSS](https://blog.gdeltproject.org/announcing-the-gdelt-article-list-rss-feed/)
+- [GDELT project use and attribution](https://www.gdeltproject.org/about.html)
 - [OurAirports public-domain data](https://ourairports.com/data/)
 
 Free-provider quotas, fields, coverage, and terms can change. Review the linked sources before
-deploying publicly or commercially. API keys belong in `.env`, never in the repository.
+deploying publicly or commercially. Use or redistribution of GDELT data must cite and link the
+GDELT Project; the dashboard includes that visible attribution. API keys belong in `.env`, never
+in the repository.

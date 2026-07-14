@@ -117,12 +117,24 @@ else:
 
 ### 响应结构
 
-- `context.weather`、`context.operations`、`context.news`：自动获取的三个上下文信号，均含 `[0, 1]` 数值、来源、获取时间、双语摘要和明确状态；新闻还可含最多五篇来源文章。
+- `context.weather`、`context.operations`、`context.news`：自动获取的三个上下文信号，均含 `[0, 1]` 数值、来源、获取时间、双语摘要和明确状态；新闻还可含最多五篇去重后的来源文章。
 - `offers`：逐航司、逐支持舱位的模型估价、80% 区间、行程时长、准点概率、风险等级、行李/学生/改签/退票状态及学生验证说明；`cabin_status=catalog_scenario` 明确表示舱位来自比较目录而非实时报价确认。
 - `rankings.direct_first`、`rankings.lowest_price`、`rankings.student_first`：引用 `offers[].id` 的完整排序。
 - `departure_time` / `departure_timezone`：服务按出发机场坐标解析后的带偏移时间和 IANA 时区；`warnings`：中英文限制说明；`model_version`：本次比较所用模型版本。
 
 上下文状态只允许 `live`、`forecast`、`proxy`、`historical`、`neutral` 或 `unavailable`。`route_status=provider_confirmed` 表示免费航线提供方确认该航司经营直飞航线；`model_scenario` 是一站中转比较场景，不能解释为真实可售航班。比较始终保留全球目录中的所有航司；提供方返回的其他航司也会追加到结果中。
+
+`context.news.articles[]` 的字段语义如下：
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `title` | string | 来源标题原文；系统不承诺翻译 |
+| `url` | HTTP(S) URL | 清理跟踪参数后的来源文章链接 |
+| `source` | string | GDELT 返回的来源域名或站点名 |
+| `language` | string / null | GDELT 提供时返回的可选来源语言代码 |
+| `published_at` | datetime | 兼容字段名；在 GDELT 集成中表示文章被观察 / 索引的时间，不保证等于媒体的准确发布时间 |
+
+GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败时可使用官方 GAL 滚动 RSS。成功新闻按航线新鲜缓存 15 分钟。实时来源失败时，不超过 6 小时的成功缓存可标为 `historical` 并降低模型影响；没有缓存时必须返回 `neutral`、值 0 和空文章列表。`context.news.observed_at` 表示该新闻上下文快照的获取时间，而不是某篇文章的发布时间。
 
 直飞 offer 使用 `punctuality_basis=direct_leg_model`。一站场景使用 `two_leg_independence_scenario`：其时长在直飞基准上增加 90 分钟，其行程准点率按两个同概率、相互独立航段同时准点的保守场景计算，即 `p_itinerary = p_leg²`。这是显式的模型假设，不是已确认转机方案。
 
@@ -149,7 +161,7 @@ else:
 - 由出发机场 IANA 时区得到的本地月份、星期和小时；训练表可显式提供 `departure_local_month`、`departure_local_weekday`、`departure_local_hour`，服务推理时会自动生成；
 - 标准化航线键（方向性是否保留需由任务声明）；
 - 根据机场坐标或版本化航线表推算距离/时长，并保留来源标记；
-- 在预测时刻获取天气预报、机场运行和近七日新闻，失败时使用带标签的回退值；
+- 在预测时刻获取天气预报、机场运行和近七日新闻；新闻优先使用 15 分钟航线缓存，失败时只允许使用不超过 6 小时且标为 `historical` 的旧缓存，否则中性回退；
 - `news_disruption_index` 同时进入票价与准点模型；天气和机场运行信号进入准点模型；
 - 训练数据中的距离/时长一致性诊断。
 
