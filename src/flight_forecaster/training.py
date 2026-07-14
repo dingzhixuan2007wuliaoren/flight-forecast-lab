@@ -39,7 +39,7 @@ from flight_forecaster.features import (
 )
 
 ARTIFACT_FILENAME = "model_bundle.joblib"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -163,6 +163,32 @@ def _ontime_metrics(
     }
 
 
+def _context_priors(frame: pd.DataFrame, *, data_mode: str) -> dict[str, Any]:
+    """Build fallback averages from training rows only, never from held-out future rows."""
+
+    working = frame.copy()
+    departure = pd.to_datetime(working["scheduled_departure"], utc=True, errors="raise")
+    weather = pd.to_numeric(working["weather_severity_forecast"], errors="raise").clip(0, 1)
+    operations = pd.to_numeric(working["origin_congestion_index"], errors="raise").clip(0, 1)
+    weather_by_month = weather.groupby(departure.dt.month).mean()
+    operations_by_origin = operations.groupby(working["origin"].astype(str).str.upper()).mean()
+    source = f"{data_mode}_training_average"
+    return {
+        "status": "proxy",
+        "source": source,
+        "weather_global": round(float(weather.mean()), 4),
+        "weather_by_month": {
+            str(int(month)): round(float(value), 4)
+            for month, value in weather_by_month.items()
+        },
+        "operations_global": round(float(operations.mean()), 4),
+        "operations_by_origin": {
+            str(origin): round(float(value), 4)
+            for origin, value in operations_by_origin.items()
+        },
+    }
+
+
 def train_models(
     price_data: pd.DataFrame,
     ontime_data: pd.DataFrame,
@@ -219,6 +245,7 @@ def train_models(
     ontime_probability = ontime_model.predict_proba(x_ontime_test)[:, 1]
     ontime_baseline = float(np.mean(y_ontime_train))
     ontime_metrics = _ontime_metrics(y_ontime_test, ontime_probability, ontime_baseline)
+    context_priors = _context_priors(ontime_split.train, data_mode=data_mode)
 
     metrics = {"price": price_metrics, "on_time": ontime_metrics}
     trained_at = datetime.now(UTC).isoformat()
@@ -257,6 +284,20 @@ def train_models(
             "price": "USD fare estimate conditional on itinerary and booking lead time",
             "on_time": "not cancelled and arrival delay below 15 minutes",
         },
+        "runtime_context_features": {
+            "news_disruption_index": (
+                "bounded recent-news signal; synthetic relationship in demo training"
+            ),
+            "weather_severity_forecast": "resolved automatically at prediction time",
+            "origin_congestion_index": "resolved automatically at prediction time",
+        },
+        "context_prior": {
+            "source": context_priors["source"],
+            "status": context_priors["status"],
+            "weather_month_groups": len(context_priors["weather_by_month"]),
+            "operations_airport_groups": len(context_priors["operations_by_origin"]),
+            "training_rows_only": True,
+        },
     }
     bundle = {
         "artifact_schema_version": SCHEMA_VERSION,
@@ -266,6 +307,7 @@ def train_models(
         "ontime_model": ontime_model,
         "metrics": metrics,
         "metadata": metadata,
+        "context_priors": context_priors,
     }
     joblib.dump(bundle, output_path / ARTIFACT_FILENAME, compress=3)
     (output_path / "metrics.json").write_text(

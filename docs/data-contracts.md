@@ -5,7 +5,7 @@
 ## 通用约定
 
 - 字段名使用 `snake_case`；CSV 使用 UTF-8，推荐处理后数据使用 Parquet。
-- 日期使用 ISO 8601 `YYYY-MM-DD`；时间戳必须含 UTC 偏移，例如 `2026-08-15T13:30:00-04:00` 或 `2026-08-15T17:30:00Z`。
+- 日期使用 ISO 8601 `YYYY-MM-DD`；单项接口时间戳必须含 UTC 偏移，例如 `2026-08-15T13:30:00-04:00` 或 `2026-08-15T17:30:00Z`。比较接口另允许无偏移墙钟时间，并按出发机场当地时区解释。
 - 机场使用大写三位字母或数字代码。通常是 IATA 风格代码，但训练数据必须保留代码体系与有效期元数据。
 - 航司代码统一大写；代码复用或历史更名应由带有效日期的映射表处理。
 - 距离统一为公里，时长统一为分钟，票价统一为美元。
@@ -26,16 +26,16 @@
 | `airline` | string | 是 | 2–3 位字母或数字；营销/票务口径在训练与推理间必须一致 |
 | `cabin` | string | 否 | `economy`、`premium_economy`、`business` 或 `first`；默认 `economy` |
 | `stops` | integer | 否 | 经停/转机次数，范围 0–3；默认 0 |
-| `duration_minutes` | integer | 是 | 计划总行程时长，`30 < value <= 1800` |
-| `distance_km` | number | 是 | 行程或市场距离，`50 < value <= 20000` |
-| `quote_time` | datetime | 是 | 本次价格预测/询价时刻，必须带时区 |
-| `departure_time` | datetime | 是 | 计划起飞时刻，必须带时区、晚于 `quote_time` 且不超过其后 370 天 |
+| `departure_time` | datetime | 是 | 计划起飞时刻，必须带时区、晚于服务接收时刻且不超过其后 370 天；`quote_time` 已从公开请求删除 |
 
-训练表在上述字段基础上增加：
+服务根据 `origin`、`destination` 和 `stops` 自动生成 `distance_km` 与 `duration_minutes`，常规请求不得手工覆盖。训练表仍须包含真实或经过验证的距离与时长，并在上述字段基础上增加：
 
 | 字段 | 类型 | 语义 |
 | --- | --- | --- |
 | `price_usd` | number | 回归目标；与行程范围一致的旅客支付/报价金额，必须为正 |
+| `duration_minutes` | integer | 训练特征；计划总行程时长，`30 < value <= 1800` |
+| `distance_km` | number | 训练特征；行程或市场距离，`50 < value <= 20000` |
+| `news_disruption_index` | number | 报价时刻可获得的近期航线新闻风险快照，范围 `[0, 1]`；不得使用事后新闻 |
 | `sample_weight` | number / null | 可选，例如 O&D 的旅客数；必须为正且不得导致重复加权 |
 | `source` | string | 数据来源，如 `synthetic`、`bts_db1b`、`bts_db1c` |
 | `source_record_id` | string / null | 可追溯但不进入模型的源记录键 |
@@ -49,8 +49,9 @@
 - `estimated_price_usd`：美元价格点估计；
 - `interval_80_low_usd` / `interval_80_high_usd`：80% 区间下界和上界；
 - `days_until_departure`：由两个输入时间戳计算的提前天数；
+- `distance_km` / `duration_minutes`：服务自动推算并实际送入模型的航程距离与时长；
 - `model_version`：产物中的模型版本；
-- `warning`：非实时报价与非最低价保证提示。
+- `warning` / `warning_en`：新闻风险已纳入模型、但结果并非实时报价或最低价保证的中英文提示。
 
 服务保证 `interval_80_low_usd <= estimated_price_usd <= interval_80_high_usd`，且下界不小于 0。
 
@@ -67,16 +68,17 @@
 | `origin` | string | 是 | 起飞机场，3 位字母或数字；服务会转为大写 |
 | `destination` | string | 是 | 到达机场，3 位字母或数字；不得与起点相同 |
 | `airline` | string | 是 | 2–3 位字母或数字；报告/运营口径在训练与推理间必须一致 |
-| `distance_km` | number | 是 | 计划航段距离，`50 < value <= 20000` |
-| `scheduled_departure` | datetime | 是 | 计划起飞时刻，必须带时区 |
-| `weather_severity_forecast` | number | 否 | 预测时刻可获得的天气严重度，范围 `[0, 1]`；默认 0.2，0 最轻、1 最重 |
-| `origin_congestion_index` | number | 否 | 预测时刻可获得的起飞机场拥堵指数，范围 `[0, 1]`；默认 0.4 |
+| `scheduled_departure` | datetime | 是 | 计划起飞时刻，必须带时区、晚于当前时刻且不超过其后 370 天 |
 
-训练 CSV 中，以上七个特征列全部必填（API 默认值不会自动补入 CSV），并增加原始结果与标签：
+调用方不再输入距离、天气严重度或机场拥堵。服务会根据起点、终点与计划时间自动解析距离，并获取预测时刻可用的天气、机场运行和近期新闻信号；免费数据源不可用或不适用于计划日期时，演示版使用仅由训练切分计算、明确标为 `proxy` 的同月天气/机场平均值，新闻则中性回退。默认产物来源标为 `synthetic_demo_training_average`；部署方只有在接入并审计真实历史聚合数据后才能标为 `historical`。训练 CSV 仍须保存当时真实可获得的上下文快照，并增加原始结果与标签：
 
 | 字段 | 类型 | 必填 | 语义 |
 | --- | --- | --- | --- |
 | `cancelled` | boolean | 是 | 是否取消 |
+| `distance_km` | number | 是 | 训练特征；计划航段距离，`50 < value <= 20000` |
+| `weather_severity_forecast` | number | 是 | 当时可获得的天气预报严重度快照，范围 `[0, 1]` |
+| `origin_congestion_index` | number | 是 | 当时可获得的出发机场运行/拥堵快照，范围 `[0, 1]` |
+| `news_disruption_index` | number | 是 | 当时可获得的近七日航线中断新闻风险，范围 `[0, 1]` |
 | `arrival_delay_minutes` | number / null | 条件必填 | 未取消且有最终到达记录时的实际到达延误；提前到达为负数 |
 | `on_time` | integer | 是 | 二分类目标，只能为 0 或 1 |
 | `source` | string | 是 | 如 `synthetic`、`bts_on_time` |
@@ -97,9 +99,36 @@ else:
 
 ### 输出语义
 
-响应字段为 `on_time_probability`、`disruption_probability`、`risk_level`、`definition` 和 `model_version`。两个概率均在 `[0, 1]` 且互为补数；当前风险分档为准点概率 `>= 0.80` 时 `low`，`>= 0.60` 且 `< 0.80` 时 `medium`，否则 `high`。
+响应字段为 `on_time_probability`、`disruption_probability`、自动推算的 `distance_km`、`risk_level`、中文 `definition`、英文 `definition_en` 和 `model_version`。两个概率均在 `[0, 1]` 且互为补数；当前风险分档为准点概率 `>= 0.80` 时 `low`，`>= 0.60` 且 `< 0.80` 时 `medium`，否则 `high`。
 
 风险分档阈值不是准点定义中的 15 分钟阈值：前者把模型概率转成面向用户的风险级别，后者从真实到达结果生成训练标签。
+
+## 航司与舱位比较 API
+
+端点：`POST /v1/compare`
+
+### 请求字段
+
+| 字段 | 类型 | 必填 | 约束与语义 |
+| --- | --- | --- | --- |
+| `origin` | string | 是 | 起飞机场 IATA 风格三位代码 |
+| `destination` | string | 是 | 到达机场 IATA 风格三位代码；不得与起点相同 |
+| `departure_time` | datetime | 是 | 未来计划时间；无偏移时按出发机场当地时区解释，有偏移时视为绝对时刻；不得超过当前时间后 370 天 |
+
+### 响应结构
+
+- `context.weather`、`context.operations`、`context.news`：自动获取的三个上下文信号，均含 `[0, 1]` 数值、来源、获取时间、双语摘要和明确状态；新闻还可含最多五篇来源文章。
+- `offers`：逐航司、逐支持舱位的模型估价、80% 区间、行程时长、准点概率、风险等级、行李/学生/改签/退票状态及学生验证说明；`cabin_status=catalog_scenario` 明确表示舱位来自比较目录而非实时报价确认。
+- `rankings.direct_first`、`rankings.lowest_price`、`rankings.student_first`：引用 `offers[].id` 的完整排序。
+- `departure_time` / `departure_timezone`：服务按出发机场坐标解析后的带偏移时间和 IANA 时区；`warnings`：中英文限制说明；`model_version`：本次比较所用模型版本。
+
+上下文状态只允许 `live`、`forecast`、`proxy`、`historical`、`neutral` 或 `unavailable`。`route_status=provider_confirmed` 表示免费航线提供方确认该航司经营直飞航线；`model_scenario` 是一站中转比较场景，不能解释为真实可售航班。比较始终保留全球目录中的所有航司；提供方返回的其他航司也会追加到结果中。
+
+直飞 offer 使用 `punctuality_basis=direct_leg_model`。一站场景使用 `two_leg_independence_scenario`：其时长在直飞基准上增加 90 分钟，其行程准点率按两个同概率、相互独立航段同时准点的保守场景计算，即 `p_itinerary = p_leg²`。这是显式的模型假设，不是已确认转机方案。
+
+政策状态采用严格证据语义。`unknown` 不等于“不包含”；公开学生计划只标为 `program_available`，不能当成当前航线、日期和舱位已经获得实际学生折扣。只有报价级证据才可使用 `confirmed_free`、`confirmed_included` 或 `confirmed_discount`。
+
+学生优先排序依次比较：最低模型价格、免费托运行李、已确认实际学生折扣、免费改签/退票、年龄与身份验证门槛。`program_available` 本身不满足“实际折扣”条件，只在最后一级使用其公开年龄和验证信息。由于价格是第一排序键，后续条件主要用于同价时打破平局。
 
 ## 服务辅助端点
 
@@ -107,6 +136,7 @@ else:
 | --- | --- |
 | `GET /health` | 进程与模型加载健康状态；不代表模型仍然准确 |
 | `GET /v1/model-info` | 模型版本、训练来源、时间和可用任务信息 |
+| `POST /v1/compare` | 用三个输入生成多航司、多舱位结果与三类完整排序 |
 
 健康响应不得暴露本地绝对路径、密钥或原始训练记录。模型信息应能让调用方识别是否误用了 `synthetic` 演示模型。
 
@@ -116,8 +146,12 @@ else:
 
 - `lead_time_hours = departure_time - quote_time`；
 - 起飞月份、星期、小时和周末标志；
+- 由出发机场 IANA 时区得到的本地月份、星期和小时；训练表可显式提供 `departure_local_month`、`departure_local_weekday`、`departure_local_hour`，服务推理时会自动生成；
 - 标准化航线键（方向性是否保留需由任务声明）；
-- 距离/时长的一致性诊断。
+- 根据机场坐标或版本化航线表推算距离/时长，并保留来源标记；
+- 在预测时刻获取天气预报、机场运行和近七日新闻，失败时使用带标签的回退值；
+- `news_disruption_index` 同时进入票价与准点模型；天气和机场运行信号进入准点模型；
+- 训练数据中的距离/时长一致性诊断。
 
 所有时间派生应使用字段自身的时区语义。不能先丢弃偏移再计算提前期；夏令时边界需要自动化测试。
 
@@ -144,5 +178,7 @@ else:
 - 补充可选字段：向后兼容的小版本；
 - 改变单位、枚举、标签或必填字段：不兼容的大版本；
 - 适配器必须拒绝未知的大版本，而不是猜测转换。
+
+当前演示模型使用 `schema_version = 2`；该版本增加 `news_disruption_index`，并将天气与机场运行输入从客户端请求迁移为服务端自动解析。
 
 API 客户端应以 `/v1/` 为稳定主版本边界，并读取 `/v1/model-info` 判断模型来源与版本。批量推理时还应保存请求模式版本、模型版本和预测时间，以便复现。

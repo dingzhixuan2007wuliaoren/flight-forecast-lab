@@ -7,7 +7,10 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
+from flight_forecaster.route_info import RouteLookupError
 from flight_forecaster.schemas import (
+    ComparisonRequest,
+    ComparisonResponse,
     OnTimePrediction,
     OnTimeRequest,
     PricePrediction,
@@ -18,8 +21,11 @@ from flight_forecaster.training import ARTIFACT_FILENAME
 
 app = FastAPI(
     title="Flight Forecast Lab",
-    version="0.1.0",
-    description="Future itinerary fare estimates and flight on-time probabilities.",
+    version="0.2.0",
+    description=(
+        "Bilingual global airline/cabin model comparisons with automatic weather, "
+        "airport-operations, and current-news context."
+    ),
 )
 
 
@@ -65,9 +71,23 @@ def model_info() -> dict:
 
 @app.post("/v1/predict/price", response_model=PricePrediction)
 def predict_price(request: PriceRequest) -> PricePrediction:
-    return _service_or_503().predict_price(request)
+    try:
+        return _service_or_503().predict_price(request)
+    except RouteLookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/v1/predict/on-time", response_model=OnTimePrediction)
 def predict_ontime(request: OnTimeRequest) -> OnTimePrediction:
-    return _service_or_503().predict_ontime(request)
+    try:
+        return _service_or_503().predict_ontime(request)
+    except RouteLookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/compare", response_model=ComparisonResponse)
+def compare_flights(request: ComparisonRequest) -> ComparisonResponse:
+    try:
+        return _service_or_503().compare(request)
+    except RouteLookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flight-forecast-lab"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reproducible flight fare estimation and on-time probability models"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -17,6 +17,7 @@ dependencies = [
   "pandas>=2.2,<4.0",
   "pydantic>=2.10,<3.0",
   "scikit-learn>=1.5,<2.0",
+  "timezonefinder>=8.2,<9.0",
   "uvicorn[standard]>=0.34,<1.0",
 ]
 

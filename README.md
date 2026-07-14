@@ -1,25 +1,41 @@
-# Flight Forecast Lab
+# Flight Forecast Lab / 全球航班预测实验室
 
-Flight Forecast Lab 是一个可复现的双任务机器学习项目：
+Flight Forecast Lab 是一个可复现的双任务机器学习项目，用于比较未来行程的**模型票价**与**准点概率**。页面只要求输入出发机场、到达机场和计划起飞时间；距离、飞行时长、天气、机场运行压力和近期新闻均由系统自动解析。
 
-- **机票价格回归**：根据航线、航司、舱位、经停、行程时长、距离、询价时间和起飞时间，给出未来行程的美元价格点估计与 **80% 预测区间**。
-- **准点率分类**：估计航班“准点”的概率。本项目将准点严格定义为：**航班未取消，且到达延误少于 15 分钟**。
+Flight Forecast Lab is a reproducible two-model project for comparing **estimated fares** and **on-time probabilities**. The dashboard only asks for origin, destination, and planned departure; distance, duration, weather, airport operations, and recent news are resolved automatically.
 
-项目包含命令行训练入口、FastAPI 推理服务、模型与数据说明，以及一个完全离线的合成数据演示。合成演示用于验证工程流程，**不是经过真实市场数据验证的生产预测器**。
+> 重要：默认模型使用确定性的合成演示数据训练。输出不是实时可购买报价，也不是经过全球真实数据验证的生产预测。
+>
+> Important: the default models are trained on deterministic synthetic demo data. Outputs are neither live bookable fares nor globally validated production forecasts.
 
-## 当前能力
+## 功能 / Features
 
-| 能力 | 输出 | 状态 |
+- 页面右上角 `中文 / English` 切换，并使用浏览器本地存储记住语言。
+- 页面输入的时间自动按出发机场当地 IANA 时区解释，不受用户电脑所在时区影响。
+- 119 个内置全球主要机场；其他有效 IATA 机场可通过免费的 OurAirports 目录回退解析。
+- 60 家全球主要航司及其可比较舱位场景；配置 AirLabs 免费密钥后，优先使用其返回的航线航司。
+- 三类完整排序：直飞优先、低价优先、学生友好优先。
+- 学生友好排序严格采用：最低价格 → 已确认免费托运行李 → 已确认实际学生折扣 → 已确认免费改签/退票 → 年龄与验证要求。
+- Open-Meteo 与 NOAA 航空气象、AirLabs 或 ADSB.lol 机场运行信号、GDELT 近期新闻信号。
+- 外部服务超时、无数据或额度不足时，自动使用明确标注的历史/模型平均值或中性新闻值。
+- FastAPI、OpenAPI 文档、CLI 训练入口、时间切分评估和自动测试。
+
+The UI always labels external context as `live`, `forecast`, `proxy`, `historical`, or `neutral`. Missing policy information remains `unknown`; the service never converts “unknown” into “not included.”
+
+## 免费数据模式 / Strict-free data mode
+
+| 数据 | 默认来源 | 无法获取时 |
 | --- | --- | --- |
-| 票价预测 | 点估计 + 80% 预测区间 | 可用；默认演示模型基于合成数据 |
-| 准点预测 | 准点概率 + 扰动概率 + 风险级别 | 可用；默认演示模型基于合成数据 |
-| 模型训练 | 两个任务一次训练并写入同一模型目录 | 可用 |
-| 在线推理 | FastAPI、自动 OpenAPI 文档 | 可用 |
-| 真实数据接入 | BTS DB1B/DB1C、BTS On-Time、NOAA 的字段映射与数据契约 | 已定义适配路径；数据需由使用者下载、校验并重新训练 |
+| 天气 | Open-Meteo；30 小时内可结合 NOAA TAF，2 小时内还可结合 METAR | 明确标记的合成训练集同月平均值 |
+| 机场运行 | 出发前 6 小时内使用 AirLabs 或 ADSB.lol 当前信号 | 明确标记的合成训练集机场平均值 |
+| 时事新闻 | GDELT DOC 2.0 最近 7 天相关中断新闻 | 中性值，不生成新闻 |
+| 航线航司 | 配置密钥时使用 AirLabs routes | 60 家全球模型比较目录 |
 
-## 快速开始
+AirLabs 密钥是可选项。没有任何密钥时项目仍可运行。免费额度、覆盖和条款可能变化，公开部署前应重新检查来源要求，详见 [运行时数据与回退](docs/runtime-context.md)。
 
-项目支持 Python **3.11–3.13**，建议使用 Python 3.12 并在虚拟环境中安装。当前依赖声明不接受 Python 3.14。项目不需要 API 密钥即可运行合成数据演示。
+## 快速运行 / Quick start
+
+支持 Python 3.11–3.13。Windows PowerShell：
 
 ```powershell
 git clone https://github.com/dingzhixuan2007wuliaoren/flight-forecast-lab.git
@@ -31,147 +47,131 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-macOS 或 Linux 激活虚拟环境时改用：
+训练并启动：
+
+```powershell
+python -m flight_forecaster train-demo --output artifacts/demo
+python -m flight_forecaster serve --model-dir artifacts/demo
+```
+
+打开：
+
+- 双语页面 / bilingual dashboard: <http://127.0.0.1:8000/>
+- API 文档 / API docs: <http://127.0.0.1:8000/docs>
+- 健康检查 / health: <http://127.0.0.1:8000/health>
+
+macOS 或 Linux 激活环境：
 
 ```bash
 source .venv/bin/activate
 ```
 
-训练内置演示模型：
+### 可选免费 AirLabs 密钥 / Optional free AirLabs key
 
-```bash
-python -m flight_forecaster train-demo --output artifacts/demo
-```
+密钥只保存在本地环境变量，不要提交到 GitHub：
 
-启动服务：
-
-```bash
+```powershell
+$env:AIRLABS_API_KEY="your-free-key"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
-服务启动后可访问：
+完全离线模式：
 
-- 浏览器演示页：<http://127.0.0.1:8000/>
-- 交互式 API 文档：<http://127.0.0.1:8000/docs>
-- 健康检查：<http://127.0.0.1:8000/health>
-- 模型信息：<http://127.0.0.1:8000/v1/model-info>
-
-### API 请求
-
-票价预测使用 `POST /v1/predict/price`：
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/predict/price \
-  -H "Content-Type: application/json" \
-  -d '{
-    "origin": "JFK",
-    "destination": "LAX",
-    "airline": "DL",
-    "cabin": "economy",
-    "stops": 0,
-    "duration_minutes": 365,
-    "distance_km": 3983,
-    "quote_time": "2026-07-11T12:00:00Z",
-    "departure_time": "2026-08-15T13:30:00Z"
-  }'
+```powershell
+$env:EXTERNAL_CONTEXT_ENABLED="0"
+python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
-响应包含：
+可参考 [.env.example](.env.example)，但项目不会自动上传或提交 `.env`。
+
+## 比较接口 / Comparison API
+
+`POST /v1/compare`
 
 ```json
 {
-  "estimated_price_usd": 246.12,
-  "interval_80_low_usd": 171.43,
-  "interval_80_high_usd": 320.81,
-  "days_until_departure": 35.1,
-  "model_version": "0.1.0",
-  "warning": "条件估价并非实时可购买报价，也不保证最低价。"
+  "origin": "YYZ",
+  "destination": "LHR",
+  "departure_time": "2026-09-15T08:00:00-04:00"
 }
 ```
 
-以上数值仅展示响应形状，不是固定预测结果。
+响应包括：
 
-准点预测使用 `POST /v1/predict/on-time`：
+- 自动推算的距离和飞行时长；
+- 天气、机场运行和新闻信号及来源、状态、时间；
+- 每个航司/舱位的模型价格、80% 区间、准点率和风险；
+- 行李、学生计划、退改、年龄及验证的保守状态；
+- `direct_first`、`lowest_price`、`student_first` 三组完整 ID 排序；
+- 中英双语限制说明。
 
-```bash
-curl -X POST http://127.0.0.1:8000/v1/predict/on-time \
-  -H "Content-Type: application/json" \
-  -d '{
-    "origin": "JFK",
-    "destination": "LAX",
-    "airline": "DL",
-    "distance_km": 3983,
-    "scheduled_departure": "2026-08-15T13:30:00Z",
-    "weather_severity_forecast": 0.25,
-    "origin_congestion_index": 0.40
-  }'
+The endpoint always returns the complete global comparison catalog. AirLabs-confirmed direct carriers are marked `provider_confirmed` and ranked first; all other airlines are explicit one-stop `model_scenario` entries. Every cabin is separately labelled `catalog_scenario`, because the free route source does not confirm cabin inventory.
+
+For one-stop model scenarios, the offer duration adds a 90-minute connection and the itinerary on-time probability uses an explicit two-independent-leg assumption (`p²`). The API labels this as `two_leg_independence_scenario`; it is not a confirmed connection itinerary.
+
+网页的无偏移时间按出发机场当地时区解释。直接调用 API 时，无偏移时间同样采用该语义；带偏移的 ISO 8601 时间则按绝对时刻处理。响应中的 `departure_timezone` 可用于核对。
+
+## 单项接口 / Individual endpoints
+
+模型票价：`POST /v1/predict/price`
+
+```json
+{
+  "origin": "JFK",
+  "destination": "LAX",
+  "airline": "DL",
+  "cabin": "economy",
+  "stops": 0,
+  "departure_time": "2026-09-15T08:00:00-04:00"
+}
 ```
 
-响应包含 `on_time_probability`、其补数 `disruption_probability`、`risk_level`（`low` / `medium` / `high`）、准点定义和模型版本。风险级别不是新的训练标签：服务按准点概率将其分为低、中、高扰动风险。
+准点概率：`POST /v1/predict/on-time`
 
-字段约束和单位见 [数据契约](docs/data-contracts.md)。运行中的 `/docs` 是请求与响应模式的最终依据。
+```json
+{
+  "origin": "JFK",
+  "destination": "LAX",
+  "airline": "DL",
+  "scheduled_departure": "2026-09-15T08:00:00-04:00"
+}
+```
 
-## 验证
+天气严重度、出发机场拥堵、距离和飞行时长均不再由调用方提交。
 
-```bash
+## 新闻如何进入预测 / How news affects predictions
+
+系统查询 GDELT 最近 7 天内与起点、终点及航空中断词相关的文章，仅对真实返回的标题进行保守评分。所得 `news_disruption_index` 是票价和准点模型的正式输入特征。页面会显示最多 5 条来源文章；查询失败时值为 0、状态为 `neutral`，不会生成标题。
+
+The news relationship in the demo training data is synthetic. Article relevance does not prove that a particular flight will be affected, and the feature should be retrained and calibrated with lawful, representative historical snapshots before production use.
+
+## 训练与验证 / Training and validation
+
+```powershell
 python -m pytest
+python -m ruff check src tests
 ```
 
-若已经把真实数据转换成契约兼容的 CSV，可用：
+使用符合契约的真实 CSV：
 
-```bash
-python -m flight_forecaster train-csv \
-  --price-csv data/processed/price.csv \
-  --ontime-csv data/processed/on_time.csv \
+```powershell
+python -m flight_forecaster train-csv `
+  --price-csv data/processed/price.csv `
+  --ontime-csv data/processed/on_time.csv `
   --output artifacts/custom
 ```
 
-该命令只负责读取统一契约并训练，不会自动下载 BTS 或 NOAA。模型目录将包含 `model_bundle.joblib`、`metrics.json`、`metadata.json` 和 `report.md`。也可以用 `predict-price` / `predict-on-time` 子命令读取单个 JSON 请求；运行 `python -m flight_forecaster --help` 查看参数。
+详细字段见 [数据契约](docs/data-contracts.md)，真实训练来源见 [数据来源](docs/data-sources.md)，评估边界见 [模型卡](MODEL_CARD.md)。
 
-建议在提交真实模型前同时检查：测试是否通过、时间切分是否正确、模型目录中的训练摘要是否与本次数据一致，以及 API 是否能加载该目录。
+## 关键限制 / Key limitations
 
-## 项目结构
+- 合成数据只证明训练、保存、加载和服务链路可工作，不代表真实市场表现。
+- 免费模式没有全球实时可售票价；所有页面价格均为模型估价。
+- 公共学生计划页面不能证明当前行程已经应用学生专属价；因此目录只标记 `program_available`，不标记“实际折扣已确认”。
+- 行李和退改通常依赖具体 fare brand。没有报价级证据时保持 `unknown`。
+- NOAA、Open-Meteo、AirLabs、ADSB.lol、GDELT 和 OurAirports 的覆盖、频率、许可与可用性可能变化。
+- 不应将输出用于自动购票、拒绝退款、差别定价或无人复核的重大财务/安全决策。
 
-```text
-src/flight_forecaster/   Python 包、训练流程、CLI、网页与 API
-tests/                   自动化测试
-docs/
-  data-sources.md        官方数据来源与接入注意事项
-  data-contracts.md      训练数据和 API 字段契约
-artifacts/               本地训练产物（通常不提交大型二进制文件）
-MODEL_CARD.md            模型用途、限制与评估要求
-```
+## License
 
-## 从演示迁移到真实数据
-
-官方来源：
-
-- [BTS Origin and Destination Survey（DB1B / DB1C）](https://www.bts.gov/topics/airlines-and-airports/origin-and-destination-survey-data)
-- [BTS Reporting Carrier On-Time Performance](https://transtats.bts.gov/DL_SelectFields.aspx?QO_fu146_anzr=&gnoyr_VQ=FGJ)
-- [NOAA/NCEI GHCN Hourly](https://www.ncei.noaa.gov/products/global-historical-climatology-network-hourly)
-- [NOAA Aviation Weather Center Data API](https://aviationweather.gov/data/api/)
-
-真实训练建议按以下顺序进行：
-
-1. 从 BTS 下载 O&D 票价数据。历史时期使用 DB1B；2025 年 7 月起的新制度数据使用 DB1C。
-2. 从 BTS Reporting Carrier On-Time Performance 下载航班级运行记录，按本项目定义生成 `on_time` 标签。
-3. 按机场和时间拼接 NOAA 天气。训练时只能使用预测时刻已经可知的信息；若使用实际观测天气，必须明确它只适合回溯分析，不能冒充未来天气预报。
-4. 先落到 [统一数据契约](docs/data-contracts.md)，完成重复值、单位、时区、缺失值和异常票价检查。
-5. 使用按时间向前滚动的训练/验证/测试切分重新训练，并在未见过的较新时间段上报告指标。
-
-官方入口与数据粒度详见 [真实数据来源](docs/data-sources.md)。
-
-## 重要限制
-
-- **合成数据不代表真实世界表现。** 它只能证明训练、保存、加载和服务链路可以工作。
-- **公开票价调查不等于实时搜索报价。** DB1B/DB1C 是抽样后的已售客票数据，存在发布滞后，也通常没有用户何时搜索或购买的完整信息。
-- **80% 区间不是承诺。** 它表示在与校准数据近似同分布时的经验覆盖目标；节假日、突发事件、新航线或分布漂移都会导致覆盖不足。
-- **准点概率不是航班状态。** 临时维护、机组、空管、天气和连锁延误可能在起飞前迅速变化。
-- **美国数据覆盖有限。** BTS 数据主要服务于美国国内航空统计；示例中的非美国机场代码不意味着模型已经具备相应地区的真实训练覆盖。
-- 不应将输出用于自动购买、拒绝退款、差别定价、安全关键决策，或在没有人工复核的情况下作出重大财务决定。
-
-更完整的适用范围、评估要求与风险说明见 [模型卡](MODEL_CARD.md)。
-
-## 许可证
-
-代码以 [MIT License](LICENSE) 发布。BTS 与 NOAA 数据不随本仓库再分发；下载和使用外部数据时，请自行核对其最新条款、引用要求和访问限制。
+代码以 [MIT License](LICENSE) 发布。第三方数据不随 MIT 许可证重新授权；使用者必须遵守各来源的当前条款与署名要求。

@@ -83,9 +83,23 @@ on_time = (Cancelled != 1) AND (ArrDelay < 15)
 
 ### 防止天气泄漏
 
-NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预测未来航班时，实际天气尚不可知。生产系统应接入在预测时刻真实可获得的预报快照，并使用同一预报时效训练。若项目只接入历史观测，API 中的 `weather_severity_forecast` 必须由调用方提供，且文档和 UI 应明确它是外部预测输入。
+NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预测未来航班时，实际天气尚不可知。生产系统应保存预测时刻真实可获得的预报快照，并使用相同预报时效训练。本项目的服务端会自动解析 Open-Meteo/NOAA 天气信号；演示版数据源不可用时返回明确标记的合成模型先验，不冒充真实历史均值，也不要求用户填写天气严重度。
 
-## 4. 建议的数据落地层
+## 4. 运行时免费上下文来源
+
+比较和准点接口还会在运行时查询以下免费来源；这些信号是短期上下文，不会被伪装成实时可售票价：
+
+| 信号 | 优先来源 | 无法获取时 |
+| --- | --- | --- |
+| 全球机场坐标 | [OurAirports public-domain data](https://ourairports.com/data/) | 内置主要全球机场目录；未知代码返回校验错误 |
+| 天气预报 | [Open-Meteo](https://open-meteo.com/en/docs) 与 [NOAA Aviation Weather](https://aviationweather.gov/data/api/) | 月份、纬度与机场类型的历史先验 |
+| 机场运行 | 配置免费 AirLabs key 后使用 [AirLabs schedules](https://airlabs.co/docs/schedules) | [ADSB.lol](https://api.adsb.lol/) 密度代理，再回退机场/时段先验 |
+| 时事新闻 | [GDELT DOC 2.0](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) 近七日中断类新闻 | 中性值且不虚构文章 |
+| 航线航司 | AirLabs route records | 60 家全球航司的模型比较场景，并标为 `model_scenario` |
+
+详细的状态、缓存、严格政策字段和失败回退语义见 [`runtime-context.md`](runtime-context.md)。免费服务的配额、覆盖和条款可能变化，公开部署前应重新核对官方说明。
+
+## 5. 建议的数据落地层
 
 不要直接在下载压缩包上训练。建议保存三层：
 
@@ -108,7 +122,7 @@ data/processed/<dataset_version>/   符合项目数据契约的训练表
 
 大型原始数据和含许可限制的数据不应直接提交到 Git。可提交小型、去标识、来源明确的测试夹具，以及生成它们的说明。
 
-## 5. 合并边界
+## 6. 合并边界
 
 票价和准点数据的观测单位不同：O&D 记录描述客票/市场/行程，而 On-Time 记录描述实际航班。不要仅凭起点、终点、航司和月份做多对多连接后把它称为同一旅程。
 
