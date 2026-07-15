@@ -222,6 +222,16 @@ class _Client:
                 self.booking_calls.append(kwargs)
             token = str(params["booking_token"])
             travel_class = int(token.split("-")[2])
+            expected_context = {
+                "departure_id": "YYZ",
+                "arrival_id": "LHR",
+                "outbound_date": "2026-08-20",
+                "type": 2,
+                "travel_class": travel_class,
+                "adults": 1,
+            }
+            if any(params.get(key) != value for key, value in expected_context.items()):
+                return _Response({"error": "Missing parameter `departure_id`."}, 400)
             payload = _booking_payload(travel_class, invalid=self.invalid)
             payload["search_metadata"]["created_at"] = self.booking_created_at
             payload["search_metadata"]["status"] = self.booking_metadata_status
@@ -320,6 +330,16 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
     for call in client.booking_calls:
         assert "booking_token" in call["params"]
         assert call["params"]["engine"] == "google_flights"
+        assert call["params"]["departure_id"] == "YYZ"
+        assert call["params"]["arrival_id"] == "LHR"
+        assert call["params"]["outbound_date"] == "2026-08-20"
+        assert call["params"]["type"] == 2
+        assert call["params"]["travel_class"] == int(
+            str(call["params"]["booking_token"]).split("-")[2]
+        )
+        assert call["params"]["adults"] == 1
+        assert "departure_token" not in call["params"]
+        assert "return_date" not in call["params"]
         assert "no_cache" not in call["params"]
         assert call["timeout"] == 25.0
 
@@ -354,6 +374,30 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
             period_key=_HOUR_BUCKET_KEY,
         )
         == 10
+    )
+
+
+def test_booking_endpoint_bad_request_remains_a_provider_error(tmp_path: Path) -> None:
+    class _BookingBadRequestClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            if url == SERPAPI_SEARCH_URL and "booking_token" in kwargs["params"]:
+                return _Response({"error": "booking request rejected"}, 400)
+            return response
+
+    client = _BookingBadRequestClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "provider_error"
+    assert result.offers == ()
+    assert len(client.booking_calls) == 6
+    assert any(
+        diagnostic.stage == "booking_options"
+        and diagnostic.http_status == 400
+        and diagnostic.exception_type == "ProviderHttpError"
+        for diagnostic in result.diagnostics
     )
 
 

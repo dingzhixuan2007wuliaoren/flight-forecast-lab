@@ -965,7 +965,10 @@ class SerpApiFlightOfferProvider:
                 futures = {
                     pool.submit(
                         self._booking_options,
-                        candidate.booking_token,
+                        candidate,
+                        origin,
+                        destination,
+                        departure_date,
                         force_refresh,
                         diagnostics,
                     ): (position, candidate)
@@ -1153,13 +1156,26 @@ class SerpApiFlightOfferProvider:
 
     def _booking_options(
         self,
-        booking_token: str,
+        candidate: _SearchCandidate,
+        origin: str,
+        destination: str,
+        departure_date: date,
         force_refresh: bool,
         diagnostics: _DiagnosticCollector,
     ) -> tuple[dict[str, Any], _ProviderObservation, int]:
+        # SerpApi documents booking_token as the itinerary selector, but its live
+        # Google Flights endpoint also validates the originating search context.
+        # Replay the core one-way query so a valid token is not rejected with a
+        # misleading HTTP 400 "missing departure_id" response.
         params: dict[str, Any] = {
             "engine": "google_flights",
-            "booking_token": booking_token,
+            "booking_token": candidate.booking_token,
+            "departure_id": origin,
+            "arrival_id": destination,
+            "outbound_date": departure_date.isoformat(),
+            "type": 2,
+            "travel_class": _SERPAPI_TRAVEL_CLASSES[candidate.cabin],
+            "adults": 1,
             "currency": "USD",
             "hl": "en",
             "gl": "us",
