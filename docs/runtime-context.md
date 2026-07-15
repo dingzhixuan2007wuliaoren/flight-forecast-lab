@@ -122,6 +122,15 @@ three stops). Its `live_fare` is independent of `estimated_price_usd` and its 80
 The free response does not reliably establish whether taxes are included, so `taxes_included` is
 unknown rather than asserted true.
 
+If a Search API response is `Processing` or `Queued`, the adapter validates the opaque Search ID
+against an allowlist and polls only the fixed `https://serpapi.com/searches/{search_id}.json`
+archive path with bounded 0.5, 1, 1.5, and 2 second backoff. It never follows the response's arbitrary
+archive URL and never resubmits the four-cabin search automatically. Archive reads are reported as
+`archive_poll_count`; they do not increase `call_count` or the conservative quota reservation.
+An unresolved archive returns `provider_processing`, a terminal/HTTP/transport failure returns
+`provider_error`, and `no_results` is reserved for a successfully completed search with no offer
+that passes strict verification.
+
 The free allowance is a provider-account limit, not an unlimited service guarantee. The local
 ledger conservatively reserves every attempted initial or token request before issuing it, and stops
 before `SERPAPI_MONTHLY_LIMIT` is exceeded. Its compatibility field `monthly_calls_used` follows the
@@ -134,6 +143,12 @@ rate limiting, provider failure, no matching offers, an absent
 `booking_token`, an itinerary mismatch, or a missing usable booking option is represented by
 explicit `fare_search_metadata.status` and `result_status` values with empty `offers`; none enables
 a model or timetable fallback.
+
+Provider diagnostics are deliberately data-minimized. The response contains at most ten records,
+and the ignored runtime SQLite database retains at most 500 across restarts. A record contains only
+observation time, request stage, HTTP status, a stable exception type, and a format-validated Search
+ID. API keys, booking tokens, request parameters, complete URLs, and raw provider error text are
+never included.
 
 SerpApi may serve a provider result cached for up to about one hour; the application also maintains
 a five-minute strict-result cache. `live_fare.provider_cache_hit` is inferred from a local cache hit

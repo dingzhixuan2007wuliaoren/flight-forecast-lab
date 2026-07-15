@@ -13,6 +13,7 @@ import pytest
 
 from flight_forecaster.availability import (
     SERPAPI_ACCOUNT_URL,
+    SERPAPI_SEARCH_ARCHIVE_URL,
     SERPAPI_SEARCH_URL,
     NullFlightOfferProvider,
     SerpApiFlightOfferProvider,
@@ -238,6 +239,7 @@ def _provider(
     client: Any,
     *,
     monthly_limit: int | None = 250,
+    poll_delays_seconds: tuple[float, ...] = (0.0,),
 ) -> SerpApiFlightOfferProvider:
     return SerpApiFlightOfferProvider(
         "serpapi-key",
@@ -245,6 +247,8 @@ def _provider(
         monthly_limit=monthly_limit,
         client=client,
         now_provider=lambda: _FETCHED_AT,
+        poll_delays_seconds=poll_delays_seconds,
+        sleep_provider=lambda _seconds: None,
     )
 
 
@@ -264,6 +268,17 @@ def _ledger_calls(
         ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _diagnostic_rows(path: Path) -> list[tuple[Any, ...]]:
+    with sqlite3.connect(path) as connection:
+        return connection.execute(
+            """
+            SELECT stage, http_status, exception_type, search_id
+            FROM serpapi_provider_diagnostics
+            ORDER BY diagnostic_id
+            """
+        ).fetchall()
 
 
 def test_search_then_booking_options_returns_only_strictly_verified_offers(
@@ -340,6 +355,280 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
         )
         == 10
     )
+
+
+def test_processing_cabin_search_polls_archive_without_resubmitting_or_using_quota(
+    tmp_path: Path,
+) -> None:
+    search_id = "pendingsearch01"
+    archive_url = SERPAPI_SEARCH_ARCHIVE_URL.format(search_id=search_id)
+
+    class _PendingCabinClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.archive_calls: list[dict[str, Any]] = []
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if url == archive_url:
+                with self._lock:
+                    self.archive_calls.append(kwargs)
+                payload = _search_payload(1)
+                payload["search_metadata"]["id"] = search_id
+                return _Response(payload)
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.search_calls.append(kwargs)
+                return _Response(
+                    {
+                        "search_metadata": {
+                            "id": search_id,
+                            "status": "Processing",
+                        }
+                    }
+                )
+            return super().get(url, **kwargs)
+
+    client = _PendingCabinClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert result.calls_used == 10
+    assert result.archive_poll_count == 1
+    assert len(client.search_calls) == 4
+    assert len(client.booking_calls) == 6
+    assert len(client.archive_calls) == 1
+    assert client.archive_calls[0]["params"] == {"api_key": "serpapi-key"}
+    assert client.archive_calls[0]["timeout"] == 2.0
+    assert any(
+        diagnostic.exception_type == "ProviderPending"
+        and diagnostic.search_id == search_id
+        for diagnostic in result.diagnostics
+    )
+    ledger_path = tmp_path / "private" / "usage.sqlite3"
+    assert _ledger_calls(ledger_path) == 10
+    rows = _diagnostic_rows(ledger_path)
+    assert ("cabin_search", 200, "ProviderPending", search_id) in rows
+    persisted = json.dumps(rows)
+    assert "serpapi-key" not in persisted
+    assert "booking-token" not in persisted
+    assert "https://" not in persisted
+
+
+def test_queued_booking_option_polls_until_success_without_new_search(
+    tmp_path: Path,
+) -> None:
+    search_id = "queuedbooking01"
+    archive_url = SERPAPI_SEARCH_ARCHIVE_URL.format(search_id=search_id)
+
+    class _QueuedBookingClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.archive_calls = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if url == archive_url:
+                with self._lock:
+                    self.archive_calls += 1
+                    poll_number = self.archive_calls
+                if poll_number == 1:
+                    return _Response(
+                        {
+                            "search_metadata": {
+                                "id": search_id,
+                                "status": "Processing",
+                            }
+                        }
+                    )
+                payload = _booking_payload(1)
+                payload["search_metadata"]["id"] = search_id
+                return _Response(payload)
+            if (
+                url == SERPAPI_SEARCH_URL
+                and kwargs["params"].get("booking_token") == "booking-token-1"
+            ):
+                with self._lock:
+                    self.booking_calls.append(kwargs)
+                return _Response(
+                    {
+                        "search_metadata": {
+                            "id": search_id,
+                            "status": "Queued",
+                        }
+                    }
+                )
+            return super().get(url, **kwargs)
+
+    client = _QueuedBookingClient()
+    result = _provider(
+        tmp_path,
+        client,
+        poll_delays_seconds=(0.0, 0.0),
+    ).search("YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT)
+
+    assert result.status == "confirmed_offers"
+    assert result.calls_used == 10
+    assert result.archive_poll_count == 2
+    assert len(client.search_calls) == 4
+    assert len(client.booking_calls) == 6
+    assert client.archive_calls == 2
+
+
+def test_processing_timeout_is_distinct_and_never_restarts_four_cabin_searches(
+    tmp_path: Path,
+) -> None:
+    search_id = "stillpending01"
+    archive_url = SERPAPI_SEARCH_ARCHIVE_URL.format(search_id=search_id)
+
+    class _StillPendingClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.archive_calls = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if url == archive_url:
+                with self._lock:
+                    self.archive_calls += 1
+                return _Response(
+                    {
+                        "search_metadata": {
+                            "id": search_id,
+                            "status": "Queued",
+                        }
+                    }
+                )
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.search_calls.append(kwargs)
+                return _Response(
+                    {
+                        "search_metadata": {
+                            "id": search_id,
+                            "status": "Processing",
+                        }
+                    }
+                )
+            return super().get(url, **kwargs)
+
+    client = _StillPendingClient()
+    result = _provider(
+        tmp_path,
+        client,
+        poll_delays_seconds=(0.0, 0.0, 0.0),
+    ).search("YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT)
+
+    assert result.status == "provider_processing"
+    assert result.offers == ()
+    assert result.calls_used == 4
+    assert result.archive_poll_count == 3
+    assert len(client.search_calls) == 4
+    assert client.archive_calls == 3
+    assert client.booking_calls == []
+    assert any(
+        diagnostic.exception_type == "ProviderProcessingError"
+        and diagnostic.search_id == search_id
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_pending_search_id_must_pass_allowlist_before_archive_poll(
+    tmp_path: Path,
+) -> None:
+    class _InvalidSearchIdClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.unexpected_urls: list[str] = []
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if url not in {SERPAPI_ACCOUNT_URL, SERPAPI_SEARCH_URL}:
+                self.unexpected_urls.append(url)
+                raise AssertionError("an untrusted archive URL was requested")
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.search_calls.append(kwargs)
+                return _Response(
+                    {
+                        "search_metadata": {
+                            "id": "../../unsafe?api_key=secret",
+                            "status": "Processing",
+                        }
+                    }
+                )
+            return super().get(url, **kwargs)
+
+    client = _InvalidSearchIdClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "provider_unavailable"
+    assert result.offers == ()
+    assert len(client.search_calls) == 4
+    assert client.unexpected_urls == []
+    assert result.archive_poll_count == 0
+    assert any(
+        diagnostic.exception_type == "PayloadError"
+        and diagnostic.search_id is None
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_terminal_provider_error_is_not_reported_as_no_verified_offer(
+    tmp_path: Path,
+) -> None:
+    search_id = "failedsearch01"
+
+    class _TerminalErrorClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.search_calls.append(kwargs)
+                return _Response(
+                    {
+                        "search_metadata": {
+                            "id": search_id,
+                            "status": "Error",
+                        },
+                        "error": "deliberately not persisted",
+                    }
+                )
+            return super().get(url, **kwargs)
+
+    client = _TerminalErrorClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "provider_error"
+    assert result.offers == ()
+    assert len(client.search_calls) == 4
+    assert client.booking_calls == []
+    assert any(
+        diagnostic.exception_type == "ProviderSearchError"
+        and diagnostic.search_id == search_id
+        for diagnostic in result.diagnostics
+    )
+    persisted = json.dumps(
+        _diagnostic_rows(tmp_path / "private" / "usage.sqlite3")
+    )
+    assert "deliberately not persisted" not in persisted
 
 
 def test_candidate_requires_booking_token_and_booking_response_requires_evidence(
@@ -919,7 +1208,7 @@ def test_booking_token_verification_runs_in_parallel(tmp_path: Path) -> None:
         (401, 200, "authentication_failed"),
         (200, 401, "authentication_failed"),
         (200, 429, "rate_limited"),
-        (503, 200, "provider_unavailable"),
+        (503, 200, "provider_error"),
     ],
 )
 def test_provider_errors_are_distinguished_and_fail_closed(

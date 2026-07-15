@@ -549,6 +549,30 @@ class LiveFare(BaseModel):
         return self
 
 
+class FareProviderDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observed_at: datetime
+    stage: Literal[
+        "account",
+        "cabin_search",
+        "booking_options",
+        "search_archive",
+        "validation",
+    ]
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    exception_type: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+    search_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{8,128}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_diagnostic(self) -> FareProviderDiagnostic:
+        _require_timezone(self.observed_at)
+        return self
+
+
 class FareSearchMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -561,6 +585,8 @@ class FareSearchMetadata(BaseModel):
         "rate_limited",
         "budget_not_configured",
         "budget_exhausted",
+        "provider_processing",
+        "provider_error",
         "provider_unavailable",
     ]
     provider_code: Literal["serpapi_google_flights", "none"]
@@ -577,6 +603,11 @@ class FareSearchMetadata(BaseModel):
     search_monthly_used: int | None = Field(default=None, ge=0)
     pricing_monthly_limit: int | None = Field(default=None, ge=0)
     pricing_monthly_used: int | None = Field(default=None, ge=0)
+    archive_poll_count: int = Field(default=0, ge=0)
+    diagnostics: list[FareProviderDiagnostic] = Field(
+        default_factory=list,
+        max_length=10,
+    )
     notice: BilingualText
 
     @model_validator(mode="after")
@@ -905,6 +936,8 @@ class ComparisonResponse(BaseModel):
         "fare_provider_rate_limited",
         "fare_provider_budget_not_configured",
         "fare_provider_budget_exhausted",
+        "fare_provider_processing",
+        "fare_provider_error",
         "fare_provider_unavailable",
         "verified_schedules_found",
         "no_verified_schedule",
@@ -949,6 +982,8 @@ class ComparisonResponse(BaseModel):
             "rate_limited": "fare_provider_rate_limited",
             "budget_not_configured": "fare_provider_budget_not_configured",
             "budget_exhausted": "fare_provider_budget_exhausted",
+            "provider_processing": "fare_provider_processing",
+            "provider_error": "fare_provider_error",
             "provider_unavailable": "fare_provider_unavailable",
         }[self.fare_search_metadata.status]
         if self.result_status != expected_status:

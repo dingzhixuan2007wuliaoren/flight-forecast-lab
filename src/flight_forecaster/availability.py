@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any, Literal
 from urllib import error, parse, request
 
@@ -35,11 +35,14 @@ SearchStatus = Literal[
     "rate_limited",
     "budget_not_configured",
     "budget_exhausted",
+    "provider_processing",
+    "provider_error",
     "provider_unavailable",
 ]
 
 SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
 SERPAPI_ACCOUNT_URL = "https://serpapi.com/account.json"
+SERPAPI_SEARCH_ARCHIVE_URL = "https://serpapi.com/searches/{search_id}.json"
 SERPAPI_PROVIDER_CODE = "serpapi_google_flights"
 SERPAPI_PROVIDER_NAME = "SerpApi Google Flights"
 SERPAPI_DEFAULT_MONTHLY_LIMIT = 250
@@ -48,12 +51,16 @@ FLIGHT_OFFER_CACHE_TTL_SECONDS = 300.0
 MAX_PROVIDER_RESPONSE_BYTES = 5_000_000
 REQUEST_TIMEOUT_SECONDS = 25.0
 ACCOUNT_REQUEST_TIMEOUT_SECONDS = 8.0
+SEARCH_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 2.0
 MAX_CACHE_ENTRIES = 128
 MAX_CANDIDATES = 6
 SERPAPI_MAX_HOURLY_LIMIT = 50
 MAX_PROVIDER_CACHE_AGE_SECONDS = 65 * 60
 MAX_PROVIDER_FUTURE_SKEW_SECONDS = 5 * 60
 PROVIDER_CACHE_HIT_AGE_SECONDS = 60
+PROVIDER_POLL_DELAYS_SECONDS = (0.5, 1.0, 1.5, 2.0)
+MAX_PROVIDER_DIAGNOSTICS = 10
+MAX_PERSISTED_PROVIDER_DIAGNOSTICS = 500
 
 _CABINS: tuple[Cabin, ...] = (
     "economy",
@@ -78,6 +85,38 @@ _AIRLINE_PATTERN = re.compile(r"^[A-Z0-9]{2,3}$")
 _FLIGHT_NUMBER_PATTERN = re.compile(r"^[A-Z0-9]{1,8}$")
 _FULL_FLIGHT_NUMBER_PATTERN = re.compile(r"^([A-Z0-9]{2,3})\s+([A-Z0-9]{1,8})$")
 _SAFE_SHORT_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]+$")
+_SEARCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+_EXCEPTION_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+DiagnosticStage = Literal[
+    "account",
+    "cabin_search",
+    "booking_options",
+    "search_archive",
+    "validation",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderDiagnostic:
+    """A deliberately small, secret-free provider diagnostic record."""
+
+    observed_at: datetime
+    stage: DiagnosticStage
+    http_status: int | None
+    exception_type: str
+    search_id: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observed_at", _utc(self.observed_at))
+        if self.http_status is not None and not 100 <= self.http_status <= 599:
+            raise ValueError("provider diagnostic HTTP status is invalid")
+        if not _EXCEPTION_TYPE_PATTERN.fullmatch(self.exception_type):
+            raise ValueError("provider diagnostic exception type is invalid")
+        if self.search_id is not None and not _SEARCH_ID_PATTERN.fullmatch(
+            self.search_id
+        ):
+            raise ValueError("provider diagnostic search ID is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,11 +264,14 @@ class FlightOfferSearchResult:
     pricing_monthly_limit: int | None = None
     search_monthly_used: int | None = None
     pricing_monthly_used: int | None = None
+    archive_poll_count: int = 0
+    diagnostics: tuple[ProviderDiagnostic, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "offers", tuple(self.offers))
         object.__setattr__(self, "observed_at", _utc(self.observed_at))
         object.__setattr__(self, "searched_cabins", tuple(self.searched_cabins))
+        object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
 
     @property
     def configured_search_monthly_limit(self) -> int | None:
@@ -257,6 +299,22 @@ class _PayloadError(_ProviderError):
 
 
 class _UsageError(_ProviderError):
+    pass
+
+
+class _ProviderHttpError(_ProviderError):
+    pass
+
+
+class _ProviderSearchError(_ProviderError):
+    pass
+
+
+class _ProviderProcessingError(_ProviderError):
+    pass
+
+
+class _TransportError(_ProviderError):
     pass
 
 
@@ -425,6 +483,55 @@ class _UsageLedger:
             if connection is not None:
                 connection.close()
 
+    def record_diagnostic(self, diagnostic: ProviderDiagnostic) -> None:
+        """Persist only the allowlisted diagnostic fields with bounded retention."""
+
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._connect()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO serpapi_provider_diagnostics(
+                    observed_at,
+                    stage,
+                    http_status,
+                    exception_type,
+                    search_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    diagnostic.observed_at.isoformat(),
+                    diagnostic.stage,
+                    diagnostic.http_status,
+                    diagnostic.exception_type,
+                    diagnostic.search_id,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM serpapi_provider_diagnostics
+                WHERE diagnostic_id NOT IN (
+                    SELECT diagnostic_id
+                    FROM serpapi_provider_diagnostics
+                    ORDER BY diagnostic_id DESC
+                    LIMIT ?
+                )
+                """,
+                (MAX_PERSISTED_PROVIDER_DIAGNOSTICS,),
+            )
+            connection.commit()
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise _UsageError("provider diagnostic ledger is unwritable") from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
@@ -437,6 +544,28 @@ class _UsageLedger:
                 calls INTEGER NOT NULL CHECK(calls >= 0),
                 PRIMARY KEY(scope, period_key)
             ) WITHOUT ROWID
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS serpapi_provider_diagnostics (
+                diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_at TEXT NOT NULL,
+                stage TEXT NOT NULL CHECK(
+                    stage IN (
+                        'account',
+                        'cabin_search',
+                        'booking_options',
+                        'search_archive',
+                        'validation'
+                    )
+                ),
+                http_status INTEGER CHECK(
+                    http_status IS NULL OR http_status BETWEEN 100 AND 599
+                ),
+                exception_type TEXT NOT NULL,
+                search_id TEXT
+            )
             """
         )
         return connection
@@ -471,6 +600,69 @@ class _UsageLedger:
             """,
             (scope, period_key, calls),
         )
+
+
+class _DiagnosticCollector:
+    """Collect per-comparison diagnostics and persist a bounded local history."""
+
+    def __init__(self, ledger: _UsageLedger) -> None:
+        self._ledger = ledger
+        self._events: list[ProviderDiagnostic] = []
+        self._archive_poll_count = 0
+        self._lock = threading.Lock()
+
+    def note_archive_poll(self) -> None:
+        with self._lock:
+            self._archive_poll_count += 1
+
+    @property
+    def archive_poll_count(self) -> int:
+        with self._lock:
+            return self._archive_poll_count
+
+    def record(
+        self,
+        *,
+        observed_at: datetime,
+        stage: DiagnosticStage,
+        http_status: int | None,
+        exception_type: str,
+        search_id: str | None,
+    ) -> None:
+        diagnostic = ProviderDiagnostic(
+            observed_at=observed_at,
+            stage=stage,
+            http_status=(
+                http_status
+                if http_status is not None and 100 <= http_status <= 599
+                else None
+            ),
+            exception_type=_safe_exception_type(exception_type),
+            search_id=_safe_search_id(search_id),
+        )
+        with self._lock:
+            if diagnostic not in self._events:
+                self._events.append(diagnostic)
+        try:
+            self._ledger.record_diagnostic(diagnostic)
+        except _UsageError:
+            # Diagnostics must never weaken the provider's fail-closed behavior.
+            pass
+
+    def snapshot(self) -> tuple[ProviderDiagnostic, ...]:
+        with self._lock:
+            events = tuple(self._events)
+        ordered = sorted(
+            events,
+            key=lambda item: (
+                item.observed_at,
+                item.stage,
+                item.http_status or 0,
+                item.exception_type,
+                item.search_id or "",
+            ),
+        )
+        return tuple(ordered[-MAX_PROVIDER_DIAGNOSTICS:])
 
 
 @dataclass(frozen=True, slots=True)
@@ -564,12 +756,23 @@ class SerpApiFlightOfferProvider:
         client: Any = None,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         now_provider: Callable[[], datetime] | None = None,
+        poll_delays_seconds: tuple[float, ...] = PROVIDER_POLL_DELAYS_SECONDS,
+        sleep_provider: Callable[[float], None] | None = None,
     ) -> None:
         self._api_key = (api_key or "").strip() or None
         self._monthly_limit = _bounded_monthly_limit(monthly_limit)
         self._client = client or _UrllibClient()
         self._timeout_seconds = max(0.1, min(float(timeout_seconds), 30.0))
         self._now_provider = now_provider or (lambda: datetime.now(UTC))
+        delays = tuple(float(value) for value in poll_delays_seconds)
+        if (
+            not delays
+            or len(delays) > 8
+            or any(not math.isfinite(value) or value < 0 or value > 10 for value in delays)
+        ):
+            raise ValueError("provider poll delays are invalid")
+        self._poll_delays_seconds = delays
+        self._sleep_provider = sleep_provider or sleep
         self._ledger = _UsageLedger(Path(usage_path))
         self._operation_lock = threading.Lock()
         self._cache_lock = threading.Lock()
@@ -637,14 +840,21 @@ class SerpApiFlightOfferProvider:
         *,
         force_refresh: bool,
     ) -> FlightOfferSearchResult:
+        diagnostics = _DiagnosticCollector(self._ledger)
         try:
-            account = self._account_quota()
+            account = self._account_quota(diagnostics)
         except _AuthenticationError:
-            return self._result("authentication_failed", observed_at)
+            return self._diagnostic_result(
+                "authentication_failed", observed_at, diagnostics
+            )
         except _RateLimitError:
-            return self._result("rate_limited", observed_at)
+            return self._diagnostic_result("rate_limited", observed_at, diagnostics)
+        except (_ProviderHttpError, _ProviderSearchError, _TransportError):
+            return self._diagnostic_result("provider_error", observed_at, diagnostics)
         except Exception:
-            return self._result("provider_unavailable", observed_at)
+            return self._diagnostic_result(
+                "provider_unavailable", observed_at, diagnostics
+            )
 
         try:
             initial_reservation = self._ledger.synchronize_and_reserve(
@@ -658,16 +868,19 @@ class SerpApiFlightOfferProvider:
                 require_all=True,
             )
         except _UsageError:
-            return self._result("provider_unavailable", observed_at)
+            return self._diagnostic_result(
+                "provider_unavailable", observed_at, diagnostics
+            )
         if initial_reservation.reserved_calls != len(_CABINS):
             status: SearchStatus = (
                 "rate_limited"
                 if initial_reservation.limiting_quota == "hourly"
                 else "budget_exhausted"
             )
-            return self._result(
+            return self._diagnostic_result(
                 status,
                 observed_at,
+                diagnostics,
                 conservative_monthly_used=initial_reservation.monthly_used,
             )
 
@@ -682,6 +895,7 @@ class SerpApiFlightOfferProvider:
                     departure_date,
                     cabin,
                     force_refresh,
+                    diagnostics,
                 ): cabin
                 for cabin in _CABINS
             }
@@ -694,9 +908,10 @@ class SerpApiFlightOfferProvider:
 
         failure_status = _failure_status(failures)
         if failure_status is not None:
-            return self._result(
+            return self._diagnostic_result(
                 failure_status,
                 observed_at,
+                diagnostics,
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
                 conservative_monthly_used=initial_reservation.monthly_used,
@@ -706,9 +921,10 @@ class SerpApiFlightOfferProvider:
             payloads, origin, destination, departure_date
         )
         if not candidates:
-            return self._result(
+            return self._diagnostic_result(
                 "no_results",
                 observed_at,
+                diagnostics,
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
                 conservative_monthly_used=initial_reservation.monthly_used,
@@ -728,9 +944,10 @@ class SerpApiFlightOfferProvider:
                 require_all=False,
             )
         except _UsageError:
-            return self._result(
+            return self._diagnostic_result(
                 "provider_unavailable",
                 observed_at,
+                diagnostics,
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
                 conservative_monthly_used=initial_reservation.monthly_used,
@@ -750,13 +967,18 @@ class SerpApiFlightOfferProvider:
                         self._booking_options,
                         candidate.booking_token,
                         force_refresh,
+                        diagnostics,
                     ): (position, candidate)
                     for position, candidate in reserved_candidates
                 }
                 for future in as_completed(futures):
                     position, candidate = futures[future]
+                    payload: dict[str, Any] | None = None
+                    provider_http_status: int | None = None
                     try:
-                        payload, provider_observation = future.result()
+                        payload, provider_observation, provider_http_status = (
+                            future.result()
+                        )
                         offer = _parse_booking_confirmation(
                             payload,
                             candidate,
@@ -766,6 +988,14 @@ class SerpApiFlightOfferProvider:
                             provider_observation,
                         )
                     except Exception as exc:
+                        if isinstance(exc, _PayloadError) and payload is not None:
+                            diagnostics.record(
+                                observed_at=self._provider_now(),
+                                stage="validation",
+                                http_status=provider_http_status,
+                                exception_type="PayloadError",
+                                search_id=_payload_search_id(payload),
+                            )
                         booking_failures.append(exc)
                         continue
                     if offer is not None:
@@ -780,9 +1010,10 @@ class SerpApiFlightOfferProvider:
                 seen_fingerprints.add(offer.fingerprint)
 
         if confirmed:
-            return self._result(
+            return self._diagnostic_result(
                 "confirmed_offers",
                 observed_at,
+                diagnostics,
                 offers=tuple(confirmed),
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
@@ -798,20 +1029,23 @@ class SerpApiFlightOfferProvider:
             status = "budget_exhausted"
         else:
             status = "no_results"
-        return self._result(
+        return self._diagnostic_result(
             status,
             observed_at,
+            diagnostics,
             searched_cabins=_CABINS,
             search_calls_used=len(_CABINS),
             pricing_calls_used=booking_calls,
             conservative_monthly_used=booking_reservation.monthly_used,
         )
 
-    def _account_quota(self) -> _AccountQuota:
-        payload, received_at = self._request_json(
+    def _account_quota(self, diagnostics: _DiagnosticCollector) -> _AccountQuota:
+        payload, received_at, http_status = self._request_json(
             SERPAPI_ACCOUNT_URL,
             params={"api_key": self._api_key},
             require_search_success=False,
+            stage="account",
+            diagnostics=diagnostics,
             timeout_seconds=min(
                 self._timeout_seconds,
                 ACCOUNT_REQUEST_TIMEOUT_SECONDS,
@@ -819,6 +1053,13 @@ class SerpApiFlightOfferProvider:
         )
         account_status = str(payload.get("account_status", "")).strip().lower()
         if account_status != "active":
+            diagnostics.record(
+                observed_at=received_at,
+                stage="account",
+                http_status=http_status,
+                exception_type="AuthenticationError",
+                search_id=None,
+            )
             raise _AuthenticationError("provider account is not active")
         monthly_usage = _optional_nonnegative_int(payload.get("this_month_usage"))
         hourly_usage = _optional_nonnegative_int(payload.get("this_hour_searches"))
@@ -839,6 +1080,13 @@ class SerpApiFlightOfferProvider:
             or provider_hourly_limit is None
             or renewal_date is None
         ):
+            diagnostics.record(
+                observed_at=received_at,
+                stage="account",
+                http_status=http_status,
+                exception_type="PayloadError",
+                search_id=None,
+            )
             raise _PayloadError("provider account quota metadata is missing or invalid")
         return _AccountQuota(
             billing_cycle_key=f"renewal:{renewal_date.isoformat()}",
@@ -857,6 +1105,7 @@ class SerpApiFlightOfferProvider:
         departure_date: date,
         cabin: Cabin,
         force_refresh: bool,
+        diagnostics: _DiagnosticCollector,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "engine": "google_flights",
@@ -875,26 +1124,39 @@ class SerpApiFlightOfferProvider:
         }
         if force_refresh:
             params["no_cache"] = "true"
-        payload, received_at = self._request_json(
+        payload, received_at, http_status = self._request_json(
             SERPAPI_SEARCH_URL,
             params=params,
+            stage="cabin_search",
+            diagnostics=diagnostics,
         )
-        _provider_observation(payload, received_at)
-        if not _search_parameters_match(
-            payload,
-            origin=origin,
-            destination=destination,
-            departure_date=departure_date,
-            cabin=cabin,
-        ):
-            raise _PayloadError("search parameters were not echoed correctly")
+        try:
+            _provider_observation(payload, received_at)
+            if not _search_parameters_match(
+                payload,
+                origin=origin,
+                destination=destination,
+                departure_date=departure_date,
+                cabin=cabin,
+            ):
+                raise _PayloadError("search parameters were not echoed correctly")
+        except _PayloadError:
+            diagnostics.record(
+                observed_at=received_at,
+                stage="validation",
+                http_status=http_status,
+                exception_type="PayloadError",
+                search_id=_payload_search_id(payload),
+            )
+            raise
         return payload
 
     def _booking_options(
         self,
         booking_token: str,
         force_refresh: bool,
-    ) -> tuple[dict[str, Any], _ProviderObservation]:
+        diagnostics: _DiagnosticCollector,
+    ) -> tuple[dict[str, Any], _ProviderObservation, int]:
         params: dict[str, Any] = {
             "engine": "google_flights",
             "booking_token": booking_token,
@@ -905,57 +1167,230 @@ class SerpApiFlightOfferProvider:
         }
         if force_refresh:
             params["no_cache"] = "true"
-        payload, received_at = self._request_json(
+        payload, received_at, http_status = self._request_json(
             SERPAPI_SEARCH_URL,
             params=params,
+            stage="booking_options",
+            diagnostics=diagnostics,
         )
-        parameters = payload.get("search_parameters")
-        if (
-            not isinstance(parameters, dict)
-            or str(parameters.get("engine", "")).strip().lower() != "google_flights"
-            or str(parameters.get("currency", "")).strip().upper() != "USD"
-        ):
-            raise _PayloadError("booking parameters were not echoed correctly")
-        return payload, _provider_observation(payload, received_at)
+        try:
+            parameters = payload.get("search_parameters")
+            if (
+                not isinstance(parameters, dict)
+                or str(parameters.get("engine", "")).strip().lower()
+                != "google_flights"
+                or str(parameters.get("currency", "")).strip().upper() != "USD"
+            ):
+                raise _PayloadError("booking parameters were not echoed correctly")
+            observation = _provider_observation(payload, received_at)
+        except _PayloadError:
+            diagnostics.record(
+                observed_at=received_at,
+                stage="validation",
+                http_status=http_status,
+                exception_type="PayloadError",
+                search_id=_payload_search_id(payload),
+            )
+            raise
+        return payload, observation, http_status
 
     def _request_json(
         self,
         url: str,
         *,
         params: dict[str, Any],
+        stage: DiagnosticStage,
+        diagnostics: _DiagnosticCollector,
         require_search_success: bool = True,
         timeout_seconds: float | None = None,
-    ) -> tuple[dict[str, Any], datetime]:
-        response = self._client.get(
-            url,
-            params=params,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "flight-forecast-lab/0.2.0 (strict booking verification)",
-            },
-            timeout=(self._timeout_seconds if timeout_seconds is None else timeout_seconds),
-        )
+    ) -> tuple[dict[str, Any], datetime, int]:
+        try:
+            response = self._client.get(
+                url,
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        "flight-forecast-lab/0.2.0 (strict booking verification)"
+                    ),
+                },
+                timeout=(
+                    self._timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
+            )
+        except Exception as exc:
+            received_at = self._provider_now()
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=None,
+                exception_type="TransportError",
+                search_id=None,
+            )
+            raise _TransportError("provider transport failed") from exc
         received_at = self._provider_now()
         status = _status_code(response)
         if status in {401, 403}:
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=status,
+                exception_type="AuthenticationError",
+                search_id=_response_search_id(response),
+            )
             raise _AuthenticationError("provider authentication failed")
         if status == 429:
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=status,
+                exception_type="RateLimitError",
+                search_id=_response_search_id(response),
+            )
             raise _RateLimitError("provider rate limit reached")
         if status < 200 or status >= 300:
-            raise _ProviderError("provider request failed")
-        payload = _safe_response_json(response)
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=status,
+                exception_type="ProviderHttpError",
+                search_id=_response_search_id(response),
+            )
+            raise _ProviderHttpError("provider request failed")
+        try:
+            payload = _safe_response_json(response)
+        except _PayloadError:
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=status,
+                exception_type="PayloadError",
+                search_id=None,
+            )
+            raise
         if not isinstance(payload, dict):
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=status,
+                exception_type="PayloadError",
+                search_id=None,
+            )
             raise _PayloadError("provider payload must be an object")
         if require_search_success:
-            metadata = payload.get("search_metadata")
-            search_status = (
-                str(metadata.get("status", "")).strip().lower()
-                if isinstance(metadata, dict)
-                else ""
+            search_status = _provider_search_status(payload)
+            search_id = _payload_search_id(payload)
+            if search_status in {"success", "cached"}:
+                return payload, received_at, status
+            if search_status in {"processing", "queued"}:
+                if search_id is None:
+                    diagnostics.record(
+                        observed_at=received_at,
+                        stage=stage,
+                        http_status=status,
+                        exception_type="PayloadError",
+                        search_id=None,
+                    )
+                    raise _PayloadError("pending provider search has no valid search ID")
+                diagnostics.record(
+                    observed_at=received_at,
+                    stage=stage,
+                    http_status=status,
+                    exception_type="ProviderPending",
+                    search_id=search_id,
+                )
+                return self._poll_search_archive(search_id, diagnostics)
+            if search_status == "error":
+                diagnostics.record(
+                    observed_at=received_at,
+                    stage=stage,
+                    http_status=status,
+                    exception_type="ProviderSearchError",
+                    search_id=search_id,
+                )
+                raise _ProviderSearchError("provider search failed")
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=status,
+                exception_type="PayloadError",
+                search_id=search_id,
             )
-            if search_status not in {"success", "cached"}:
-                raise _ProviderError("provider search did not succeed")
-        return payload, received_at
+            raise _PayloadError("provider search status is missing or invalid")
+        return payload, received_at, status
+
+    def _poll_search_archive(
+        self,
+        search_id: str,
+        diagnostics: _DiagnosticCollector,
+    ) -> tuple[dict[str, Any], datetime, int]:
+        archive_url = SERPAPI_SEARCH_ARCHIVE_URL.format(search_id=search_id)
+        last_received_at = self._provider_now()
+        last_http_status: int | None = None
+        for delay_seconds in self._poll_delays_seconds:
+            self._sleep_provider(delay_seconds)
+            diagnostics.note_archive_poll()
+            payload, received_at, http_status = self._request_json(
+                archive_url,
+                params={"api_key": self._api_key},
+                stage="search_archive",
+                diagnostics=diagnostics,
+                require_search_success=False,
+                timeout_seconds=min(
+                    self._timeout_seconds,
+                    SEARCH_ARCHIVE_REQUEST_TIMEOUT_SECONDS,
+                ),
+            )
+            last_received_at = received_at
+            last_http_status = http_status
+            archived_id = _payload_search_id(payload)
+            search_status = _provider_search_status(payload)
+            if archived_id != search_id:
+                diagnostics.record(
+                    observed_at=received_at,
+                    stage="search_archive",
+                    http_status=http_status,
+                    exception_type="SearchIdMismatch",
+                    search_id=archived_id,
+                )
+                raise _PayloadError("provider archive search ID did not match")
+            if search_status in {"success", "cached"}:
+                return payload, received_at, http_status
+            if search_status == "error":
+                diagnostics.record(
+                    observed_at=received_at,
+                    stage="search_archive",
+                    http_status=http_status,
+                    exception_type="ProviderSearchError",
+                    search_id=search_id,
+                )
+                raise _ProviderSearchError("provider archive search failed")
+            if search_status not in {"processing", "queued"}:
+                diagnostics.record(
+                    observed_at=received_at,
+                    stage="search_archive",
+                    http_status=http_status,
+                    exception_type="PayloadError",
+                    search_id=search_id,
+                )
+                raise _PayloadError("provider archive status is invalid")
+            diagnostics.record(
+                observed_at=received_at,
+                stage="search_archive",
+                http_status=http_status,
+                exception_type="ProviderPending",
+                search_id=search_id,
+            )
+        diagnostics.record(
+            observed_at=last_received_at,
+            stage="search_archive",
+            http_status=last_http_status,
+            exception_type="ProviderProcessingError",
+            search_id=search_id,
+        )
+        raise _ProviderProcessingError("provider search is still processing")
 
     def _provider_now(self) -> datetime:
         try:
@@ -1094,6 +1529,8 @@ class SerpApiFlightOfferProvider:
         search_calls_used: int = 0,
         pricing_calls_used: int = 0,
         conservative_monthly_used: int | None = None,
+        archive_poll_count: int = 0,
+        diagnostics: tuple[ProviderDiagnostic, ...] = (),
     ) -> FlightOfferSearchResult:
         return FlightOfferSearchResult(
             offers=offers,
@@ -1111,6 +1548,23 @@ class SerpApiFlightOfferProvider:
             pricing_monthly_limit=None,
             search_monthly_used=conservative_monthly_used,
             pricing_monthly_used=None,
+            archive_poll_count=archive_poll_count,
+            diagnostics=diagnostics,
+        )
+
+    def _diagnostic_result(
+        self,
+        status: SearchStatus,
+        observed_at: datetime,
+        diagnostics: _DiagnosticCollector,
+        **kwargs: Any,
+    ) -> FlightOfferSearchResult:
+        return self._result(
+            status,
+            observed_at,
+            archive_poll_count=diagnostics.archive_poll_count,
+            diagnostics=diagnostics.snapshot(),
+            **kwargs,
         )
 
 
@@ -1689,6 +2143,37 @@ def _normalized_phrase(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().replace("_", " ").split())
 
 
+def _safe_search_id(value: Any) -> str | None:
+    candidate = str(value or "").strip()
+    return candidate if _SEARCH_ID_PATTERN.fullmatch(candidate) else None
+
+
+def _safe_exception_type(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if _EXCEPTION_TYPE_PATTERN.fullmatch(candidate) else "UnknownError"
+
+
+def _payload_search_id(payload: Any) -> str | None:
+    metadata = payload.get("search_metadata") if isinstance(payload, dict) else None
+    return _safe_search_id(metadata.get("id")) if isinstance(metadata, dict) else None
+
+
+def _provider_search_status(payload: Any) -> str:
+    metadata = payload.get("search_metadata") if isinstance(payload, dict) else None
+    return (
+        str(metadata.get("status", "")).strip().lower()
+        if isinstance(metadata, dict)
+        else ""
+    )
+
+
+def _response_search_id(response: Any) -> str | None:
+    try:
+        return _payload_search_id(_safe_response_json(response))
+    except _PayloadError:
+        return None
+
+
 def _safe_response_json(response: Any) -> Any:
     content = getattr(response, "content", None)
     if isinstance(content, bytes) and len(content) > MAX_PROVIDER_RESPONSE_BYTES:
@@ -1716,6 +2201,16 @@ def _failure_status(failures: list[BaseException]) -> SearchStatus | None:
         return "rate_limited"
     if any(isinstance(exc, _AuthenticationError) for exc in failures):
         return "authentication_failed"
+    if any(
+        isinstance(
+            exc,
+            (_ProviderHttpError, _ProviderSearchError, _TransportError),
+        )
+        for exc in failures
+    ):
+        return "provider_error"
+    if any(isinstance(exc, _ProviderProcessingError) for exc in failures):
+        return "provider_processing"
     if failures:
         return "provider_unavailable"
     return None

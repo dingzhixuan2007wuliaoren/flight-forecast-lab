@@ -102,6 +102,22 @@ $env:SERPAPI_MONTHLY_LIMIT="250"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
+若 Search API 返回 `Processing` 或 `Queued`，后端会按 0.5、1、1.5、2 秒的有界退避读取固定的
+Search Archive 地址；它只轮询同一个经过白名单校验的 Search ID，不跟随响应中的任意 URL，
+也不重新提交四舱搜索。Archive 读取单独记录为 `archive_poll_count`，不计入最多 10 次的
+`call_count` 或本地额度预留。轮询后仍未完成返回 `provider_processing`，终态/HTTP/网络错误
+返回 `provider_error`，只有成功完成但没有通过严格验证的购票选项才返回 `no_results`。
+
+When SerpApi reports `Processing` or `Queued`, the backend performs bounded polling of the same
+allowlisted Search ID through the fixed Search Archive endpoint. It never follows an arbitrary
+provider URL or resubmits the four-cabin search. The API distinguishes `provider_processing`,
+`provider_error`, and a successfully completed `no_results` response.
+
+异常诊断只保留观测时间、阶段、HTTP 状态、固定异常类型和经过格式校验的 Search ID，并写入
+Git 已忽略的 `artifacts/runtime/serpapi-usage.sqlite3`，最多保留 500 条；最近最多 10 条也会作为
+`fare_search_metadata.diagnostics` 返回。API Key、`booking_token`、请求参数、完整 URL 和原始错误
+文本均不会保存。
+
 `SERPAPI_MONTHLY_LIMIT` 可省略（默认 250）；大于 250 会被钳制为 250，非法或非正值也不会
 解除安全上限。凭据只放在启动服务进程的环境变量或本地密钥存储中，绝不能提交到 GitHub、
 发送给浏览器/前端或写入应用日志。服务端按 SerpApi 官方接口要求把 key 放入发往

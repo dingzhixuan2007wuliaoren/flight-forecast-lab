@@ -28,6 +28,11 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert 'name="weather_severity_forecast"' not in dashboard
     assert 'name="origin_congestion_index"' not in dashboard
     assert 'name="departure_date"' in dashboard
+    assert "fare_provider_processing" in dashboard
+    assert "fare_provider_error" in dashboard
+    assert "报价任务仍在处理中" in dashboard
+    assert "Fare provider returned an error" in dashboard
+    assert "isProcessingComparison" in dashboard
     offer_page = client.get("/details/offer").text
     assert 'id="price-curve"' in offer_page
     assert 'id="curve-chart"' in offer_page

@@ -333,6 +333,66 @@ def test_serpapi_metadata_requires_one_shared_quota_no_higher_than_250() -> None
         FareSearchMetadata.model_validate(inconsistent_calls)
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["provider_processing", "provider_error", "no_results"],
+)
+def test_fare_metadata_distinguishes_terminal_and_pending_outcomes(
+    status: str,
+) -> None:
+    payload = {
+        "status": status,
+        "provider_code": "serpapi_google_flights",
+        "environment": "production",
+        "observed_at": "2026-07-15T12:00:00Z",
+        "searched_cabins": ["economy"],
+        "call_count": 1,
+        "search_call_count": 1,
+        "archive_poll_count": 2,
+        "diagnostics": [
+            {
+                "observed_at": "2026-07-15T12:00:00Z",
+                "stage": "search_archive",
+                "http_status": 200,
+                "exception_type": "ProviderProcessingError",
+                "search_id": "pendingsearch01",
+            }
+        ],
+        "notice": {"zh": "状态说明", "en": "Status notice"},
+    }
+
+    metadata = FareSearchMetadata.model_validate(payload)
+
+    assert metadata.status == status
+    assert metadata.archive_poll_count == 2
+    assert metadata.diagnostics[0].search_id == "pendingsearch01"
+    serialized = metadata.model_dump_json()
+    assert "api_key" not in serialized
+    assert "booking_token" not in serialized
+
+
+def test_fare_diagnostic_rejects_unredacted_or_malformed_fields() -> None:
+    with pytest.raises(ValidationError):
+        FareSearchMetadata.model_validate(
+            {
+                "status": "provider_error",
+                "provider_code": "serpapi_google_flights",
+                "environment": "production",
+                "observed_at": "2026-07-15T12:00:00Z",
+                "diagnostics": [
+                    {
+                        "observed_at": "2026-07-15T12:00:00Z",
+                        "stage": "search_archive",
+                        "http_status": 200,
+                        "exception_type": "raw error: api_key=secret",
+                        "search_id": "https://unsafe.example/search",
+                    }
+                ],
+                "notice": {"zh": "错误", "en": "Error"},
+            }
+        )
+
+
 def test_confirmed_offer_rejects_mixed_cabins() -> None:
     payload = _confirmed_offer_payload()
     segments = payload["segments"]

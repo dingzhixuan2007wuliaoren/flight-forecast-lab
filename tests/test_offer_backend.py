@@ -12,6 +12,7 @@ from flight_forecaster.availability import (
     ConfirmedFlightOffer,
     FlightOfferSearchResult,
     FlightOfferSegment,
+    ProviderDiagnostic,
 )
 from flight_forecaster.context import (
     AIRLABS_FREE_SAMPLE_LIMIT,
@@ -891,6 +892,78 @@ def test_no_key_strict_mode_returns_empty_instead_of_model_flights(
                 offer_id="off_000000000000000000000000",
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "result_status", "notice_fragment"),
+    [
+        ("provider_processing", "fare_provider_processing", "有界轮询"),
+        ("provider_error", "fare_provider_error", "终态错误"),
+        ("no_results", "no_verified_offer", "没有返回"),
+    ],
+)
+def test_empty_provider_outcomes_remain_distinct_across_service_contract(
+    trained_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_status: str,
+    result_status: str,
+    notice_fragment: str,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    generated_at = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    diagnostic = (
+        ProviderDiagnostic(
+            observed_at=generated_at,
+            stage="search_archive",
+            http_status=200,
+            exception_type=(
+                "ProviderProcessingError"
+                if provider_status == "provider_processing"
+                else "ProviderSearchError"
+            ),
+            search_id="pendingsearch01",
+        ),
+    ) if provider_status != "no_results" else ()
+    fare_result = FlightOfferSearchResult(
+        offers=(),
+        status=provider_status,  # type: ignore[arg-type]
+        observed_at=generated_at,
+        environment="production",
+        searched_cabins=("economy", "premium_economy", "business", "first"),
+        calls_used=4,
+        cache_hit=False,
+        search_calls_used=4,
+        search_monthly_limit=250,
+        search_monthly_used=4,
+        archive_poll_count=(2 if provider_status == "provider_processing" else 0),
+        diagnostics=diagnostic,
+    )
+    service = PredictionService(
+        trained_model_dir,
+        context_provider=ContextProvider(),
+        schedule_provider=_StaticScheduleProvider(
+            ScheduleSearchResult((), frozenset())
+        ),  # type: ignore[arg-type]
+        flight_offer_provider=_StaticFareProvider(fare_result),
+        now_provider=lambda: generated_at,
+    )
+
+    comparison = service.compare(
+        ComparisonRequest(
+            origin="YYZ",
+            destination="LHR",
+            departure_date=date(2026, 7, 22),
+        )
+    )
+
+    assert comparison.offers == []
+    assert comparison.result_status == result_status
+    assert comparison.fare_search_metadata is not None
+    assert comparison.fare_search_metadata.status == provider_status
+    assert notice_fragment in comparison.fare_search_metadata.notice.zh
+    assert "本次没有价格通过严格购票选项验证" in comparison.warnings.zh
+    assert "No price passed strict booking-option verification" in comparison.warnings.en
+    assert len(comparison.fare_search_metadata.diagnostics) == len(diagnostic)
 
 
 def test_departure_date_rejects_past_and_more_than_370_days(

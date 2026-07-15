@@ -627,6 +627,26 @@ class PredictionService:
                     "production calls were made."
                 ),
             ),
+            "provider_processing": BilingualText(
+                zh=(
+                    "报价任务仍在 SerpApi 队列中或处理中；系统已完成有界轮询，"
+                    "未重新提交整组搜索。"
+                ),
+                en=(
+                    "The fare search is still queued or processing at SerpApi after "
+                    "bounded polling; the full search was not resubmitted."
+                ),
+            ),
+            "provider_error": BilingualText(
+                zh=(
+                    "生产报价源返回终态错误、HTTP 错误或网络错误；"
+                    "严格模式未显示未验证航班。"
+                ),
+                en=(
+                    "The production fare source returned a terminal, HTTP, or "
+                    "transport error; strict mode showed no unverified flights."
+                ),
+            ),
             "provider_unavailable": BilingualText(
                 zh="生产报价源暂不可用或返回了无效数据；严格模式未降级为虚构结果。",
                 en=(
@@ -670,6 +690,17 @@ class PredictionService:
             search_monthly_used=result.search_monthly_used,
             pricing_monthly_limit=result.pricing_monthly_limit,
             pricing_monthly_used=result.pricing_monthly_used,
+            archive_poll_count=result.archive_poll_count,
+            diagnostics=[
+                {
+                    "observed_at": diagnostic.observed_at,
+                    "stage": diagnostic.stage,
+                    "http_status": diagnostic.http_status,
+                    "exception_type": diagnostic.exception_type,
+                    "search_id": diagnostic.search_id,
+                }
+                for diagnostic in result.diagnostics
+            ],
             notice=notices[result.status],
         )
 
@@ -1311,6 +1342,8 @@ class PredictionService:
             "rate_limited": "fare_provider_rate_limited",
             "budget_not_configured": "fare_provider_budget_not_configured",
             "budget_exhausted": "fare_provider_budget_exhausted",
+            "provider_processing": "fare_provider_processing",
+            "provider_error": "fare_provider_error",
             "provider_unavailable": "fare_provider_unavailable",
         }[fare_result.status]
         rejected_warning = (
@@ -1322,6 +1355,19 @@ class PredictionService:
             )
             if rejected_priced_offers
             else ("", "")
+        )
+        fare_warning = (
+            (
+                "主价格是查询时经 Google Flights 购票选项验证的一位成人单程 USD "
+                "报价；",
+                "The primary price is a one-way, one-adult USD result whose booking "
+                "option was verified through Google Flights at query time. ",
+            )
+            if offers and fare_result.status == "confirmed_offers"
+            else (
+                "本次没有价格通过严格购票选项验证；",
+                "No price passed strict booking-option verification in this response. ",
+            )
         )
 
         return ComparisonResponse(
@@ -1362,8 +1408,8 @@ class PredictionService:
             schedule_sample_limit=AIRLABS_FREE_SAMPLE_LIMIT,
             warnings=BilingualWarning(
                 zh=(
-                    "主价格是查询时经 Google Flights 购票选项验证的一位成人单程 USD "
-                    "报价；模型估价、80% 区间、价格曲线和准点率仍是合成演示模型结果。"
+                    f"{fare_warning[0]}模型估价、80% 区间、价格曲线和准点率仍是"
+                    "合成演示模型结果。"
                     "搜索结果和购票价格可能随时变化，航空公司最终结账页才是最终价格；"
                     "系统不会为覆盖缺口补造航班。"
                     f" {reference_warning[0]}"
@@ -1371,8 +1417,7 @@ class PredictionService:
                     f"{rejected_warning[0]}"
                 ),
                 en=(
-                    "The primary price is a one-way, one-adult USD result whose booking option "
-                    "was verified through Google Flights at query time. The model estimate, 80% "
+                    f"{fare_warning[1]}The model estimate, 80% "
                     "interval, price curve, and on-time probability remain synthetic-demo model "
                     "outputs. Search results and booking prices can change at any time; the "
                     "airline checkout is authoritative. The system does not invent flights to "

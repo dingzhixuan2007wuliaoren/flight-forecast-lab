@@ -1756,6 +1756,10 @@
           fareRateLimitedBody: "SerpApi 暂时限制了请求，请稍后重试；系统不会使用旧报价冒充当前报价。",
           fareAuthTitle: "报价服务身份验证失败",
           fareAuthBody: "请检查 SERPAPI_API_KEY，修复前不会显示购票选项。",
+          fareProcessingTitle: "报价任务仍在处理中",
+          fareProcessingBody: "SerpApi 仍在排队或处理原搜索。系统已完成限定次数的状态轮询，没有重复提交整组搜索，请稍后手动重试。",
+          fareProviderErrorTitle: "报价供应商返回错误",
+          fareProviderErrorBody: "SerpApi 返回终态、HTTP 或网络错误，因此无法验证当前价格和余位；系统没有显示未验证航班。",
           fareProviderUnavailableTitle: "报价服务暂时不可用",
           fareProviderUnavailableBody: "无法验证当前价格与余位，请稍后重试。下方时刻表仅供参考。",
           fareNoResultsTitle: "未找到当前可售报价",
@@ -1934,6 +1938,10 @@
           fareRateLimitedBody: "SerpApi is temporarily limiting requests. Try again later; stale quotes are not presented as current.",
           fareAuthTitle: "Fare service authentication failed",
           fareAuthBody: "Check SERPAPI_API_KEY; no booking option is shown until authentication succeeds.",
+          fareProcessingTitle: "Fare search is still processing",
+          fareProcessingBody: "SerpApi is still queuing or processing the original search. Bounded status polling finished without resubmitting the full search; retry manually later.",
+          fareProviderErrorTitle: "Fare provider returned an error",
+          fareProviderErrorBody: "SerpApi returned a terminal, HTTP, or transport error, so current price and availability could not be verified; no unverified flight is shown.",
           fareProviderUnavailableTitle: "Fare provider is temporarily unavailable",
           fareProviderUnavailableBody: "Current price and availability could not be verified. Try again later; timetable rows below are reference only.",
           fareNoResultsTitle: "No currently bookable fare found",
@@ -2092,6 +2100,13 @@
         };
       }
 
+      function isProcessingComparison(data) {
+        if (!data || typeof data !== "object") return false;
+        var metadata = data.fare_search_metadata && typeof data.fare_search_metadata === "object" ? data.fare_search_metadata : {};
+        var status = normalizeKey(data.result_status) || normalizeKey(metadata.status);
+        return status === "fare_provider_processing" || status === "provider_processing";
+      }
+
       function saveSessionState() {
         try {
           window.sessionStorage.setItem(sessionKey, JSON.stringify({
@@ -2099,7 +2114,7 @@
             language: currentLanguage,
             ranking: activeRanking,
             cabin: activeCabin,
-            comparison: lastData
+            comparison: isProcessingComparison(lastData) ? null : lastData
           }));
         } catch (error) { /* storage may be unavailable or full */ }
       }
@@ -2117,7 +2132,7 @@
           if (/^\d{4}-\d{2}-\d{2}$/.test(savedDate)) {
             byId("departure-time").value = savedDate;
           }
-          if (state.comparison && typeof state.comparison === "object") lastData = state.comparison;
+          if (state.comparison && typeof state.comparison === "object" && !isProcessingComparison(state.comparison)) lastData = state.comparison;
           return state;
         } catch (error) {
           return null;
@@ -2954,6 +2969,8 @@
             fare_provider_budget_exhausted: ["fareBudgetExhaustedTitle", "fareBudgetExhaustedBody"],
             fare_provider_rate_limited: ["fareRateLimitedTitle", "fareRateLimitedBody"],
             fare_provider_authentication_failed: ["fareAuthTitle", "fareAuthBody"],
+            fare_provider_processing: ["fareProcessingTitle", "fareProcessingBody"],
+            fare_provider_error: ["fareProviderErrorTitle", "fareProviderErrorBody"],
             fare_provider_unavailable: ["fareProviderUnavailableTitle", "fareProviderUnavailableBody"],
             no_verified_offer: ["fareNoResultsTitle", "fareNoResultsBody"],
             not_configured: ["fareNotConfiguredTitle", "fareNotConfiguredBody"],
@@ -2965,6 +2982,8 @@
             auth: ["fareAuthTitle", "fareAuthBody"],
             auth_failed: ["fareAuthTitle", "fareAuthBody"],
             authentication_failed: ["fareAuthTitle", "fareAuthBody"],
+            provider_processing: ["fareProcessingTitle", "fareProcessingBody"],
+            provider_error: ["fareProviderErrorTitle", "fareProviderErrorBody"],
             provider_unavailable: ["fareProviderUnavailableTitle", "fareProviderUnavailableBody"],
             unavailable: ["fareProviderUnavailableTitle", "fareProviderUnavailableBody"],
             no_results: ["fareNoResultsTitle", "fareNoResultsBody"]
