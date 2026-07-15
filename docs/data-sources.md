@@ -83,7 +83,7 @@ on_time = (Cancelled != 1) AND (ArrDelay < 15)
 
 ### 防止天气泄漏
 
-NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预测未来航班时，实际天气尚不可知。生产系统应保存预测时刻真实可获得的预报快照，并使用相同预报时效训练。本项目的服务端会自动解析 Open-Meteo/NOAA 天气信号；演示版数据源不可用时返回明确标记的合成模型先验，不冒充真实历史均值，也不要求用户填写天气严重度。
+NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预测未来航班时，实际天气尚不可知。生产系统应保存预测时刻真实可获得的预报快照，并使用相同预报时效训练。本项目的服务端会自动解析 Open-Meteo/NOAA 天气信号；演示版数据源不可用时可展示明确标记的训练平均/合成模型先验作参考，不冒充实时天气，也不要求用户填写天气严重度。票价模型不使用天气；准点率只在状态为 `live` 或 `forecast` 时使用含天气模型，其他状态以 `weather_feature_status=ignored` 切换到无天气模型。
 
 ## 4. 运行时免费上下文来源
 
@@ -92,7 +92,7 @@ NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预
 | 信号 | 优先来源 | 无法获取时 |
 | --- | --- | --- |
 | 全球机场坐标 | [OurAirports public-domain data](https://ourairports.com/data/) | 内置主要全球机场目录；未知代码返回校验错误 |
-| 当前天气与预报 | [Open-Meteo](https://open-meteo.com/en/docs) 当前模型天气/小时预报与 [NOAA Aviation Weather](https://aviationweather.gov/data/api/) METAR/TAF | 同月训练平均值或季节模型先验，并明确标为 `proxy` |
+| 当前天气与预报 | [Open-Meteo](https://open-meteo.com/en/docs) 当前模型天气/小时预报与 [NOAA Aviation Weather](https://aviationweather.gov/data/api/) METAR/TAF | 同月训练平均值或季节模型先验明确标为 `proxy`，仅作展示参考；准点预测改用无天气模型 |
 | 机场运行 | 美国机场使用无需密钥的 [FAA NAS Status](https://nasstatus.faa.gov/) 当前事件；其他机场配置免费 AirLabs key 后使用 [AirLabs schedules](https://airlabs.co/docs/schedules) | [ADSB.lol](https://www.adsb.lol/docs/open-data/api/) 当前飞机密度代理；目标时刻不适用时回退训练平均值/合成先验 |
 | 时事新闻 | 无需密钥的 [GDELT DOC 2.0](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) 近七日中断类新闻（`DateDesc`）；DOC 失败时使用官方 [GAL 滚动 RSS](https://blog.gdeltproject.org/announcing-the-gdelt-article-list-rss-feed/) | 先返回不超过 6 小时、降低影响且标为 `historical` 的航线缓存；无缓存时返回中性值且不虚构文章 |
 | 严格航班比较 | [SerpApi Google Flights API](https://serpapi.com/google-flights-api) 搜索后，再使用候选的 `booking_token` 获取购票选项 | 缺失凭据、额度耗尽、二次验证失败或字段不完整时返回结构化空 offers；AirLabs 只进入参考区 |
@@ -103,7 +103,7 @@ GDELT DOC 属于近实时来源，全球数据通常约每 15 分钟更新；GAL
 
 SerpApi Google Flights 首次搜索只产生候选。系统分别搜索经济舱、超级经济舱、商务舱和头等舱，并启用 `deep_search=true` 与 `show_hidden=true`；这些参数只能扩大可见范围，仍不能保证返回所有航司、航班、舱位、销售方、私有票价或日期。候选必须带 `booking_token`，随后查询到的 `selected_flights` 必须与原始航段完全一致，并至少返回一个具有销售方、匹配航班号、正数 USD 价格和 HTTPS `booking_request.url` 的购票选项，才能标为 `booking_option_confirmed`。这证明 Google Flights 在来源结果生成时点返回了对应购票路径，不等于航空公司或销售方最终结账页仍有相同库存、规则或价格。若该请求无需 POST，`booking_url_kind=direct_get` 并可打开 Google 的销售方跳转；若请求带 `post_data`，普通 `<a>` 不能重放它，系统明确返回 `booking_url_kind=google_flights_itinerary` 的 Google Flights 结果页，不把它误称为销售方直链或“已选行程”。官方在此只保证 `google_flights_url`。当前响应不能可靠证明报价是否含税，因此 `taxes_included` 保持未知，不能写成“明确含税”。
 
-[SerpApi 免费计划](https://serpapi.com/pricing) 目前提供每个 provider 结算周期 250 次成功搜索及每小时 50 次请求；周期按账户 `plan_renewal_date` 划分，不按自然月。初始航班搜索和 `booking_token` 查询共用额度。单次比较最多 4 次舱位搜索加 6 次候选验证，即最多预留 10 次 provider 查询；按最坏路径，每小时约只能完成 5 次全新完整比较，其他请求会进一步减少。最多 6 个候选优先保持航司多样性，再用价格填充剩余位置；这不是所有航司的列表。官方当前说明缓存、错误和失败搜索不计入 provider 周期额度，但项目本地账本会在每次尝试前保守预留，连 provider 缓存请求也预留，因此本地 `monthly_calls_used` 是尝试数而不是 provider 成功计费数，可能更高并提前停止。`SERPAPI_MONTHLY_LIMIT` 和保存在忽略 Git 的 `runtime/` 目录中的单一结算周期账本共同执行硬上限：省略时默认 250，大于 250 时钳制为 250，非法或非正值也不会解除上限。部署者仍应独立检查账户用量；“严格”表示证据不降级，不表示覆盖全球所有航司、舱位、销售方或日期。
+[SerpApi 免费计划](https://serpapi.com/pricing) 目前提供每个 provider 结算周期 250 次成功搜索及每小时 50 次请求；周期按账户 `plan_renewal_date` 划分，不按自然月。四舱初始搜索和 `booking_token` 查询共用额度。系统处理 SerpApi 四舱搜索实际返回的全部合格候选，并在剩余免费额度和供应商响应范围内逐个验证；同航程同舱位只保留最低已验证销售价。候选数量与验证调用数随查询变化，额度不足时允许返回已验证部分，并通过 `coverage_scope`、各候选计数、`coverage_status` 和 `quota_limit` 明确标记截断。官方当前说明缓存、错误和失败搜索不计入 provider 周期额度，但项目本地账本会在每次尝试前保守预留，连 provider 缓存请求也预留，因此本地 `monthly_calls_used` 是尝试数而不是 provider 成功计费数，可能更高并提前停止。`SERPAPI_MONTHLY_LIMIT` 和保存在忽略 Git 的 `runtime/` 目录中的单一结算周期账本共同执行硬上限：省略时默认 250，大于 250 时钳制为 250，非法或非正值也不会解除上限。部署者仍应独立检查账户用量；“严格”表示证据不降级，不表示覆盖全球所有航司、舱位、销售方或日期。
 
 SerpApi 可返回最长约 1 小时的 provider 缓存；应用另有 5 分钟严格结果缓存。`provider_cache_hit` 来自本地缓存命中或 provider 状态/时间启发式，只表示检测到缓存复用，不精确区分或证明具体来源；`provider_cache_age_seconds` 是当前响应相对 `verified_at`（SerpApi `search_metadata.created_at`，即 provider 结果生成时间）的年龄，并限制在含处理/时钟容差的 0–3900 秒。主页另外显示本次响应生成时间，不能把它与 provider 结果时间混为一谈。
 
@@ -115,7 +115,7 @@ AirLabs 免费 `schedules` 是近实时接口，结果按当前或目标时刻�
 
 天气与新闻详情页从主页接收 `departure_date`，每次刷新由服务重新计算带 `departure_time_basis` 的模型/上下文参考，避免沿用已过期的同日固定时刻；这些时间不是航班计划。天气详情接口在出发机场参考时刻和到达机场模型估算抵达参考分别查询 Open-Meteo，并显示当前条件、目标小时、前后 12 小时趋势和风险拆解；可用时还显示 NOAA METAR/TAF 原始报文与自动解释。新闻详情接口最多显示最近 7 天的 20 篇匹配文章及分类、命中词和时效权重。网页分别每 10 分钟和 15 分钟刷新，但服务端同样使用短期缓存以遵守免费来源的负载与配额边界。
 
-Offer 详情初次加载发送 `force_refresh=false`，复用 5 分钟严格缓存而不主动发起 provider 请求；只有用户点击“刷新并重新查询”才发送 `force_refresh=true`，重新执行最多 4 次舱位搜索和 6 次候选验证。前端外部数据请求超时为 90 秒。
+Offer 详情初次加载发送 `force_refresh=false`，复用 5 分钟严格缓存而不主动发起 provider 请求；只有用户点击“刷新并重新查询”才发送 `force_refresh=true`，重新处理四舱搜索实际返回的候选，仍受免费额度与供应商响应限制。详情响应沿用 `weather_feature_status`，在准点预测切换到无天气模型时明确提示天气变量已忽略。为容纳免费额度内的多批候选验证，前端外部数据请求超时为 360 秒。
 
 详细的状态、缓存、严格政策字段和失败回退语义见 [`runtime-context.md`](runtime-context.md)。免费服务的配额、覆盖和条款可能变化，公开部署前应重新核对官方说明。
 

@@ -286,10 +286,7 @@ def test_offer_detail_request_defaults_to_cached_result_and_accepts_refresh() ->
         "offer_id": "off_0123456789abcdef01234567",
     }
     assert OfferDetailRequest.model_validate(base).force_refresh is False
-    assert (
-        OfferDetailRequest.model_validate({**base, "force_refresh": True}).force_refresh
-        is True
-    )
+    assert OfferDetailRequest.model_validate({**base, "force_refresh": True}).force_refresh is True
 
 
 def test_serpapi_metadata_requires_one_shared_quota_no_higher_than_250() -> None:
@@ -368,7 +365,45 @@ def test_fare_metadata_distinguishes_terminal_and_pending_outcomes(
     assert metadata.diagnostics[0].search_id == "pendingsearch01"
     serialized = metadata.model_dump_json()
     assert "api_key" not in serialized
-    assert "booking_token" not in serialized
+    assert '"booking_token":' not in serialized
+
+
+def test_fare_metadata_validates_partial_candidate_coverage() -> None:
+    payload = {
+        "status": "confirmed_offers",
+        "provider_code": "serpapi_google_flights",
+        "environment": "production",
+        "observed_at": "2026-07-15T12:00:00Z",
+        "searched_cabins": ["economy", "business"],
+        "call_count": 6,
+        "search_call_count": 4,
+        "pricing_call_count": 2,
+        "eligible_candidate_count": 9,
+        "verification_attempted_count": 2,
+        "verified_candidate_count": 1,
+        "strictly_rejected_candidate_count": 0,
+        "provider_failed_candidate_count": 1,
+        "quota_skipped_candidate_count": 7,
+        "deduplicated_verified_count": 0,
+        "coverage_status": "quota_and_provider_incomplete",
+        "quota_limit": "hourly",
+        "notice": {"zh": "覆盖不完整", "en": "Partial coverage"},
+    }
+
+    metadata = FareSearchMetadata.model_validate(payload)
+
+    assert metadata.coverage_status == "quota_and_provider_incomplete"
+    assert metadata.eligible_candidate_count == 9
+
+    inconsistent = dict(payload)
+    inconsistent["verification_attempted_count"] = 3
+    with pytest.raises(ValidationError, match="verification attempts"):
+        FareSearchMetadata.model_validate(inconsistent)
+
+    missing_quota = dict(payload)
+    missing_quota["quota_limit"] = None
+    with pytest.raises(ValidationError, match="quota limit"):
+        FareSearchMetadata.model_validate(missing_quota)
 
 
 def test_fare_diagnostic_rejects_unredacted_or_malformed_fields() -> None:

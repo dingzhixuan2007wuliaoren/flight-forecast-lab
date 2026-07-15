@@ -51,6 +51,7 @@ DepartureTimeBasis = Literal[
     "origin_local_remaining_day_model_reference",
     "legacy_input",
 ]
+WeatherFeatureStatus = Literal["used", "ignored"]
 
 
 def _normalise_code(value: str, *, min_length: int, max_length: int) -> str:
@@ -186,10 +187,7 @@ class ComparisonRequest(BaseModel):
     def validate_trip(self) -> ComparisonRequest:
         if self.origin == self.destination:
             raise ValueError("origin and destination must differ")
-        if (
-            self.departure_time is not None
-            and self.departure_date != self.departure_time.date()
-        ):
+        if self.departure_time is not None and self.departure_date != self.departure_time.date():
             raise ValueError("departure_date and legacy departure_time must match")
         return self
 
@@ -241,6 +239,9 @@ class OnTimePrediction(BaseModel):
     definition: str
     definition_en: str
     model_version: str
+    weather_feature_status: WeatherFeatureStatus
+    weather_feature_notice_zh: str
+    weather_feature_notice_en: str
 
 
 class ContextSignal(BaseModel):
@@ -301,6 +302,9 @@ class PredictionContextResponse(BaseModel):
     weather: ContextSignal
     operations: OperationsSignal
     news: NewsSignal
+    weather_feature_status: WeatherFeatureStatus
+    weather_feature_notice_zh: str
+    weather_feature_notice_en: str
 
 
 class BilingualText(BaseModel):
@@ -480,18 +484,13 @@ class ProviderOfferSegment(BaseModel):
             raise ValueError("segment UTC fields must use a zero UTC offset")
         if self.arrival_utc <= self.departure_utc:
             raise ValueError("segment arrival must be after departure")
-        elapsed_minutes = round(
-            (self.arrival_utc - self.departure_utc).total_seconds() / 60
-        )
+        elapsed_minutes = round((self.arrival_utc - self.departure_utc).total_seconds() / 60)
         if abs(elapsed_minutes - self.duration_minutes) > 15:
             raise ValueError("segment duration must match its UTC timestamps")
-        if abs(
-            (
-                self.departure_local.astimezone(UTC) - self.departure_utc
-            ).total_seconds()
-        ) > 120 or abs(
-            (self.arrival_local.astimezone(UTC) - self.arrival_utc).total_seconds()
-        ) > 120:
+        if (
+            abs((self.departure_local.astimezone(UTC) - self.departure_utc).total_seconds()) > 120
+            or abs((self.arrival_local.astimezone(UTC) - self.arrival_utc).total_seconds()) > 120
+        ):
             raise ValueError("segment local and UTC fields must describe the same instants")
         _validate_checked_bag_fields(
             self.included_checked_bag_quantity,
@@ -608,6 +607,24 @@ class FareSearchMetadata(BaseModel):
         default_factory=list,
         max_length=10,
     )
+    coverage_scope: Literal["provider_returned_booking_token_candidates"] = (
+        "provider_returned_booking_token_candidates"
+    )
+    eligible_candidate_count: int = Field(default=0, ge=0)
+    verification_attempted_count: int = Field(default=0, ge=0)
+    verified_candidate_count: int = Field(default=0, ge=0)
+    strictly_rejected_candidate_count: int = Field(default=0, ge=0)
+    provider_failed_candidate_count: int = Field(default=0, ge=0)
+    quota_skipped_candidate_count: int = Field(default=0, ge=0)
+    deduplicated_verified_count: int = Field(default=0, ge=0)
+    coverage_status: Literal[
+        "not_evaluated",
+        "complete",
+        "quota_limited",
+        "provider_incomplete",
+        "quota_and_provider_incomplete",
+    ] = "not_evaluated"
+    quota_limit: Literal["monthly", "hourly"] | None = None
     notice: BilingualText
 
     @model_validator(mode="after")
@@ -617,6 +634,53 @@ class FareSearchMetadata(BaseModel):
             raise ValueError("searched cabins must be unique")
         if self.call_count != self.search_call_count + self.pricing_call_count:
             raise ValueError("total call count must equal search plus booking-validation calls")
+        if self.verification_attempted_count != (
+            self.verified_candidate_count
+            + self.strictly_rejected_candidate_count
+            + self.provider_failed_candidate_count
+        ):
+            raise ValueError("verification attempts must equal all verification outcomes")
+        if self.deduplicated_verified_count > self.verified_candidate_count:
+            raise ValueError("deduplicated verified count cannot exceed verified candidates")
+        if self.coverage_status == "not_evaluated":
+            if any(
+                (
+                    self.verification_attempted_count,
+                    self.verified_candidate_count,
+                    self.strictly_rejected_candidate_count,
+                    self.provider_failed_candidate_count,
+                    self.quota_skipped_candidate_count,
+                    self.deduplicated_verified_count,
+                )
+            ):
+                raise ValueError("unevaluated candidate coverage cannot report outcomes")
+        elif self.eligible_candidate_count != (
+            self.verification_attempted_count + self.quota_skipped_candidate_count
+        ):
+            raise ValueError("eligible candidates must equal attempted plus quota-skipped")
+        expected_coverage = (
+            "quota_and_provider_incomplete"
+            if self.provider_failed_candidate_count and self.quota_skipped_candidate_count
+            else (
+                "provider_incomplete"
+                if self.provider_failed_candidate_count
+                else (
+                    "quota_limited"
+                    if self.quota_skipped_candidate_count
+                    else (
+                        "not_evaluated" if self.coverage_status == "not_evaluated" else "complete"
+                    )
+                )
+            )
+        )
+        if self.coverage_status != expected_coverage:
+            raise ValueError("candidate coverage status does not match its counts")
+        quota_limited = self.coverage_status in {
+            "quota_limited",
+            "quota_and_provider_incomplete",
+        }
+        if quota_limited != (self.quota_limit is not None):
+            raise ValueError("candidate quota limit must match quota-truncated coverage")
         if self.monthly_calls_used is not None and self.monthly_call_limit is None:
             raise ValueError("monthly usage requires a monthly call limit")
         if self.search_monthly_used is not None and self.search_monthly_limit is None:
@@ -654,9 +718,7 @@ class FareSearchMetadata(BaseModel):
             raise ValueError("configured fare-search results must identify SerpApi Google Flights")
         if self.status == "test_environment_rejected" and self.environment != "test":
             raise ValueError("test-environment rejection requires environment test")
-        if self.status in {"confirmed_offers", "no_results"} and (
-            self.environment != "production"
-        ):
+        if self.status in {"confirmed_offers", "no_results"} and (self.environment != "production"):
             raise ValueError("live fare-search results require the production environment")
         return self
 
@@ -673,6 +735,7 @@ class ComparisonOffer(BaseModel):
     interval_80_high_usd: float = Field(ge=0.0)
     on_time_probability: float = Field(ge=0.0, le=1.0)
     risk_level: RiskLevel
+    weather_feature_status: WeatherFeatureStatus = "ignored"
     baggage_status: PolicyStatus
     student_status: PolicyStatus
     change_status: PolicyStatus
@@ -742,17 +805,14 @@ class ComparisonOffer(BaseModel):
                 self.stops,
                 self.punctuality_basis,
             ) != expected_routing:
-                raise ValueError(
-                    "routing status, stops, route status, and basis must agree"
-                )
+                raise ValueError("routing status, stops, route status, and basis must agree")
 
         if self.bookability_status == "unverified" and self.live_fare is not None:
             raise ValueError("unverified offers cannot include a live fare")
         if self.bookability_status == "booking_option_verified":
             if (
                 self.route_status != "provider_confirmed"
-                or self.routing_status
-                not in {"provider_direct", "provider_itinerary"}
+                or self.routing_status not in {"provider_direct", "provider_itinerary"}
                 or self.schedule_status != "priced_offer"
                 or self.schedule_source != "serpapi_google_flights_booking"
                 or self.cabin_status != "provider_confirmed"
@@ -820,23 +880,24 @@ class ComparisonOffer(BaseModel):
         if self.scheduled_arrival_utc <= self.scheduled_departure_utc:
             raise ValueError("scheduled arrival must be after scheduled departure")
         elapsed_minutes = round(
-            (
-                self.scheduled_arrival_utc - self.scheduled_departure_utc
-            ).total_seconds()
-            / 60
+            (self.scheduled_arrival_utc - self.scheduled_departure_utc).total_seconds() / 60
         )
         if abs(elapsed_minutes - self.duration_minutes) > 15:
             raise ValueError("schedule duration must match its UTC timestamps")
-        if abs(
-            (
-                self.scheduled_departure_local.astimezone(UTC)
-                - self.scheduled_departure_utc
-            ).total_seconds()
-        ) > 120 or abs(
-            (
-                self.scheduled_arrival_local.astimezone(UTC) - self.scheduled_arrival_utc
-            ).total_seconds()
-        ) > 120:
+        if (
+            abs(
+                (
+                    self.scheduled_departure_local.astimezone(UTC) - self.scheduled_departure_utc
+                ).total_seconds()
+            )
+            > 120
+            or abs(
+                (
+                    self.scheduled_arrival_local.astimezone(UTC) - self.scheduled_arrival_utc
+                ).total_seconds()
+            )
+            > 120
+        ):
             raise ValueError("local and UTC schedule fields must describe the same instants")
         if self.bookability_status == "booking_option_verified":
             first_segment = self.segments[0]
@@ -952,13 +1013,22 @@ class ComparisonResponse(BaseModel):
 
     @model_validator(mode="after")
     def validate_availability_mode(self) -> ComparisonResponse:
+        offer_ids = [offer.id for offer in self.offers]
+        if len(offer_ids) != len(set(offer_ids)):
+            raise ValueError("comparison offer ids must be unique")
+        expected_ranking_ids = set(offer_ids)
+        for ranking_name, ranking in (
+            ("direct_first", self.rankings.direct_first),
+            ("lowest_price", self.rankings.lowest_price),
+            ("student_first", self.rankings.student_first),
+        ):
+            if len(ranking) != len(offer_ids) or set(ranking) != expected_ranking_ids:
+                raise ValueError(f"{ranking_name} must contain every offer id exactly once")
         if self.availability_mode != "strict_bookable_only":
             return self
         if self.fare_search_metadata is None:
             raise ValueError("strict bookable mode requires fare-search metadata")
-        if any(
-            offer.bookability_status != "booking_option_verified" for offer in self.offers
-        ):
+        if any(offer.bookability_status != "booking_option_verified" for offer in self.offers):
             raise ValueError("strict bookable mode may only return confirmed offers")
         if self.offers and self.result_status != "verified_offers_found":
             raise ValueError("strict bookable offers require result status verified_offers_found")
@@ -972,9 +1042,7 @@ class ComparisonResponse(BaseModel):
         ):
             raise ValueError("confirmed offers require production fare-search metadata")
         expected_status = {
-            "confirmed_offers": (
-                "verified_offers_found" if self.offers else "no_verified_offer"
-            ),
+            "confirmed_offers": ("verified_offers_found" if self.offers else "no_verified_offer"),
             "no_results": "no_verified_offer",
             "not_configured": "fare_provider_not_configured",
             "test_environment_rejected": "fare_provider_test_rejected",
@@ -1093,16 +1161,13 @@ class ItineraryLeg(BaseModel):
             raise ValueError("provider leg UTC fields must use a zero UTC offset")
         if self.arrival_utc <= self.departure_utc:
             raise ValueError("provider leg arrival must be after departure")
-        elapsed_minutes = round(
-            (self.arrival_utc - self.departure_utc).total_seconds() / 60
-        )
+        elapsed_minutes = round((self.arrival_utc - self.departure_utc).total_seconds() / 60)
         if abs(elapsed_minutes - self.duration_minutes) > 15:
             raise ValueError("provider leg duration must match its UTC timestamps")
-        if abs(
-            (self.departure_local.astimezone(UTC) - self.departure_utc).total_seconds()
-        ) > 120 or abs(
-            (self.arrival_local.astimezone(UTC) - self.arrival_utc).total_seconds()
-        ) > 120:
+        if (
+            abs((self.departure_local.astimezone(UTC) - self.departure_utc).total_seconds()) > 120
+            or abs((self.arrival_local.astimezone(UTC) - self.arrival_utc).total_seconds()) > 120
+        ):
             raise ValueError("provider leg local and UTC fields must describe the same instants")
         if self.data_basis == "serpapi_booking_confirmed" and (
             self.marketing_airline_code is None or self.cabin is None
@@ -1175,9 +1240,7 @@ class OfferItinerary(BaseModel):
         elif self.kind == "one_stop":
             if len(self.legs) != 2:
                 raise ValueError("one-stop itineraries require exactly two legs")
-            legacy_layover = (
-                self.layover_airport is not None and self.layover_minutes is not None
-            )
+            legacy_layover = self.layover_airport is not None and self.layover_minutes is not None
             provider_layover = len(self.layovers) == 1
             if legacy_layover == provider_layover:
                 raise ValueError(
@@ -1261,11 +1324,7 @@ class PriceForecastPoint(BaseModel):
     @model_validator(mode="after")
     def validate_interval(self) -> PriceForecastPoint:
         _require_timezone(self.quote_time)
-        if not (
-            self.interval_80_low_usd
-            <= self.estimated_price_usd
-            <= self.interval_80_high_usd
-        ):
+        if not (self.interval_80_low_usd <= self.estimated_price_usd <= self.interval_80_high_usd):
             raise ValueError("price estimate must be inside its 80% interval")
         return self
 

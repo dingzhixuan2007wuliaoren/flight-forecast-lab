@@ -1,5 +1,5 @@
 {
-  "artifact_schema_version": 2,
+  "artifact_schema_version": 3,
   "context_prior": {
     "operations_airport_groups": 34,
     "source": "synthetic_demo_training_average",
@@ -36,7 +36,7 @@
   "runtime_context_features": {
     "news_disruption_index": "bounded recent-news signal; synthetic relationship in demo training",
     "origin_congestion_index": "resolved automatically at prediction time",
-    "weather_severity_forecast": "resolved automatically at prediction time"
+    "weather_severity_forecast": "used only when live or forecast weather is usable; otherwise the separate no-weather on-time model is selected"
   },
   "target_definitions": {
     "on_time": "not cancelled and arrival delay below 15 minutes",
@@ -46,5 +46,5 @@
     "on_time": 1200,
     "price": 900
   },
-  "trained_at_utc": "2026-07-14T20:57:17.073044+00:00"
+  "trained_at_utc": "2026-07-15T21:22:33.699000+00:00"
 }

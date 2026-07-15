@@ -21,6 +21,7 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     dashboard = client.get("/").text
     assert "Flight Forecast Lab" in dashboard
     assert 'id="strict-mode-notice"' in dashboard
+    assert 'id="fare-coverage-notice"' in dashboard
     assert 'id="timetable-reference-section"' in dashboard
     assert 'name="distance_km"' not in dashboard
     assert 'name="duration_minutes"' not in dashboard
@@ -33,14 +34,49 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert "报价任务仍在处理中" in dashboard
     assert "Fare provider returned an error" in dashboard
     assert "isProcessingComparison" in dashboard
+    assert "本次准点预测已忽略天气变量。" in dashboard
+    assert "Weather was omitted from this on-time prediction." in dashboard
+    for field in (
+        "coverage_scope",
+        "eligible_candidate_count",
+        "verification_attempted_count",
+        "verified_candidate_count",
+        "strictly_rejected_candidate_count",
+        "provider_failed_candidate_count",
+        "quota_skipped_candidate_count",
+        "deduplicated_verified_count",
+        "coverage_status",
+        "quota_limit",
+    ):
+        assert field in dashboard
+    for obsolete_claim in (
+        "最多 6 个候选",
+        "最多 10 次",
+        "at most six candidates",
+        "at most 10 provider requests",
+        "four cabin searches plus six",
+    ):
+        assert obsolete_claim not in dashboard
     offer_page = client.get("/details/offer").text
     assert 'id="price-curve"' in offer_page
     assert 'id="curve-chart"' in offer_page
     assert "historical_prices_available" in offer_page
+    assert "本次准点预测已忽略天气变量。" in offer_page
+    assert "Weather was omitted from this on-time prediction." in offer_page
+    assert "weather_feature_status" in offer_page
+    assert "data.offers.length" in dashboard
+    assert "coverageCacheSnapshot" in dashboard
+    for obsolete_claim in (
+        "最多 6 个候选",
+        "最多 10 次",
+        "at most six candidates",
+        "at most 10 provider requests",
+        "four cabin searches plus six",
+    ):
+        assert obsolete_claim not in offer_page
     assert "fare_estimation" in client.get("/v1/model-info").json()["available_tasks"]
     assert (
-        "global_airline_cabin_comparison"
-        in client.get("/v1/model-info").json()["available_tasks"]
+        "global_airline_cabin_comparison" in client.get("/v1/model-info").json()["available_tasks"]
     )
 
     future_departure = (datetime.now(UTC) + timedelta(days=60)).isoformat()
@@ -159,6 +195,9 @@ def test_strict_comparison_returns_structured_empty_result_without_fare_provider
     assert "booking-token" in payload["strict_mode_notice"]["en"]
     assert payload["fare_search_metadata"]["status"] == "not_configured"
     assert payload["context"]["weather"]["status"] == "proxy"
+    assert payload["context"]["weather_feature_status"] == "ignored"
+    assert "忽略天气变量" in payload["context"]["weather_feature_notice_zh"]
+    assert "weather feature" in payload["context"]["weather_feature_notice_en"]
     assert payload["context"]["operations"]["status"] == "proxy"
     assert payload["context"]["news"]["status"] == "neutral"
     assert payload["context"]["news"]["articles"] == []

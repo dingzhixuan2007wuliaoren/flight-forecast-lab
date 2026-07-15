@@ -29,7 +29,11 @@ from flight_forecaster.context import (
     PredictionContext,
 )
 from flight_forecaster.details import DetailProvider
-from flight_forecaster.features import build_ontime_features, build_price_features
+from flight_forecaster.features import (
+    build_ontime_features,
+    build_ontime_features_without_weather,
+    build_price_features,
+)
 from flight_forecaster.route_info import (
     Airport,
     AirportResolver,
@@ -237,8 +241,7 @@ class PredictionService:
         if airport_resolver is not None:
             self.airport_resolver = airport_resolver
         elif (
-            self.context_provider.external_context_enabled
-            or self.flight_offer_provider.configured
+            self.context_provider.external_context_enabled or self.flight_offer_provider.configured
         ):
             self.airport_resolver = OurAirportsResolver()
         else:
@@ -298,11 +301,7 @@ class PredictionService:
 
         if value.tzinfo is None or value.utcoffset() is None:
             departure = value.replace(tzinfo=timezone, fold=0)
-            round_trip = (
-                departure.astimezone(UTC)
-                .astimezone(timezone)
-                .replace(tzinfo=None)
-            )
+            round_trip = departure.astimezone(UTC).astimezone(timezone).replace(tzinfo=None)
             if round_trip != value:
                 raise RouteLookupError(
                     "计划时间落在夏令时不存在的时段 / departure falls in a DST gap"
@@ -319,9 +318,7 @@ class PredictionService:
         now = datetime.now(UTC)
         departure_utc = departure.astimezone(UTC)
         if departure_utc <= now:
-            raise RouteLookupError(
-                "计划出发时间必须晚于当前时间 / departure must be in the future"
-            )
+            raise RouteLookupError("计划出发时间必须晚于当前时间 / departure must be in the future")
         if departure_utc > now + timedelta(days=370):
             raise RouteLookupError(
                 "计划出发时间不得超过 370 天 / departure must be within 370 days"
@@ -538,9 +535,7 @@ class PredictionService:
         )
         if total_duration_minutes <= 0:
             raise RouteLookupError("provider itinerary duration is invalid")
-        if offer.cabin != first.cabin or any(
-            segment.cabin != offer.cabin for segment in segments
-        ):
+        if offer.cabin != first.cabin or any(segment.cabin != offer.cabin for segment in segments):
             raise RouteLookupError("provider itinerary mixes cabin classes")
         return tuple(segments), round(total_distance_km, 1), total_duration_minutes
 
@@ -601,9 +596,7 @@ class PredictionService:
             ),
             "test_environment_rejected": BilingualText(
                 zh="测试或样例报价已被严格模式拒绝。",
-                en=(
-                    "Test or illustrative fare data is rejected by strict mode."
-                ),
+                en=("Test or illustrative fare data is rejected by strict mode."),
             ),
             "authentication_failed": BilingualText(
                 zh="SerpApi 认证失败；未返回未验证航班。",
@@ -629,8 +622,7 @@ class PredictionService:
             ),
             "provider_processing": BilingualText(
                 zh=(
-                    "报价任务仍在 SerpApi 队列中或处理中；系统已完成有界轮询，"
-                    "未重新提交整组搜索。"
+                    "报价任务仍在 SerpApi 队列中或处理中；系统已完成有界轮询，未重新提交整组搜索。"
                 ),
                 en=(
                     "The fare search is still queued or processing at SerpApi after "
@@ -638,10 +630,7 @@ class PredictionService:
                 ),
             ),
             "provider_error": BilingualText(
-                zh=(
-                    "生产报价源返回终态错误、HTTP 错误或网络错误；"
-                    "严格模式未显示未验证航班。"
-                ),
+                zh=("生产报价源返回终态错误、HTTP 错误或网络错误；严格模式未显示未验证航班。"),
                 en=(
                     "The production fare source returned a terminal, HTTP, or "
                     "transport error; strict mode showed no unverified flights."
@@ -668,6 +657,61 @@ class PredictionService:
         # one legacy slot; never add the slots and accidentally report 500.
         monthly_limit = next((value for value in limits if value is not None), None)
         monthly_used = next((value for value in usage if value is not None), None)
+        notice = notices[result.status]
+        if result.coverage_status in {"quota_limited", "quota_and_provider_incomplete"}:
+            provider_failure_zh = (
+                f"另有 {result.provider_failed_candidate_count} 个候选因供应商错误未完成验证；"
+                if result.provider_failed_candidate_count
+                else ""
+            )
+            provider_failure_en = (
+                f" A further {result.provider_failed_candidate_count} candidate(s) failed "
+                "because of provider errors."
+                if result.provider_failed_candidate_count
+                else ""
+            )
+            notice = BilingualText(
+                zh=(
+                    f"SerpApi 四舱搜索返回 {result.eligible_candidate_count} 个可验证候选；"
+                    f"本次受免费{('小时' if result.quota_limit == 'hourly' else '月度')}额度限制，"
+                    f"仅尝试 {result.verification_attempted_count} 个，跳过 "
+                    f"{result.quota_skipped_candidate_count} 个。{provider_failure_zh}"
+                    "列表只包含成功严格验证的航班，"
+                    "最低价仅指已验证子集。"
+                ),
+                en=(
+                    f"SerpApi's four-cabin search returned {result.eligible_candidate_count} "
+                    f"verifiable candidate(s). The free "
+                    f"{result.quota_limit or 'provider'} quota allowed "
+                    f"{result.verification_attempted_count} attempt(s), leaving "
+                    f"{result.quota_skipped_candidate_count} unverified."
+                    f"{provider_failure_en} Only strictly "
+                    "verified flights are listed; the lowest price applies to the verified "
+                    "subset only."
+                ),
+            )
+        elif result.coverage_status == "provider_incomplete":
+            notice = BilingualText(
+                zh=(
+                    f"已尝试 SerpApi 返回的全部 {result.eligible_candidate_count} 个候选，"
+                    f"其中 {result.provider_failed_candidate_count} 个因供应商错误未能完成验证。"
+                    "列表只包含成功严格验证的航班。"
+                ),
+                en=(
+                    f"All {result.eligible_candidate_count} SerpApi candidate(s) were "
+                    f"attempted, but {result.provider_failed_candidate_count} could not be "
+                    "completed because of provider errors. Only strictly verified flights "
+                    "are listed."
+                ),
+            )
+        if result.cache_hit and result.coverage_status != "not_evaluated":
+            notice = BilingualText(
+                zh="本次复用 5 分钟严格缓存；以下候选统计来自原查询。" + notice.zh,
+                en=(
+                    "This response reused the five-minute strict cache; the candidate "
+                    "coverage counts describe the original search. " + notice.en
+                ),
+            )
         return FareSearchMetadata(
             status=result.status,
             provider_code=(
@@ -701,7 +745,17 @@ class PredictionService:
                 }
                 for diagnostic in result.diagnostics
             ],
-            notice=notices[result.status],
+            coverage_scope=result.coverage_scope,
+            eligible_candidate_count=result.eligible_candidate_count,
+            verification_attempted_count=result.verification_attempted_count,
+            verified_candidate_count=result.verified_candidate_count,
+            strictly_rejected_candidate_count=result.strictly_rejected_candidate_count,
+            provider_failed_candidate_count=result.provider_failed_candidate_count,
+            quota_skipped_candidate_count=result.quota_skipped_candidate_count,
+            deduplicated_verified_count=result.deduplicated_verified_count,
+            coverage_status=result.coverage_status,
+            quota_limit=result.quota_limit,
+            notice=notice,
         )
 
     @staticmethod
@@ -793,24 +847,66 @@ class PredictionService:
         route: RouteEstimate,
         context: PredictionContext,
     ) -> float:
-        row = pd.DataFrame(
-            [
-                {
-                    "origin": origin,
-                    "destination": destination,
-                    "airline": airline,
-                    "scheduled_departure": departure_time,
-                    "distance_km": route.distance_km,
-                    "weather_severity_forecast": context.weather.value,
-                    "origin_congestion_index": context.operations.value,
-                    "news_disruption_index": context.news.value,
-                    **_local_time_features(departure_time),
-                }
-            ]
-        )
-        features = build_ontime_features(row)
-        probability = float(self.bundle["ontime_model"].predict_proba(features)[0, 1])
+        row_data = {
+            "origin": origin,
+            "destination": destination,
+            "airline": airline,
+            "scheduled_departure": departure_time,
+            "distance_km": route.distance_km,
+            "origin_congestion_index": context.operations.value,
+            "news_disruption_index": context.news.value,
+            **_local_time_features(departure_time),
+        }
+        weather_feature_status = self._weather_feature_status(context)
+        if weather_feature_status == "used":
+            row_data["weather_severity_forecast"] = context.weather.value
+            features = build_ontime_features(pd.DataFrame([row_data]))
+            model = self.bundle["ontime_model"]
+        else:
+            features = build_ontime_features_without_weather(pd.DataFrame([row_data]))
+            model = self.bundle["ontime_model_without_weather"]
+        probability = float(model.predict_proba(features)[0, 1])
         return round(float(np.clip(probability, 0.0, 1.0)), 4)
+
+    @staticmethod
+    def _weather_feature_status(
+        context: PredictionContext,
+        *,
+        target_departure: datetime | None = None,
+        weather_reference_departure: datetime | None = None,
+    ) -> str:
+        if context.weather.status not in {"live", "forecast"}:
+            return "ignored"
+        if target_departure is None and weather_reference_departure is None:
+            return "used"
+        if target_departure is None or weather_reference_departure is None:
+            return "ignored"
+        if (
+            target_departure.tzinfo is None
+            or target_departure.utcoffset() is None
+            or weather_reference_departure.tzinfo is None
+            or weather_reference_departure.utcoffset() is None
+        ):
+            return "ignored"
+        separation = abs(
+            (
+                target_departure.astimezone(UTC) - weather_reference_departure.astimezone(UTC)
+            ).total_seconds()
+        )
+        return "used" if separation <= 2 * 60 * 60 else "ignored"
+
+    @staticmethod
+    def _weather_feature_notice(status: str) -> tuple[str, str]:
+        if status == "used":
+            return (
+                "本次准点预测使用了适用于出发时刻的实时或预报天气。",
+                "This on-time prediction uses applicable live or forecast weather.",
+            )
+        return (
+            "天气不可用、超出预报范围或仅有历史代理值；本次准点预测已忽略天气变量。",
+            "Weather is unavailable, outside the forecast horizon, or proxy-only; "
+            "this on-time prediction excludes the weather feature.",
+        )
 
     @staticmethod
     def _risk_level(probability: float) -> str:
@@ -844,9 +940,7 @@ class PredictionService:
             distance_km=route.distance_km,
             duration_minutes=route.duration_minutes,
             model_version=self.model_version,
-            warning=(
-                "模型估价已纳入带来源的新闻风险信号，但并非实时可购买报价，也不保证最低价。"
-            ),
+            warning=("模型估价已纳入带来源的新闻风险信号，但并非实时可购买报价，也不保证最低价。"),
             warning_en=(
                 "The model estimate includes a sourced news-risk signal, but it is not a "
                 "live bookable fare or a lowest-price guarantee."
@@ -868,6 +962,8 @@ class PredictionService:
             route=route,
             context=context,
         )
+        weather_feature_status = self._weather_feature_status(context)
+        weather_notice_zh, weather_notice_en = self._weather_feature_notice(weather_feature_status)
         return OnTimePrediction(
             on_time_probability=probability,
             disruption_probability=round(1.0 - probability, 4),
@@ -876,6 +972,9 @@ class PredictionService:
             definition="未取消且到达延误少于 15 分钟",
             definition_en="Not cancelled and arrival delay under 15 minutes",
             model_version=self.model_version,
+            weather_feature_status=weather_feature_status,
+            weather_feature_notice_zh=weather_notice_zh,
+            weather_feature_notice_en=weather_notice_en,
         )
 
     @staticmethod
@@ -936,6 +1035,10 @@ class PredictionService:
             )
             for article in context.news.articles
         ]
+        weather_feature_status = PredictionService._weather_feature_status(context)
+        weather_notice_zh, weather_notice_en = PredictionService._weather_feature_notice(
+            weather_feature_status
+        )
         return PredictionContextResponse(
             weather=signal(context.weather),
             operations=OperationsSignal(
@@ -955,13 +1058,14 @@ class PredictionService:
                 summary_en=context.news.summary_en,
                 articles=articles,
             ),
+            weather_feature_status=weather_feature_status,
+            weather_feature_notice_zh=weather_notice_zh,
+            weather_feature_notice_en=weather_notice_en,
         )
 
     @staticmethod
     def _student_sort_key(offer: ComparisonOffer) -> tuple[Any, ...]:
-        baggage_rank = int(
-            offer.baggage_status not in {"confirmed_free", "confirmed_included"}
-        )
+        baggage_rank = int(offer.baggage_status not in {"confirmed_free", "confirmed_included"})
 
         student_discount_rank = int(offer.student_status != "confirmed_discount")
         flexibility_rank = sum(
@@ -998,9 +1102,7 @@ class PredictionService:
             return 0
         if offer.routing_status == "provider_itinerary":
             return offer.stops or 1
-        return {"model_one_stop": 4, "model_route_unresolved": 5}[
-            offer.routing_status
-        ]
+        return {"model_one_stop": 4, "model_route_unresolved": 5}[offer.routing_status]
 
     def compare(
         self,
@@ -1064,9 +1166,7 @@ class PredictionService:
             profile = get_airline_profile(schedule.airline_code)
             if schedule.schedule_status == "recurring_timetable_projection":
                 reason = BilingualText(
-                    zh=(
-                        "周期时刻表只作为参考，不证明所选日期实际运行、存在座位或可购买。"
-                    ),
+                    zh=("周期时刻表只作为参考，不证明所选日期实际运行、存在座位或可购买。"),
                     en=(
                         "This recurring timetable is reference-only and does not prove "
                         "operation, seat inventory, or bookability on the selected date."
@@ -1106,14 +1206,12 @@ class PredictionService:
         rejected_priced_offers = 0
         for confirmed in fare_result.offers:
             try:
-                provider_segments, total_distance, total_duration = (
-                    self._strict_provider_segments(
-                        confirmed,
-                        origin=request.origin,
-                        destination=request.destination,
-                        departure_date=departure_date,
-                        generated_at=generated_at,
-                    )
+                provider_segments, total_distance, total_duration = self._strict_provider_segments(
+                    confirmed,
+                    origin=request.origin,
+                    destination=request.destination,
+                    departure_date=departure_date,
+                    generated_at=generated_at,
                 )
             except (RouteLookupError, ValueError):
                 rejected_priced_offers += 1
@@ -1133,9 +1231,7 @@ class PredictionService:
                     stops=len(provider_segments) - 1,
                     model_stops=len(provider_segments) - 1,
                     routing_status=(
-                        "provider_direct"
-                        if len(provider_segments) == 1
-                        else "provider_itinerary"
+                        "provider_direct" if len(provider_segments) == 1 else "provider_itinerary"
                     ),
                     departure_time=provider_segments[0].departure_local,
                     duration_minutes=total_duration,
@@ -1172,34 +1268,57 @@ class PredictionService:
             estimates = np.asarray([], dtype=float)
         half_width = float(self.bundle["price_interval_half_width_usd"])
 
-        ontime_rows = [
-            {
-                "origin": request.origin,
-                "destination": request.destination,
-                "airline": scenario.profile.code,
-                "scheduled_departure": scenario.departure_time,
-                "distance_km": scenario.distance_km,
-                "weather_severity_forecast": context.weather.value,
-                "origin_congestion_index": context.operations.value,
-                "news_disruption_index": context.news.value,
-                **_local_time_features(scenario.departure_time),
-            }
+        weather_feature_statuses = [
+            self._weather_feature_status(
+                context,
+                target_departure=scenario.departure_time,
+                weather_reference_departure=departure_time,
+            )
             for scenario in scenarios
         ]
-        if ontime_rows:
-            ontime_features = build_ontime_features(pd.DataFrame(ontime_rows))
-            probabilities = np.clip(
-                self.bundle["ontime_model"].predict_proba(ontime_features)[:, 1],
+        ontime_rows: list[dict[str, Any]] = []
+        for scenario in scenarios:
+            ontime_rows.append(
+                {
+                    "origin": request.origin,
+                    "destination": request.destination,
+                    "airline": scenario.profile.code,
+                    "scheduled_departure": scenario.departure_time,
+                    "distance_km": scenario.distance_km,
+                    "origin_congestion_index": context.operations.value,
+                    "news_disruption_index": context.news.value,
+                    **_local_time_features(scenario.departure_time),
+                }
+            )
+        probabilities = np.zeros(len(ontime_rows), dtype=float)
+        for weather_feature_status in ("used", "ignored"):
+            indices = [
+                index
+                for index, status in enumerate(weather_feature_statuses)
+                if status == weather_feature_status
+            ]
+            if not indices:
+                continue
+            selected_rows = [dict(ontime_rows[index]) for index in indices]
+            if weather_feature_status == "used":
+                for row in selected_rows:
+                    row["weather_severity_forecast"] = context.weather.value
+                ontime_features = build_ontime_features(pd.DataFrame(selected_rows))
+                ontime_model = self.bundle["ontime_model"]
+            else:
+                ontime_features = build_ontime_features_without_weather(pd.DataFrame(selected_rows))
+                ontime_model = self.bundle["ontime_model_without_weather"]
+            probabilities[indices] = np.clip(
+                ontime_model.predict_proba(ontime_features)[:, 1],
                 0.0,
                 1.0,
             )
-        else:
-            probabilities = np.asarray([], dtype=float)
         offers: list[ComparisonOffer] = []
-        for scenario, raw_estimate, raw_probability in zip(
+        for scenario, raw_estimate, raw_probability, weather_feature_status in zip(
             scenarios,
             estimates,
             probabilities,
+            weather_feature_statuses,
             strict=True,
         ):
             profile = scenario.profile
@@ -1247,6 +1366,7 @@ class PredictionService:
                     interval_80_high_usd=round(float(raw_estimate + half_width), 2),
                     on_time_probability=probability,
                     risk_level=self._risk_level(probability),
+                    weather_feature_status=weather_feature_status,
                     baggage_status=self._baggage_status(scenario.provider_segments),
                     student_status=profile.student_status,
                     change_status=self._change_status(confirmed),
@@ -1332,9 +1452,7 @@ class PredictionService:
 
         fare_metadata = self._fare_metadata(fare_result)
         result_status = {
-            "confirmed_offers": (
-                "verified_offers_found" if offers else "no_verified_offer"
-            ),
+            "confirmed_offers": ("verified_offers_found" if offers else "no_verified_offer"),
             "no_results": "no_verified_offer",
             "not_configured": "fare_provider_not_configured",
             "test_environment_rejected": "fare_provider_test_rejected",
@@ -1358,8 +1476,7 @@ class PredictionService:
         )
         fare_warning = (
             (
-                "主价格是查询时经 Google Flights 购票选项验证的一位成人单程 USD "
-                "报价；",
+                "主价格是查询时经 Google Flights 购票选项验证的一位成人单程 USD 报价；",
                 "The primary price is a one-way, one-adult USD result whose booking "
                 "option was verified through Google Flights at query time. ",
             )
@@ -1368,6 +1485,16 @@ class PredictionService:
                 "本次没有价格通过严格购票选项验证；",
                 "No price passed strict booking-option verification in this response. ",
             )
+        )
+        coverage_warning = (
+            (f" {fare_metadata.notice.zh}", f" {fare_metadata.notice.en}")
+            if fare_metadata.coverage_status
+            in {
+                "quota_limited",
+                "provider_incomplete",
+                "quota_and_provider_incomplete",
+            }
+            else ("", "")
         )
 
         return ComparisonResponse(
@@ -1392,12 +1519,16 @@ class PredictionService:
             strict_mode_notice=BilingualText(
                 zh=(
                     "严格可售模式仅显示经 Google Flights 搜索及 booking token 购票选项"
-                    "二次验证的报价。"
+                    "二次验证的报价。系统会处理四个舱位搜索实际返回的全部候选，但免费额度或"
+                    "供应商错误可能使验证覆盖不完整；未验证候选绝不会进入主列表。"
                     "测试数据、AirLabs 时刻、周期投影和纯模型航班都不能进入主列表。"
                 ),
                 en=(
                     "Strict bookable mode shows only offers that pass both a Google Flights "
-                    "search and booking-token booking-option verification. Test data, AirLabs "
+                    "search and booking-token booking-option verification. Every candidate "
+                    "returned by the four cabin searches is considered, but free quota or "
+                    "provider errors can leave coverage incomplete; unverified candidates "
+                    "never enter the main list. Test data, AirLabs "
                     "timetables, recurring projections, and model-only flights cannot enter "
                     "the main list."
                 ),
@@ -1415,6 +1546,7 @@ class PredictionService:
                     f" {reference_warning[0]}"
                     f" {truncation_warning[0]}"
                     f"{rejected_warning[0]}"
+                    f"{coverage_warning[0]}"
                 ),
                 en=(
                     f"{fare_warning[1]}The model estimate, 80% "
@@ -1425,6 +1557,7 @@ class PredictionService:
                     f" {reference_warning[1]}"
                     f" {truncation_warning[1]}"
                     f"{rejected_warning[1]}"
+                    f"{coverage_warning[1]}"
                 ),
             ),
             model_version=self.model_version,
@@ -1519,8 +1652,7 @@ class PredictionService:
                 quote_date=quote_date,
                 quote_time=quote_time,
                 days_until_departure=round(
-                    (departure_utc - quote_time.astimezone(UTC)).total_seconds()
-                    / 86_400.0,
+                    (departure_utc - quote_time.astimezone(UTC)).total_seconds() / 86_400.0,
                     4,
                 ),
                 estimated_price_usd=round(float(estimate), 2),
@@ -1545,11 +1677,7 @@ class PredictionService:
                 zh=(
                     "曲线中的全部点由当前一次请求使用同一合成演示模型生成，"
                     "仅改变模拟查询日期；它不是已采集的历史票价、实时票价或可购买报价。"
-                    + (
-                        " 部分点超过模型主要的 180 天训练提前期，属于外推。"
-                        if extrapolated
-                        else ""
-                    )
+                    + (" 部分点超过模型主要的 180 天训练提前期，属于外推。" if extrapolated else "")
                 ),
                 en=(
                     "Every point is generated in this request by the same synthetic-demo "
@@ -1620,13 +1748,9 @@ class PredictionService:
                     booking_class=segment.booking_class,
                     fare_basis=segment.fare_basis,
                     fare_brand=segment.fare_brand,
-                    included_checked_bag_quantity=(
-                        segment.included_checked_bag_quantity
-                    ),
+                    included_checked_bag_quantity=(segment.included_checked_bag_quantity),
                     included_checked_bag_weight=segment.included_checked_bag_weight,
-                    included_checked_bag_weight_unit=(
-                        segment.included_checked_bag_weight_unit
-                    ),
+                    included_checked_bag_weight_unit=(segment.included_checked_bag_weight_unit),
                     data_basis="serpapi_booking_confirmed",
                 )
             )
@@ -1753,12 +1877,10 @@ class PredictionService:
             raise RouteLookupError("service clock must include a timezone offset")
         generated_at = generated_at.astimezone(UTC)
         if request.departure_date is not None:
-            departure, origin_timezone, departure_time_basis = (
-                self._departure_date_at_origin(
-                    request.departure_date,
-                    route.origin,
-                    generated_at,
-                )
+            departure, origin_timezone, departure_time_basis = self._departure_date_at_origin(
+                request.departure_date,
+                route.origin,
+                generated_at,
             )
         else:
             assert request.departure_time is not None
@@ -1870,10 +1992,7 @@ class PredictionService:
             metadata=snapshot.metadata,
             summary=snapshot.summary,
             indexed_time_notice=BilingualText(
-                zh=(
-                    "文章时间是 GDELT 观察/索引时间，不保证是媒体发布时间；"
-                    "标题保留来源语言。"
-                ),
+                zh=("文章时间是 GDELT 观察/索引时间，不保证是媒体发布时间；标题保留来源语言。"),
                 en=(
                     "Article times are GDELT observed/indexed times, not guaranteed "
                     "publisher timestamps; titles remain in their source language."

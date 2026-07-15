@@ -36,6 +36,12 @@ ONTIME_NUMERIC_FEATURES = [
     "is_peak_hour",
 ]
 ONTIME_FEATURES = ONTIME_CATEGORICAL_FEATURES + ONTIME_NUMERIC_FEATURES
+ONTIME_NUMERIC_FEATURES_WITHOUT_WEATHER = [
+    feature for feature in ONTIME_NUMERIC_FEATURES if feature != "weather_severity_forecast"
+]
+ONTIME_FEATURES_WITHOUT_WEATHER = (
+    ONTIME_CATEGORICAL_FEATURES + ONTIME_NUMERIC_FEATURES_WITHOUT_WEATHER
+)
 
 
 def _cyclic(values: pd.Series, period: float) -> tuple[pd.Series, pd.Series]:
@@ -107,16 +113,21 @@ def build_price_features(frame: pd.DataFrame) -> pd.DataFrame:
     return result[PRICE_FEATURES]
 
 
-def build_ontime_features(frame: pd.DataFrame) -> pd.DataFrame:
+def _build_ontime_features(
+    frame: pd.DataFrame,
+    *,
+    include_weather: bool,
+) -> pd.DataFrame:
     required = {
         "origin",
         "destination",
         "airline",
         "distance_km",
         "scheduled_departure",
-        "weather_severity_forecast",
         "origin_congestion_index",
     }
+    if include_weather:
+        required.add("weather_severity_forecast")
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"on-time data is missing columns: {sorted(missing)}")
@@ -131,4 +142,17 @@ def build_ontime_features(frame: pd.DataFrame) -> pd.DataFrame:
     result["departure_hour_sin"], result["departure_hour_cos"] = _cyclic(hour, 24)
     result["is_weekend"] = weekday.isin([5, 6]).astype(int)
     result["is_peak_hour"] = hour.isin([6, 7, 8, 16, 17, 18, 19]).astype(int)
-    return result[ONTIME_FEATURES]
+    features = ONTIME_FEATURES if include_weather else ONTIME_FEATURES_WITHOUT_WEATHER
+    return result[features]
+
+
+def build_ontime_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build the on-time feature matrix when usable live/forecast weather exists."""
+
+    return _build_ontime_features(frame, include_weather=True)
+
+
+def build_ontime_features_without_weather(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build the on-time matrix without creating or imputing a weather feature."""
+
+    return _build_ontime_features(frame, include_weather=False)

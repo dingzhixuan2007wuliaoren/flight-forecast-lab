@@ -175,7 +175,52 @@ def _fare_result(
         pricing_monthly_limit=None,
         search_monthly_used=2,
         pricing_monthly_used=None,
+        eligible_candidate_count=1,
+        verification_attempted_count=1,
+        verified_candidate_count=1,
+        coverage_status="complete",
     )
+
+
+def test_fare_metadata_explains_cached_and_combined_incomplete_coverage() -> None:
+    observed_at = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+    cached = FlightOfferSearchResult(
+        offers=(),
+        status="no_results",
+        observed_at=observed_at,
+        environment="production",
+        searched_cabins=("economy",),
+        calls_used=0,
+        cache_hit=True,
+        eligible_candidate_count=1,
+        verification_attempted_count=1,
+        strictly_rejected_candidate_count=1,
+        coverage_status="complete",
+    )
+    combined = FlightOfferSearchResult(
+        offers=(),
+        status="provider_error",
+        observed_at=observed_at,
+        environment="production",
+        searched_cabins=("economy",),
+        calls_used=2,
+        cache_hit=False,
+        pricing_calls_used=2,
+        eligible_candidate_count=3,
+        verification_attempted_count=2,
+        provider_failed_candidate_count=2,
+        quota_skipped_candidate_count=1,
+        coverage_status="quota_and_provider_incomplete",
+        quota_limit="hourly",
+    )
+
+    cached_metadata = PredictionService._fare_metadata(cached)
+    combined_metadata = PredictionService._fare_metadata(combined)
+
+    assert "缓存" in cached_metadata.notice.zh
+    assert "original search" in cached_metadata.notice.en
+    assert "供应商错误" in combined_metadata.notice.zh
+    assert "provider errors" in combined_metadata.notice.en
 
 
 class _ConfirmedAirlineProvider(ContextProvider):
@@ -329,14 +374,10 @@ def test_live_canceled_past_and_completed_rows_suppress_matching_projections() -
         "AC853": "mystery",
         "AC854": "active",
     }
-    weekday = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[
-        selected_date.weekday()
-    ]
+    weekday = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[selected_date.weekday()]
     for flight, departure_clock in departures.items():
         departure = datetime.combine(selected_date, departure_clock, tzinfo=origin_zone)
-        arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(
-            destination_zone
-        )
+        arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(destination_zone)
         live = _live_row(flight=flight, departure=departure, arrival=arrival)
         live["status"] = statuses[flight]
         if flight == "AC850":
@@ -448,9 +489,7 @@ def test_strict_compare_moves_recurring_rows_to_reference_section(
     ]
     schedules = []
     for index, departure in enumerate(departures, start=1):
-        arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(
-            destination_zone
-        )
+        arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(destination_zone)
         schedules.append(
             FlightSchedule(
                 airline_code="AC",
@@ -537,9 +576,7 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
     origin_zone = ZoneInfo("America/Toronto")
     destination_zone = ZoneInfo("Europe/London")
     departure = datetime.combine(selected_date, time(9, 0), tzinfo=origin_zone)
-    arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(
-        destination_zone
-    )
+    arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(destination_zone)
     schedule = FlightSchedule(
         airline_code="AC",
         flight_number="AC801",
@@ -587,9 +624,7 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
     assert {offer.flight_number for offer in result.offers} == {"AC801"}
     assert {offer.cabin for offer in result.offers} == {"economy"}
     assert all(offer.schedule_status == "priced_offer" for offer in result.offers)
-    assert all(
-        offer.bookability_status == "booking_option_verified" for offer in result.offers
-    )
+    assert all(offer.bookability_status == "booking_option_verified" for offer in result.offers)
     assert result.offers[0].live_fare is not None
     assert result.offers[0].live_fare.total_amount == 512.34
     assert result.offers[0].live_fare.taxes_included is None
@@ -639,9 +674,7 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
     ]
     assert curve.points[0].estimated_price_usd == selected.estimated_price_usd
     assert all(
-        point.interval_80_low_usd
-        <= point.estimated_price_usd
-        <= point.interval_80_high_usd
+        point.interval_80_low_usd <= point.estimated_price_usd <= point.interval_80_high_usd
         for point in curve.points
     )
     assert all(
@@ -702,12 +735,8 @@ def test_priced_connection_preserves_each_leg_layover_and_live_fare_ranking(
                 segment_id="2",
                 origin="FRA",
                 destination="LHR",
-                departure_at=datetime.combine(
-                    selected_date + timedelta(days=1), time(8, 0)
-                ),
-                arrival_at=datetime.combine(
-                    selected_date + timedelta(days=1), time(8, 30)
-                ),
+                departure_at=datetime.combine(selected_date + timedelta(days=1), time(8, 0)),
+                arrival_at=datetime.combine(selected_date + timedelta(days=1), time(8, 30)),
                 marketing_airline_code="LH",
                 operating_airline_code="LH",
                 flight_number="900",
@@ -746,14 +775,16 @@ def test_priced_connection_preserves_each_leg_layover_and_live_fare_ranking(
         pricing_monthly_limit=None,
         search_monthly_used=3,
         pricing_monthly_used=None,
+        eligible_candidate_count=2,
+        verification_attempted_count=2,
+        verified_candidate_count=2,
+        coverage_status="complete",
     )
     fare_provider = _StaticFareProvider(fare_result)
     service = PredictionService(
         trained_model_dir,
         context_provider=ContextProvider(),
-        schedule_provider=_StaticScheduleProvider(
-            ScheduleSearchResult((), frozenset())
-        ),  # type: ignore[arg-type]
+        schedule_provider=_StaticScheduleProvider(ScheduleSearchResult((), frozenset())),  # type: ignore[arg-type]
         flight_offer_provider=fare_provider,
         now_provider=lambda: generated_at,
     )
@@ -806,9 +837,7 @@ def test_unknown_airline_requires_a_priced_cabin_and_is_not_expanded(
     origin_zone = ZoneInfo("America/Toronto")
     destination_zone = ZoneInfo("Europe/London")
     departure = datetime.combine(selected_date, time(9, 0), tzinfo=origin_zone)
-    arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(
-        destination_zone
-    )
+    arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(destination_zone)
     schedule = FlightSchedule(
         airline_code="8M",
         flight_number="8M750",
@@ -912,18 +941,22 @@ def test_empty_provider_outcomes_remain_distinct_across_service_contract(
     monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
     generated_at = datetime(2026, 7, 15, 12, tzinfo=UTC)
     diagnostic = (
-        ProviderDiagnostic(
-            observed_at=generated_at,
-            stage="search_archive",
-            http_status=200,
-            exception_type=(
-                "ProviderProcessingError"
-                if provider_status == "provider_processing"
-                else "ProviderSearchError"
+        (
+            ProviderDiagnostic(
+                observed_at=generated_at,
+                stage="search_archive",
+                http_status=200,
+                exception_type=(
+                    "ProviderProcessingError"
+                    if provider_status == "provider_processing"
+                    else "ProviderSearchError"
+                ),
+                search_id="pendingsearch01",
             ),
-            search_id="pendingsearch01",
-        ),
-    ) if provider_status != "no_results" else ()
+        )
+        if provider_status != "no_results"
+        else ()
+    )
     fare_result = FlightOfferSearchResult(
         offers=(),
         status=provider_status,  # type: ignore[arg-type]
@@ -941,9 +974,7 @@ def test_empty_provider_outcomes_remain_distinct_across_service_contract(
     service = PredictionService(
         trained_model_dir,
         context_provider=ContextProvider(),
-        schedule_provider=_StaticScheduleProvider(
-            ScheduleSearchResult((), frozenset())
-        ),  # type: ignore[arg-type]
+        schedule_provider=_StaticScheduleProvider(ScheduleSearchResult((), frozenset())),  # type: ignore[arg-type]
         flight_offer_provider=_StaticFareProvider(fare_result),
         now_provider=lambda: generated_at,
     )

@@ -51,9 +51,7 @@ AIRLABS_ROUTES_URL = "https://airlabs.co/api/v9/routes"
 ADSB_LOL_URL = "https://api.adsb.lol/v2/lat/{latitude}/lon/{longitude}/dist/100"
 FAA_NAS_STATUS_URL = "https://nasstatus.faa.gov/api/airport-events"
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
-GDELT_GAL_RSS_URL = (
-    "https://storage.googleapis.com/data.gdeltproject.org/gdeltv3/gal/feed.rss"
-)
+GDELT_GAL_RSS_URL = "https://storage.googleapis.com/data.gdeltproject.org/gdeltv3/gal/feed.rss"
 
 
 def _bounded(value: Any) -> float:
@@ -529,9 +527,7 @@ class ContextProvider:
             raise LookupError("Open-Meteo response is not an object")
 
         lead = departure - fetched_at
-        if timedelta(hours=-2) <= lead <= timedelta(
-            hours=CURRENT_WEATHER_MAX_LEAD_HOURS
-        ):
+        if timedelta(hours=-2) <= lead <= timedelta(hours=CURRENT_WEATHER_MAX_LEAD_HOURS):
             current_signal = self._open_meteo_current(payload, fetched_at)
             if current_signal is not None:
                 return current_signal
@@ -550,16 +546,47 @@ class ContextProvider:
         if abs(forecast_time - departure) > timedelta(hours=2):
             raise LookupError("Departure is outside the available forecast horizon")
 
-        weather_code = self._hourly_value(hourly, "weather_code", index, 0)
-        wind = self._hourly_value(hourly, "wind_speed_10m", index, 0)
-        gust = self._hourly_value(hourly, "wind_gusts_10m", index, wind)
-        precipitation = self._hourly_value(
-            hourly,
-            "precipitation_probability",
-            index,
-            0,
-        )
-        visibility = self._hourly_value(hourly, "visibility", index, 10_000)
+        required_values = {
+            "weather_code": self._hourly_value(hourly, "weather_code", index, None),
+            "wind_speed_10m": self._hourly_value(
+                hourly,
+                "wind_speed_10m",
+                index,
+                None,
+            ),
+            "wind_gusts_10m": self._hourly_value(
+                hourly,
+                "wind_gusts_10m",
+                index,
+                None,
+            ),
+            "precipitation_probability": self._hourly_value(
+                hourly,
+                "precipitation_probability",
+                index,
+                None,
+            ),
+            "visibility": self._hourly_value(hourly, "visibility", index, None),
+        }
+        risk_values = {
+            field: self._optional_number(value) for field, value in required_values.items()
+        }
+        invalid_fields = [field for field, value in risk_values.items() if value is None]
+        if invalid_fields:
+            raise LookupError(
+                "Open-Meteo forecast risk fields are missing or invalid: "
+                + ", ".join(invalid_fields)
+            )
+        weather_code = risk_values["weather_code"]
+        wind = risk_values["wind_speed_10m"]
+        gust = risk_values["wind_gusts_10m"]
+        precipitation = risk_values["precipitation_probability"]
+        visibility = risk_values["visibility"]
+        assert weather_code is not None
+        assert wind is not None
+        assert gust is not None
+        assert precipitation is not None
+        assert visibility is not None
         temperature = self._hourly_value(hourly, "temperature_2m", index, None)
         severity = self._weather_severity(
             weather_code,
@@ -597,20 +624,18 @@ class ContextProvider:
         if observed_at is None:
             return None
         age = fetched_at - observed_at
-        if not timedelta(minutes=-15) <= age <= timedelta(
-            minutes=CURRENT_WEATHER_MAX_AGE_MINUTES
-        ):
+        if not timedelta(minutes=-15) <= age <= timedelta(minutes=CURRENT_WEATHER_MAX_AGE_MINUTES):
             return None
 
         weather_code = self._optional_number(current.get("weather_code"))
         wind = self._optional_number(current.get("wind_speed_10m"))
         gust = self._optional_number(current.get("wind_gusts_10m"))
-        if weather_code is None or wind is None or gust is None:
+        precipitation = self._optional_number(current.get("precipitation"))
+        visibility = self._optional_number(current.get("visibility"))
+        if any(value is None for value in (weather_code, wind, gust, precipitation, visibility)):
             return None
-        precipitation = current.get("precipitation", 0)
-        visibility = current.get("visibility", 10_000)
-        if visibility is None:
-            visibility = 10_000
+        assert precipitation is not None
+        assert visibility is not None
         temperature = current.get("temperature_2m")
         severity = self._weather_severity(
             weather_code,
@@ -659,13 +684,19 @@ class ContextProvider:
         status = "live" if any(signal.status == "live" for signal in signals) else "forecast"
         source = "+".join(signal.source for signal in signals)
         observed_at = max(signal.observed_at for signal in signals)
-        products_zh = "METAR 机场实况与 TAF 航站预报" if len(signals) > 1 else (
-            "METAR 机场实况" if signals[0].source == "noaa_metar" else "TAF 航站预报"
+        products_zh = (
+            "METAR 机场实况与 TAF 航站预报"
+            if len(signals) > 1
+            else ("METAR 机场实况" if signals[0].source == "noaa_metar" else "TAF 航站预报")
         )
-        products_en = "METAR observation and TAF forecast" if len(signals) > 1 else (
-            "METAR airport observation"
-            if signals[0].source == "noaa_metar"
-            else "TAF terminal forecast"
+        products_en = (
+            "METAR observation and TAF forecast"
+            if len(signals) > 1
+            else (
+                "METAR airport observation"
+                if signals[0].source == "noaa_metar"
+                else "TAF terminal forecast"
+            )
         )
         return WeatherSignal(
             severity,
@@ -691,8 +722,10 @@ class ContextProvider:
             except Exception:
                 payload = None
             self._cache_set(self._noaa_cache, cache_key, payload)
-        rows = payload if isinstance(payload, list) else (
-            payload.get("data", []) if isinstance(payload, dict) else []
+        rows = (
+            payload
+            if isinstance(payload, list)
+            else (payload.get("data", []) if isinstance(payload, dict) else [])
         )
         if not isinstance(rows, list):
             return None
@@ -714,6 +747,8 @@ class ContextProvider:
                 if not timedelta(minutes=-15) <= age <= timedelta(hours=METAR_MAX_AGE_HOURS):
                     continue
                 raw = row.get("rawOb") or row.get("raw_text") or row.get("raw") or ""
+                if not self._has_aviation_weather_evidence(row, weather_text=str(raw)):
+                    continue
                 risk = self._aviation_structured_risk(row, weather_text=str(raw))
             else:
                 observed_at = self._first_datetime(
@@ -738,12 +773,18 @@ class ContextProvider:
                 overlapping = [
                     forecast
                     for forecast in forecasts
-                    if isinstance(forecast, dict)
-                    and self._forecast_covers(forecast, departure)
+                    if isinstance(forecast, dict) and self._forecast_covers(forecast, departure)
                 ]
                 if not overlapping:
                     continue
-                risk = max(self._aviation_structured_risk(forecast) for forecast in overlapping)
+                evidence_rows = [
+                    forecast
+                    for forecast in overlapping
+                    if self._has_aviation_weather_evidence(forecast)
+                ]
+                if not evidence_rows:
+                    continue
+                risk = max(self._aviation_structured_risk(forecast) for forecast in evidence_rows)
             candidates.append((risk, observed_at))
         if not candidates:
             return None
@@ -831,10 +872,8 @@ class ContextProvider:
             target = replace(
                 current_snapshot,
                 applicability="target_departure",
-                window_start=departure_utc
-                - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
-                window_end=departure_utc
-                + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+                window_start=departure_utc - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+                window_end=departure_utc + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
             )
             return self._operations_signal_from_snapshot(
                 target,
@@ -876,11 +915,7 @@ class ContextProvider:
                     self._cache_set(self._faa_cache, "global", rows)
 
         airport_row = next(
-            (
-                row
-                for row in rows
-                if self._airport_code(row.get("airportId")) == origin
-            ),
+            (row for row in rows if self._airport_code(row.get("airportId")) == origin),
             None,
         )
         events = self._faa_events(airport_row or {})
@@ -919,15 +954,12 @@ class ContextProvider:
             applicability="current_only",
             metrics=metrics,
             events=active_events,
-            window_start=fetched_at
-            - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
-            window_end=fetched_at
-            + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            window_start=fetched_at - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            window_end=fetched_at + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
         )
 
         near_departure = (
-            abs((departure - fetched_at).total_seconds())
-            <= ADSB_MODEL_MAX_LEAD_MINUTES * 60
+            abs((departure - fetched_at).total_seconds()) <= ADSB_MODEL_MAX_LEAD_MINUTES * 60
         )
         target_events = tuple(
             event
@@ -950,10 +982,8 @@ class ContextProvider:
             value=target_value,
             applicability="target_departure",
             events=target_events,
-            window_start=departure
-            - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
-            window_end=departure
-            + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            window_start=departure - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            window_end=departure + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
             summary_zh=(
                 f"FAA NAS Status 有 {len(target_events)} 个事件适用于目标起飞时刻；"
                 f"运行压力 {target_value:.0%}。"
@@ -1037,14 +1067,11 @@ class ContextProvider:
         delays = [max(0.0, self._number(row.get("dep_delayed"))) for row in rows]
         delayed_count = sum(delay >= 15 for delay in delays)
         cancelled_count = sum(
-            str(row.get("status") or "").strip().lower()
-            in {"cancelled", "canceled"}
+            str(row.get("status") or "").strip().lower() in {"cancelled", "canceled"}
             for row in rows
         )
         disrupted_count = sum(
-            delay >= 15
-            or str(row.get("status") or "").strip().lower()
-            in {"cancelled", "canceled"}
+            delay >= 15 or str(row.get("status") or "").strip().lower() in {"cancelled", "canceled"}
             for row, delay in zip(rows, delays, strict=True)
         )
         sample_size = len(rows)
@@ -1119,9 +1146,7 @@ class ContextProvider:
         airport_type: str,
         fetched_at: datetime,
     ) -> OperationsSnapshot:
-        url = ADSB_LOL_URL.format(
-            latitude=round(latitude, 4), longitude=round(longitude, 4)
-        )
+        url = ADSB_LOL_URL.format(latitude=round(latitude, 4), longitude=round(longitude, 4))
         payload = self._get_json(url, {})
         aircraft = payload.get("ac") if isinstance(payload, dict) else None
         if not isinstance(aircraft, list):
@@ -1135,9 +1160,7 @@ class ContextProvider:
         provider_time = _parse_datetime(payload.get("now"))
         if provider_time is not None:
             age = fetched_at - provider_time
-            if not timedelta(minutes=-2) <= age <= timedelta(
-                minutes=ADSB_MAX_AGE_MINUTES
-            ):
+            if not timedelta(minutes=-2) <= age <= timedelta(minutes=ADSB_MAX_AGE_MINUTES):
                 raise LookupError("ADSB.lol snapshot is stale")
         observed_at = provider_time or fetched_at
         window = timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES)
@@ -1337,8 +1360,10 @@ class ContextProvider:
             observed_at = _parse_datetime(row.get("seendate") or row.get("published_at"))
             if title is None or canonical is None or observed_at is None:
                 continue
-            if not fetched_at - timedelta(days=7, hours=1) <= observed_at <= (
-                fetched_at + timedelta(minutes=15)
+            if (
+                not fetched_at - timedelta(days=7, hours=1)
+                <= observed_at
+                <= (fetched_at + timedelta(minutes=15))
             ):
                 continue
             url_key, clean_url, domain = canonical
@@ -1389,8 +1414,10 @@ class ContextProvider:
             observed_at = self._parse_rss_datetime(item.findtext("pubDate"))
             if title is None or canonical is None or observed_at is None:
                 continue
-            if not fetched_at - timedelta(days=1) <= observed_at <= (
-                fetched_at + timedelta(minutes=15)
+            if (
+                not fetched_at - timedelta(days=1)
+                <= observed_at
+                <= (fetched_at + timedelta(minutes=15))
             ):
                 continue
             score = self._news_text_risk(title)
@@ -1440,17 +1467,14 @@ class ContextProvider:
             selected_domains.add(article.source)
             if len(articles) == 5:
                 break
-        high_risk_domains = {
-            article.source for score, article in candidates if score >= 0.4
-        }
+        high_risk_domains = {article.source for score, article in candidates if score >= 0.4}
         risk = _bounded(
             max((score for score, _ in candidates), default=0)
             + 0.03 * max(0, len(high_risk_domains) - 1)
         )
         if candidates:
             summary_zh = (
-                f"GDELT 近实时收录 {len(candidates)} 条航线中断相关报道；"
-                f"当前新闻风险 {risk:.0%}。"
+                f"GDELT 近实时收录 {len(candidates)} 条航线中断相关报道；当前新闻风险 {risk:.0%}。"
             )
             summary_en = (
                 f"GDELT indexed {len(candidates)} near-real-time route-disruption reports in "
@@ -1494,10 +1518,7 @@ class ContextProvider:
             signal.status,
             signal.source,
             signal.observed_at,
-            (
-                f"{signal.summary_zh.rstrip('。')}；因距起飞较远，"
-                f"模型影响衰减至 {adjusted:.0%}。"
-            ),
+            (f"{signal.summary_zh.rstrip('。')}；因距起飞较远，模型影响衰减至 {adjusted:.0%}。"),
             (
                 f"{signal.summary_en.rstrip('.')} Because departure is farther away, "
                 f"the model effect is attenuated to {adjusted:.0%}."
@@ -1746,6 +1767,38 @@ class ContextProvider:
         return bool(time_from and time_to and time_from <= departure < time_to)
 
     @classmethod
+    def _has_aviation_weather_evidence(
+        cls,
+        row: dict[str, Any],
+        *,
+        weather_text: str = "",
+    ) -> bool:
+        if any(
+            str(value or "").strip()
+            for value in (weather_text, row.get("wxString"), row.get("notDecoded"))
+        ):
+            return True
+        if any(
+            cls._optional_number(row.get(field)) is not None
+            for field in ("wspd", "wgst", "vertVis")
+        ):
+            return True
+        if cls._visibility_meters(row.get("visib")) is not None:
+            return True
+        if str(row.get("fltCat") or "").upper() in {"LIFR", "IFR", "MVFR", "VFR"}:
+            return True
+        clouds = row.get("clouds")
+        return bool(
+            isinstance(clouds, list)
+            and any(
+                isinstance(cloud, dict)
+                and str(cloud.get("cover") or "").upper() in {"FEW", "SCT", "BKN", "OVC", "VV"}
+                and cls._optional_number(cloud.get("base")) is not None
+                for cloud in clouds
+            )
+        )
+
+    @classmethod
     def _aviation_structured_risk(
         cls,
         row: dict[str, Any],
@@ -1881,9 +1934,7 @@ class ContextProvider:
                     reason=reason[:500],
                     start_at=cls._first_datetime(item, "startTime"),
                     end_at=cls._first_datetime(item, "endTime"),
-                    scope=(
-                        str(item.get("includedFlights") or "").strip()[:500] or None
-                    ),
+                    scope=(str(item.get("includedFlights") or "").strip()[:500] or None),
                 )
             )
         return tuple(events)
@@ -1926,19 +1977,13 @@ class ContextProvider:
         if isinstance(config, dict):
             arrival_rate = cls._optional_number(config.get("arrivalRate"))
             if arrival_rate is not None:
-                metrics.append(
-                    OperationsMetric("arrival_rate", arrival_rate, "aircraft_per_hour")
-                )
+                metrics.append(OperationsMetric("arrival_rate", arrival_rate, "aircraft_per_hour"))
             arrival_runways = str(config.get("arrivalRunwayConfig") or "").strip()
             departure_runways = str(config.get("departureRunwayConfig") or "").strip()
             if arrival_runways:
-                metrics.append(
-                    OperationsMetric("arrival_runways", arrival_runways[:100])
-                )
+                metrics.append(OperationsMetric("arrival_runways", arrival_runways[:100]))
             if departure_runways:
-                metrics.append(
-                    OperationsMetric("departure_runways", departure_runways[:100])
-                )
+                metrics.append(OperationsMetric("departure_runways", departure_runways[:100]))
         return tuple(metrics)
 
     @staticmethod
@@ -2000,9 +2045,7 @@ class ContextProvider:
         origin_name: str | None,
         destination_name: str | None,
     ) -> list[str]:
-        values: list[str] = [
-            f"{code} airport" for code in (origin, destination) if code.strip()
-        ]
+        values: list[str] = [f"{code} airport" for code in (origin, destination) if code.strip()]
         values.extend(
             name.strip()
             for name in (origin_name, destination_name)
@@ -2154,42 +2197,60 @@ class ContextProvider:
             normalized,
         )
         groups: tuple[tuple[float, tuple[str, ...]], ...] = (
-            (0.95, (
-                r"\b(?:airspace|airport|runway)\s+(?:closure|closed|shut(?:down)?)\b",
-                r"\bclosed\s+(?:airspace|airport|runway)\b",
-                r"\bvolcanic ash\b",
-                r"\b(?:missile|drone)\s+(?:strike|attack)\b",
-                r"\bairport\s+evacuat(?:ed|ion)\b",
-            )),
-            (0.9, (
-                r"\barmed conflict\b",
-                r"\bwar zone\b",
-                r"\bhostilities\b",
-                r"\b(?:hurricane|typhoon)\b",
-            )),
-            (0.82, (
-                r"\bstrikes?\b",
-                r"\b(?:cyclone|blizzard)\b",
-                r"\bextreme weather\b",
-                r"\bground stop\b",
-                r"\bgrounded\s+flights?\b",
-            )),
-            (0.72, (
-                r"\b(?:wildfire|wildfires|flood|flooding|earthquake|cyberattack)\b",
-                r"\bairspace restriction(?:s)?\b",
-                r"\brunway closure\b",
-            )),
-            (0.58, (
-                r"\bmass cancellations?\b",
-                r"\bflights?\s+(?:are\s+|were\s+)?(?:cancelled|canceled)\b",
-                r"\bflight cancellations?\b",
-            )),
-            (0.42, (
-                r"\bdisrupt(?:ion|ions|ed)\b",
-                r"\bflight delays?\b",
-                r"\bdelayed flights?\b",
-                r"\bcancellations?\b",
-            )),
+            (
+                0.95,
+                (
+                    r"\b(?:airspace|airport|runway)\s+(?:closure|closed|shut(?:down)?)\b",
+                    r"\bclosed\s+(?:airspace|airport|runway)\b",
+                    r"\bvolcanic ash\b",
+                    r"\b(?:missile|drone)\s+(?:strike|attack)\b",
+                    r"\bairport\s+evacuat(?:ed|ion)\b",
+                ),
+            ),
+            (
+                0.9,
+                (
+                    r"\barmed conflict\b",
+                    r"\bwar zone\b",
+                    r"\bhostilities\b",
+                    r"\b(?:hurricane|typhoon)\b",
+                ),
+            ),
+            (
+                0.82,
+                (
+                    r"\bstrikes?\b",
+                    r"\b(?:cyclone|blizzard)\b",
+                    r"\bextreme weather\b",
+                    r"\bground stop\b",
+                    r"\bgrounded\s+flights?\b",
+                ),
+            ),
+            (
+                0.72,
+                (
+                    r"\b(?:wildfire|wildfires|flood|flooding|earthquake|cyberattack)\b",
+                    r"\bairspace restriction(?:s)?\b",
+                    r"\brunway closure\b",
+                ),
+            ),
+            (
+                0.58,
+                (
+                    r"\bmass cancellations?\b",
+                    r"\bflights?\s+(?:are\s+|were\s+)?(?:cancelled|canceled)\b",
+                    r"\bflight cancellations?\b",
+                ),
+            ),
+            (
+                0.42,
+                (
+                    r"\bdisrupt(?:ion|ions|ed)\b",
+                    r"\bflight delays?\b",
+                    r"\bdelayed flights?\b",
+                    r"\bcancellations?\b",
+                ),
+            ),
         )
         return max(
             (

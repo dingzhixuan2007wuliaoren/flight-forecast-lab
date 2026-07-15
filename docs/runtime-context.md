@@ -8,14 +8,15 @@ substituted for a live bookable fare.
 
 | Signal | Preferred source | Fallback | Meaning in the response |
 | --- | --- | --- | --- |
-| Weather | Open-Meteo current/forecast plus NOAA METAR/TAF | Clearly labelled synthetic month/latitude prior | `live`, `forecast`, or `proxy` |
+| Weather | Open-Meteo current/forecast plus NOAA METAR/TAF | Clearly labelled synthetic month/latitude prior for display only; the on-time prediction switches to the weather-free model | `live`, `forecast`, or `proxy`; `weather_feature_status` says `used` or `ignored` |
 | Airport operations | FAA NAS Status for authoritative current US events; optional AirLabs schedule samples elsewhere | ADSB.lol current aircraft-density proxy, plus a clearly labelled training/synthetic target-time prior | `live` or `proxy` |
 | Disruption news | No-key GDELT DOC 2.0 articles from the recent seven-day window, ordered `DateDesc`; official GAL rolling RSS if DOC fails | Route cache no older than six hours with reduced influence, otherwise a neutral value with no articles | `live`, `historical`, or `neutral` |
 | Strict flight comparison | SerpApi Google Flights search followed by a `booking_token` booking-options request | Structured empty `offers`; AirLabs schedules/routes may appear only in `timetable_references` | `strict_bookable_only`; retained rows use `bookability_status=booking_option_verified` |
 
 The service catches provider timeouts, malformed payloads, quota exhaustion, and empty results.
 Context signals may return a labelled fallback rather than fail the whole prediction; strict fare
-search instead returns labelled empty `offers` and never substitutes an unpriced row. Set
+search returns the strictly verified subset allowed by the free quota and provider response, or
+labelled empty `offers`, and never substitutes an unpriced row. Set
 `EXTERNAL_CONTEXT_ENABLED=0` for deterministic offline context development.
 
 Strict comparison needs a SerpApi key. SerpApi Free currently includes 250 successful searches per
@@ -38,11 +39,11 @@ credentials in source code, commits, browser/frontend data, or application logs.
 requires the server to include the key in the HTTPS query sent to `https://serpapi.com`, so complete
 outbound provider URLs must not be logged.
 `SERPAPI_MONTHLY_LIMIT` defaults to 250 when omitted. Values above 250 are clamped to 250, and an
-invalid or non-positive value does not disable the safety ceiling. One comparison uses at most four
-cabin searches and six booking-token candidate validations, so it reserves at most 10 provider
-requests. At most six candidates are selected with airline diversity first and price filling the
-remaining slots; this is not a complete list of airlines or flights. The worst-case 10-request path
-allows about five fresh full comparisons per hour before accounting for any other requests.
+invalid or non-positive value does not disable the safety ceiling. One comparison performs the four
+SerpApi cabin searches and then processes every eligible `booking_token` candidate those searches
+actually return. The number of booking-option validation calls therefore varies with the response
+and remaining hourly/monthly free allowance. Results are bounded by SerpApi coverage, provider
+responses, and the configured free quota; they are not a complete global list of airlines or flights.
 The AirLabs key remains optional and is used for airport-operations samples and timetable
 references, not to make strict offers. Missing credentials or exhausted quota are supported modes:
 context signals may still use labelled model/proxy fallbacks, while strict flight comparison
@@ -57,6 +58,17 @@ can now serve as the independent `live` fallback. NOAA responses are cached for 
 stay below the provider's per-thread frequency guidance. TAF risk is calculated only from decoded
 forecast segments that cover the requested departure time; METAR risk also reads structured wind,
 gust, visibility, flight category, and ceiling fields rather than relying on weather keywords alone.
+
+The price model never uses weather. The on-time prediction uses the weather-aware model only when
+the target-departure weather context is `live` or `forecast`; for a `proxy`, missing, or unusable
+weather signal it switches to the weather-free model and returns
+`weather_feature_status=ignored`. The dashboard and offer detail page then state that weather was
+omitted from this on-time prediction.
+
+Date-only comparison resolves weather at the documented origin-local reference time. A returned
+offer is allowed to use that weather only when its actual departure is within two hours of the
+reference. More distant flights use the weather-free model and expose
+`offers[].weather_feature_status=ignored`, avoiding a noon forecast being applied across the day.
 
 ## Airport operations: current snapshot versus target signal
 
@@ -109,18 +121,19 @@ future-departure validation. AirLabs rows may show those fields only inside the 
 reference list.
 
 Strict mode uses an evidence chain, not a schedule projection. It searches Google Flights for each
-of the four requested travel classes with `deep_search=true` and `show_hidden=true`, then keeps only
-bounded candidates that contain a `booking_token`. These flags broaden visible results but do not
-guarantee all airlines, flights, cabins, sellers, or private fares. At most six candidates are chosen,
-preferring distinct airlines before lower-priced remaining candidates. Each retained candidate is
-followed by a booking-options request, for at most 10 provider requests per comparison. Only a response
+of the four requested travel classes with `deep_search=true` and `show_hidden=true`, then processes
+every eligible candidate in the returned response that contains a `booking_token`, subject to the
+remaining free quota and provider availability. These flags broaden visible results but do not
+guarantee all airlines, flights, cabins, sellers, or private fares. Each attempted candidate is
+followed by a booking-options request. Only a response
 whose `selected_flights` exactly matches the original segment sequence and contains a seller,
 matching flight numbers, positive one-way USD price, and HTTPS `booking_request.url` can enter
 `offers`. The itinerary must also remain continuous, use one provider-confirmed cabin throughout,
 contain real flight numbers and complete local/UTC times, and have one to four segments (zero to
 three stops). Its `live_fare` is independent of `estimated_price_usd` and its 80% model interval.
 The free response does not reliably establish whether taxes are included, so `taxes_included` is
-unknown rather than asserted true.
+unknown rather than asserted true. If several verified sellers describe the same itinerary and
+cabin, only the lowest-price seller is retained.
 
 If a Search API response is `Processing` or `Queued`, the adapter validates the opaque Search ID
 against an allowlist and polls only the fixed `https://serpapi.com/searches/{search_id}.json`
@@ -139,10 +152,20 @@ SerpApi currently says cached, errored, and failed searches do not count against
 the local ledger still reserves them and can stop early to guarantee the free ceiling. Review SerpApi
 account usage independently because provider quota rules
 and plan terms can change. Missing configuration, exhausted local budget, authentication failure,
-rate limiting, provider failure, no matching offers, an absent
-`booking_token`, an itinerary mismatch, or a missing usable booking option is represented by
-explicit `fare_search_metadata.status` and `result_status` values with empty `offers`; none enables
-a model or timetable fallback.
+rate limiting, provider failure, no matching offers, an absent `booking_token`, an itinerary
+mismatch, or a missing usable booking option is represented by explicit
+`fare_search_metadata.status` and `result_status` values; none enables a model or timetable
+fallback. `fare_search_metadata` also exposes `coverage_scope`,
+`eligible_candidate_count`, `verification_attempted_count`, `verified_candidate_count`,
+`strictly_rejected_candidate_count`, `provider_failed_candidate_count`,
+`quota_skipped_candidate_count`, `deduplicated_verified_count`, `coverage_status`, and
+`quota_limit`. `coverage_status` is `complete`, `quota_limited`, `provider_incomplete`,
+`quota_and_provider_incomplete`, or `not_evaluated`; `quota_limit` identifies the hourly or monthly
+ceiling when quota truncated validation. A response may therefore contain a useful partial set of
+strictly verified offers while clearly reporting which eligible candidates were not verified.
+On a five-minute strict-cache hit, per-response call counts are zero while the candidate coverage
+counts describe the original search; `cache_hit=true` and the bilingual notice make that distinction
+explicit.
 
 Provider diagnostics are deliberately data-minimized. The response contains at most ten records,
 and the ignored runtime SQLite database retains at most 500 across restarts. A record contains only
@@ -241,8 +264,10 @@ This is deliberately conservative:
 Every strict comparison offer links to `GET /details/offer`. The page calls
 `POST /v1/offer-detail` with the route, `departure_date`, opaque `offer_id`, and `force_refresh`.
 Initial load sends `force_refresh=false` and reuses the five-minute strict cache. Only the explicit
-Refresh and re-query button sends `force_refresh=true`, which reruns at most four cabin searches plus
-six `booking_token` validations. The frontend timeout is 90 seconds. Its response repeats the selected
+Refresh and re-query button sends `force_refresh=true`, which reruns the four cabin searches and
+attempts every eligible returned candidate allowed by the remaining free quota and provider
+response. The frontend timeout is 360 seconds so bounded batches of free-quota candidate
+validation can finish. Its response repeats the selected
 Google Flights offer and returns the complete one-to-four segment itinerary, including flight numbers,
 local/UTC times, confirmed cabin, booking/fare fields when supplied, and provider-confirmed layovers. AirLabs
 timetable and model-only rows have no offer
@@ -280,6 +305,11 @@ replace an official aviation-weather briefing. Open-Meteo and aviation responses
 for 10 minutes; a successful weather payload up to six hours old may be displayed as a clearly
 labelled stale cache if refresh fails. The page has manual refresh and auto-refreshes every 10
 minutes.
+
+This weather detail is explanatory context. It is never an input to the price model, and it enters
+the on-time prediction only when the comparison's departure weather is usable as `live` or
+`forecast`. When `weather_feature_status=ignored`, the dashboard and offer detail page display the
+bilingual notice that weather was omitted from this on-time prediction.
 
 The news page calls `POST /v1/context/news-detail`. It shows the recent-seven-day article scoring
 described above, a detail-page route raw-risk score, departure attenuation, and the exact main-context

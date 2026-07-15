@@ -130,9 +130,7 @@ def test_service_serializes_target_operations_and_current_snapshot() -> None:
     assert payload["operations"]["current_snapshot"]["metrics"] == [
         {"key": "average_delay_minutes", "value": 42.0, "unit": "minutes"}
     ]
-    assert payload["operations"]["current_snapshot"]["events"][0]["event_type"] == (
-        "ground_delay"
-    )
+    assert payload["operations"]["current_snapshot"]["events"][0]["event_type"] == ("ground_delay")
 
 
 def test_context_cache_keeps_distinct_departure_minutes(monkeypatch) -> None:
@@ -221,9 +219,7 @@ def test_live_weather_proxy_operations_and_news_scoring() -> None:
         }
     )
 
-    context = ContextProvider(client=client).resolve(
-        "JFK", "LAX", departure, 40.6413, -73.7781
-    )
+    context = ContextProvider(client=client).resolve("JFK", "LAX", departure, 40.6413, -73.7781)
 
     assert context.weather.status == "forecast"
     assert context.weather.source == "open_meteo_forecast"
@@ -244,11 +240,7 @@ def test_live_weather_proxy_operations_and_news_scoring() -> None:
     gdelt_call = next(call for call in client.calls if call[0] == GDELT_DOC_URL)
     assert gdelt_call[1]["sort"] == "DateDesc"
     assert gdelt_call[2] == GDELT_REQUEST_TIMEOUT_SECONDS
-    assert all(
-        timeout == 3.0
-        for url, _, timeout in client.calls
-        if url != GDELT_DOC_URL
-    )
+    assert all(timeout == 3.0 for url, _, timeout in client.calls if url != GDELT_DOC_URL)
 
 
 def test_news_cache_is_route_scoped_across_departure_dates_and_attenuates_far_news() -> None:
@@ -339,9 +331,7 @@ def test_gdelt_recency_decay_reduces_older_article_risk() -> None:
 def test_gdelt_filters_invalid_dates_and_urls_and_deduplicates_tracking_variants() -> None:
     now = datetime.now(UTC).replace(second=0, microsecond=0)
     provider = ContextProvider()
-    canonical_a = provider._canonical_news_url(
-        "https://Example.test/story?utm_source=feed#section"
-    )
+    canonical_a = provider._canonical_news_url("https://Example.test/story?utm_source=feed#section")
     canonical_b = provider._canonical_news_url(
         "https://example.test/story?utm_medium=email&fbclid=123"
     )
@@ -397,9 +387,7 @@ def test_gdelt_filters_invalid_dates_and_urls_and_deduplicates_tracking_variants
         now,
     )
 
-    assert [article.url for article in signal.articles] == [
-        "https://example.test/story"
-    ]
+    assert [article.url for article in signal.articles] == ["https://example.test/story"]
 
 
 def test_news_text_risk_does_not_treat_strike_a_deal_as_labor_action() -> None:
@@ -442,9 +430,7 @@ def test_gdelt_doc_failure_uses_free_gal_rss_fallback() -> None:
 
     assert signal.source == "gdelt_gal_rss"
     assert signal.value == pytest.approx(0.95)
-    assert [article.url for article in signal.articles] == [
-        "https://rss-news.test/jfk-closure"
-    ]
+    assert [article.url for article in signal.articles] == ["https://rss-news.test/jfk-closure"]
     assert [(url, timeout) for url, _, timeout in client.calls] == [
         (GDELT_DOC_URL, GDELT_REQUEST_TIMEOUT_SECONDS),
         (GDELT_GAL_RSS_URL, GDELT_RSS_REQUEST_TIMEOUT_SECONDS),
@@ -477,9 +463,7 @@ def test_rss_route_matching_does_not_treat_lowercase_iata_word_as_airport_code()
         destination_name=None,
     )
 
-    assert [article.url for article in signal.articles] == [
-        "https://rss-news.test/uppercase-can"
-    ]
+    assert [article.url for article in signal.articles] == ["https://rss-news.test/uppercase-can"]
 
 
 def test_route_name_matching_rejects_single_generic_person_name_token() -> None:
@@ -626,9 +610,7 @@ def test_airlabs_schedules_and_route_airline_cache() -> None:
     assert context.operations.sample_size == 3
     assert context.operations.sample_limit == AIRLABS_FREE_SAMPLE_LIMIT
     assert context.operations.sample_truncated is True
-    operation_metrics = {
-        metric.key: metric.value for metric in context.operations.metrics
-    }
+    operation_metrics = {metric.key: metric.value for metric in context.operations.metrics}
     assert operation_metrics["delayed_departures"] == 1
     assert operation_metrics["cancelled_departures"] == 1
     assert operation_metrics["mean_departure_delay"] == pytest.approx(6.67)
@@ -636,9 +618,7 @@ def test_airlabs_schedules_and_route_airline_cache() -> None:
     assert second_airlines == first_airlines
     assert sum(url == AIRLABS_ROUTES_URL for url, _, _ in client.calls) == 1
     assert not any(url.startswith("https://api.adsb.lol") for url, _, _ in client.calls)
-    schedules_call = next(
-        params for url, params, _ in client.calls if url == AIRLABS_SCHEDULES_URL
-    )
+    schedules_call = next(params for url, params, _ in client.calls if url == AIRLABS_SCHEDULES_URL)
     assert schedules_call["limit"] == AIRLABS_FREE_SAMPLE_LIMIT
 
 
@@ -693,13 +673,8 @@ def test_faa_scoped_free_form_restriction_is_not_a_full_airport_closure() -> Non
     assert jfk.events == ()
     assert jfk.current_snapshot is not None
     assert jfk.current_snapshot.value == pytest.approx(0.08)
-    assert [event.event_type for event in jfk.current_snapshot.events] == [
-        "restriction"
-    ]
-    assert all(
-        event.event_type != "airport_closure"
-        for event in jfk.current_snapshot.events
-    )
+    assert [event.event_type for event in jfk.current_snapshot.events] == ["restriction"]
+    assert all(event.event_type != "airport_closure" for event in jfk.current_snapshot.events)
     assert lax.current_snapshot is not None
     assert lax.current_snapshot.value == 0
     assert sum(url == FAA_NAS_STATUS_URL for url, _, _ in client.calls) == 1
@@ -777,9 +752,7 @@ def test_far_open_ended_faa_event_does_not_override_target_prior() -> None:
     assert operations.source == "synthetic_model_prior"
     assert operations.applicability == "target_departure_prior"
     assert operations.current_snapshot is not None
-    assert [event.event_type for event in operations.current_snapshot.events] == [
-        "ground_stop"
-    ]
+    assert [event.event_type for event in operations.current_snapshot.events] == ["ground_stop"]
 
 
 def test_adsb_density_is_displayed_but_not_used_beyond_ninety_minutes() -> None:
@@ -829,10 +802,7 @@ def test_stale_adsb_snapshot_is_not_used_as_current_or_target_signal() -> None:
     client = FakeClient(
         {
             adsb_url: {
-                "now": int(
-                    (now - timedelta(minutes=ADSB_MAX_AGE_MINUTES + 1)).timestamp()
-                    * 1000
-                ),
+                "now": int((now - timedelta(minutes=ADSB_MAX_AGE_MINUTES + 1)).timestamp() * 1000),
                 "ac": [{"hex": str(index)} for index in range(100)],
             }
         }
@@ -1013,6 +983,81 @@ def test_incomplete_current_conditions_fall_back_to_departure_forecast() -> None
     assert weather.source == "open_meteo_forecast"
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("weather_code", "__missing__"),
+        ("wind_speed_10m", "not-a-number"),
+        ("wind_gusts_10m", float("nan")),
+        ("precipitation_probability", float("inf")),
+        ("visibility", float("-inf")),
+    ],
+    ids=("missing", "non-numeric", "nan", "positive-infinity", "negative-infinity"),
+)
+def test_invalid_open_meteo_forecast_risk_fields_fall_back_to_proxy(
+    field: str,
+    invalid_value: Any,
+) -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=12)
+    payload = _open_meteo_payload(departure)
+    hourly = payload["hourly"]
+    if invalid_value == "__missing__":
+        hourly.pop(field)
+    else:
+        hourly[field] = [invalid_value]
+    client = FakeClient({OPEN_METEO_URL: payload})
+
+    weather = ContextProvider(client=client)._weather(
+        departure,
+        40.6413,
+        -73.7781,
+        None,
+        now,
+    )
+
+    assert weather.status == "proxy"
+    assert weather.source == "synthetic_model_prior"
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("weather_code", "__missing__"),
+        ("wind_speed_10m", "not-a-number"),
+        ("wind_gusts_10m", float("nan")),
+        ("precipitation", float("inf")),
+        ("visibility", float("-inf")),
+    ],
+    ids=("missing", "non-numeric", "nan", "positive-infinity", "negative-infinity"),
+)
+def test_invalid_open_meteo_current_risk_fields_fall_back_to_proxy(
+    field: str,
+    invalid_value: Any,
+) -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    payload = _open_meteo_payload(departure, current_time=now)
+    payload.pop("hourly")
+    current = payload["current"]
+    if invalid_value == "__missing__":
+        current.pop(field)
+    else:
+        current[field] = invalid_value
+    client = FakeClient({OPEN_METEO_URL: payload})
+
+    weather = ContextProvider(client=client)._weather(
+        departure,
+        40.6413,
+        -73.7781,
+        None,
+        now,
+    )
+
+    assert weather.status == "proxy"
+    assert weather.source == "synthetic_model_prior"
+
+
 def test_fresh_noaa_metar_is_used_when_open_meteo_is_unavailable() -> None:
     now = datetime.now(UTC).replace(second=0, microsecond=0)
     departure = now + timedelta(hours=1)
@@ -1040,6 +1085,41 @@ def test_fresh_noaa_metar_is_used_when_open_meteo_is_unavailable() -> None:
     assert weather.status == "live"
     assert weather.source == "noaa_metar"
     assert weather.value == pytest.approx(0.95)
+
+
+def test_empty_noaa_weather_evidence_falls_back_to_proxy() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(hours=1)
+    client = FakeClient(
+        {
+            OPEN_METEO_URL: TimeoutError("Open-Meteo unavailable"),
+            NOAA_TAF_URL: [
+                {
+                    "issueTime": now.isoformat(),
+                    "validTimeFrom": int((now - timedelta(hours=1)).timestamp()),
+                    "validTimeTo": int((now + timedelta(hours=8)).timestamp()),
+                    "fcsts": [
+                        {
+                            "timeFrom": int((now - timedelta(hours=1)).timestamp()),
+                            "timeTo": int((now + timedelta(hours=2)).timestamp()),
+                        }
+                    ],
+                }
+            ],
+            NOAA_METAR_URL: [{"obsTime": int(now.timestamp())}],
+        }
+    )
+
+    weather = ContextProvider(client=client)._weather(
+        departure,
+        40.6413,
+        -73.7781,
+        "KJFK",
+        now,
+    )
+
+    assert weather.status == "proxy"
+    assert weather.source == "synthetic_model_prior"
 
 
 def test_metar_structured_wind_visibility_and_ceiling_raise_risk() -> None:

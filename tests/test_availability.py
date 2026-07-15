@@ -308,15 +308,25 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
         "business",
         "first",
     }
-    assert result.calls_used == 10
+    assert result.calls_used == 12
     assert result.search_calls_used == 4
-    assert result.pricing_calls_used == 6
+    assert result.pricing_calls_used == 8
     assert result.search_monthly_limit == 250
     assert result.pricing_monthly_limit is None
-    assert result.search_monthly_used == 10
+    assert result.search_monthly_used == 12
     assert len(client.account_calls) == 1
     assert len(client.search_calls) == 4
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
+    assert result.coverage_scope == "provider_returned_booking_token_candidates"
+    assert result.eligible_candidate_count == 8
+    assert result.verification_attempted_count == 8
+    assert result.verified_candidate_count == 4
+    assert result.strictly_rejected_candidate_count == 4
+    assert result.provider_failed_candidate_count == 0
+    assert result.quota_skipped_candidate_count == 0
+    assert result.deduplicated_verified_count == 0
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
     assert client.account_calls[0]["timeout"] == 8.0
     for call in client.search_calls:
         assert call["params"]["type"] == 2
@@ -366,15 +376,187 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
         offer.fingerprint
     )
 
-    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 10
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 12
     assert (
         _ledger_calls(
             tmp_path / "private" / "usage.sqlite3",
             scope="hour",
             period_key=_HOUR_BUCKET_KEY,
         )
-        == 10
+        == 12
     )
+
+
+def test_all_returned_candidates_and_booking_options_are_examined(
+    tmp_path: Path,
+) -> None:
+    class _LargeResultClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            params = kwargs.get("params", {})
+            token = str(params.get("booking_token", ""))
+            if url == SERPAPI_SEARCH_URL and token.startswith("bulk-token-"):
+                with self._lock:
+                    self.booking_calls.append(kwargs)
+                payload = _booking_payload(1)
+                options: list[dict[str, Any]] = []
+                for index in range(41):
+                    option = json.loads(json.dumps(payload["booking_options"][0]))
+                    option["together"]["book_with"] = f"Seller {index + 1}"
+                    option["together"]["price"] = 500 + index
+                    options.append(option)
+                options[40]["together"]["price"] = 199
+                payload["booking_options"] = options
+                return _Response(payload)
+
+            response = super().get(url, **kwargs)
+            if url == SERPAPI_SEARCH_URL and "booking_token" not in params:
+                travel_class = int(params["travel_class"])
+                if travel_class == 1:
+                    response.payload["best_flights"] = []
+                    response.payload["other_flights"] = [
+                        {
+                            "flights": [_flight("Economy")],
+                            "price": 300 + index,
+                            "type": "One way",
+                            "booking_token": f"bulk-token-{index:02d}",
+                        }
+                        for index in range(41)
+                    ]
+                else:
+                    response.payload["best_flights"] = []
+                    response.payload["other_flights"] = []
+                response.content = json.dumps(response.payload).encode("utf-8")
+            return response
+
+    client = _LargeResultClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert len(client.booking_calls) == 41
+    assert result.calls_used == 45
+    assert result.eligible_candidate_count == 41
+    assert result.verification_attempted_count == 41
+    assert result.verified_candidate_count == 41
+    assert result.strictly_rejected_candidate_count == 0
+    assert result.provider_failed_candidate_count == 0
+    assert result.quota_skipped_candidate_count == 0
+    assert result.deduplicated_verified_count == 40
+    assert result.coverage_status == "complete"
+    assert len(result.offers) == 1
+    assert result.offers[0].total_amount_usd == 199
+    assert result.offers[0].booking_provider == "Seller 41"
+
+
+def test_duplicate_tokens_are_called_once_and_conflicting_tokens_are_excluded(
+    tmp_path: Path,
+) -> None:
+    class _DuplicateTokenClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            params = kwargs.get("params", {})
+            if url == SERPAPI_SEARCH_URL and "booking_token" not in params:
+                travel_class = int(params["travel_class"])
+                response.payload["best_flights"] = []
+                response.payload["other_flights"] = []
+                if travel_class == 1:
+                    response.payload["best_flights"] = [
+                        {
+                            "flights": [_flight("Economy")],
+                            "price": 400,
+                            "type": "One way",
+                            "booking_token": "booking-token-1",
+                        },
+                        {
+                            "flights": [_flight("Economy")],
+                            "price": 350,
+                            "type": "One way",
+                            "booking_token": "booking-token-1-conflict",
+                        },
+                    ]
+                    response.payload["other_flights"] = [
+                        {
+                            "flights": [_flight("Economy")],
+                            "price": 300,
+                            "type": "One way",
+                            "booking_token": "booking-token-1",
+                        },
+                        {
+                            "flights": [_flight("Economy", suffix=1)],
+                            "price": 360,
+                            "type": "One way",
+                            "booking_token": "booking-token-1-conflict",
+                        },
+                    ]
+                response.content = json.dumps(response.payload).encode("utf-8")
+            return response
+
+    client = _DuplicateTokenClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    tokens = [call["params"]["booking_token"] for call in client.booking_calls]
+    assert tokens == ["booking-token-1"]
+    assert result.eligible_candidate_count == 1
+    assert result.verification_attempted_count == 1
+    assert result.verified_candidate_count == 1
+    assert result.coverage_status == "complete"
+
+
+def test_same_flight_across_tokens_keeps_lowest_verified_seller_price(
+    tmp_path: Path,
+) -> None:
+    prices = {
+        "booking-token-1-seller-a": (500, "Seller A", "Basic"),
+        "booking-token-1-seller-b": (420, "Seller B", "Standard"),
+        "booking-token-1-seller-c": (450, "Seller C", "Flex"),
+    }
+
+    class _MultiSellerClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            params = kwargs.get("params", {})
+            token = str(params.get("booking_token", ""))
+            if url == SERPAPI_SEARCH_URL and token in prices:
+                amount, seller, brand = prices[token]
+                together = response.payload["booking_options"][0]["together"]
+                together["price"] = amount
+                together["book_with"] = seller
+                together["option_title"] = brand
+                response.content = json.dumps(response.payload).encode("utf-8")
+            elif url == SERPAPI_SEARCH_URL and "booking_token" not in params:
+                travel_class = int(params["travel_class"])
+                response.payload["best_flights"] = []
+                response.payload["other_flights"] = []
+                if travel_class == 1:
+                    response.payload["best_flights"] = [
+                        {
+                            "flights": [_flight("Economy")],
+                            "price": amount,
+                            "type": "One way",
+                            "booking_token": token,
+                        }
+                        for token, (amount, _seller, _brand) in prices.items()
+                    ]
+                response.content = json.dumps(response.payload).encode("utf-8")
+            return response
+
+    client = _MultiSellerClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert len(client.booking_calls) == 3
+    assert result.verified_candidate_count == 3
+    assert result.deduplicated_verified_count == 2
+    assert len(result.offers) == 1
+    assert result.offers[0].total_amount_usd == 420
+    assert result.offers[0].booking_provider == "Seller B"
+    assert result.offers[0].segments[0].fare_brand == "Standard"
 
 
 def test_booking_endpoint_bad_request_remains_a_provider_error(tmp_path: Path) -> None:
@@ -392,7 +574,11 @@ def test_booking_endpoint_bad_request_remains_a_provider_error(tmp_path: Path) -
 
     assert result.status == "provider_error"
     assert result.offers == ()
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
+    assert result.eligible_candidate_count == 8
+    assert result.verification_attempted_count == 8
+    assert result.provider_failed_candidate_count == 8
+    assert result.coverage_status == "provider_incomplete"
     assert any(
         diagnostic.stage == "booking_options"
         and diagnostic.http_status == 400
@@ -442,20 +628,19 @@ def test_processing_cabin_search_polls_archive_without_resubmitting_or_using_quo
     )
 
     assert result.status == "confirmed_offers"
-    assert result.calls_used == 10
+    assert result.calls_used == 12
     assert result.archive_poll_count == 1
     assert len(client.search_calls) == 4
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
     assert len(client.archive_calls) == 1
     assert client.archive_calls[0]["params"] == {"api_key": "serpapi-key"}
     assert client.archive_calls[0]["timeout"] == 2.0
     assert any(
-        diagnostic.exception_type == "ProviderPending"
-        and diagnostic.search_id == search_id
+        diagnostic.exception_type == "ProviderPending" and diagnostic.search_id == search_id
         for diagnostic in result.diagnostics
     )
     ledger_path = tmp_path / "private" / "usage.sqlite3"
-    assert _ledger_calls(ledger_path) == 10
+    assert _ledger_calls(ledger_path) == 12
     rows = _diagnostic_rows(ledger_path)
     assert ("cabin_search", 200, "ProviderPending", search_id) in rows
     persisted = json.dumps(rows)
@@ -516,10 +701,10 @@ def test_queued_booking_option_polls_until_success_without_new_search(
     ).search("YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT)
 
     assert result.status == "confirmed_offers"
-    assert result.calls_used == 10
+    assert result.calls_used == 12
     assert result.archive_poll_count == 2
     assert len(client.search_calls) == 4
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
     assert client.archive_calls == 2
 
 
@@ -578,8 +763,7 @@ def test_processing_timeout_is_distinct_and_never_restarts_four_cabin_searches(
     assert client.archive_calls == 3
     assert client.booking_calls == []
     assert any(
-        diagnostic.exception_type == "ProviderProcessingError"
-        and diagnostic.search_id == search_id
+        diagnostic.exception_type == "ProviderProcessingError" and diagnostic.search_id == search_id
         for diagnostic in result.diagnostics
     )
 
@@ -624,8 +808,7 @@ def test_pending_search_id_must_pass_allowlist_before_archive_poll(
     assert client.unexpected_urls == []
     assert result.archive_poll_count == 0
     assert any(
-        diagnostic.exception_type == "PayloadError"
-        and diagnostic.search_id is None
+        diagnostic.exception_type == "PayloadError" and diagnostic.search_id is None
         for diagnostic in result.diagnostics
     )
 
@@ -665,13 +848,10 @@ def test_terminal_provider_error_is_not_reported_as_no_verified_offer(
     assert len(client.search_calls) == 4
     assert client.booking_calls == []
     assert any(
-        diagnostic.exception_type == "ProviderSearchError"
-        and diagnostic.search_id == search_id
+        diagnostic.exception_type == "ProviderSearchError" and diagnostic.search_id == search_id
         for diagnostic in result.diagnostics
     )
-    persisted = json.dumps(
-        _diagnostic_rows(tmp_path / "private" / "usage.sqlite3")
-    )
+    persisted = json.dumps(_diagnostic_rows(tmp_path / "private" / "usage.sqlite3"))
     assert "deliberately not persisted" not in persisted
 
 
@@ -688,6 +868,11 @@ def test_candidate_requires_booking_token_and_booking_response_requires_evidence
     )
     assert result.status == "no_results"
     assert result.offers == ()
+    assert result.eligible_candidate_count == 8
+    assert result.verification_attempted_count == 8
+    assert result.verified_candidate_count == 0
+    assert result.strictly_rejected_candidate_count == 8
+    assert result.coverage_status == "complete"
 
     class _NoTokenClient(_Client):
         def get(self, url: str, **kwargs: Any) -> _Response:
@@ -709,6 +894,9 @@ def test_candidate_requires_booking_token_and_booking_response_requires_evidence
     assert no_token_result.status == "no_results"
     assert no_token_result.offers == ()
     assert no_token.booking_calls == []
+    assert no_token_result.eligible_candidate_count == 0
+    assert no_token_result.verification_attempted_count == 0
+    assert no_token_result.coverage_status == "complete"
 
 
 def test_non_google_booking_evidence_is_rejected(tmp_path: Path) -> None:
@@ -716,9 +904,9 @@ def test_non_google_booking_evidence_is_rejected(tmp_path: Path) -> None:
         def get(self, url: str, **kwargs: Any) -> _Response:
             response = super().get(url, **kwargs)
             if url == SERPAPI_SEARCH_URL and "booking_token" in kwargs["params"]:
-                response.payload["booking_options"][0]["together"]["booking_request"][
-                    "url"
-                ] = "https://example.test/travel/clk/f"
+                response.payload["booking_options"][0]["together"]["booking_request"]["url"] = (
+                    "https://example.test/travel/clk/f"
+                )
                 response.content = json.dumps(response.payload).encode("utf-8")
             return response
 
@@ -795,10 +983,7 @@ def test_post_booking_action_falls_back_to_initial_search_results_url(
         offer.booking_url == "https://www.google.com/travel/flights?selected=1"
         for offer in result.offers
     )
-    assert all(
-        offer.booking_url_kind == "google_flights_itinerary"
-        for offer in result.offers
-    )
+    assert all(offer.booking_url_kind == "google_flights_itinerary" for offer in result.offers)
 
 
 @pytest.mark.parametrize("invalid", ["wrong_time", "wrong_cabin", "wrong_marketed_as"])
@@ -891,18 +1076,14 @@ def test_billing_cycle_uses_provider_renewal_date_not_calendar_month(
     first = _provider(tmp_path, _Client(plan_renewal_date="2026-08-01"))
     second = _provider(tmp_path, _Client(plan_renewal_date="2026-09-01"))
 
-    first_result = first.search(
-        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
-    )
-    second_result = second.search(
-        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
-    )
+    first_result = first.search("YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT)
+    second_result = second.search("YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT)
 
     assert first_result.status == "confirmed_offers"
     assert second_result.status == "confirmed_offers"
     ledger_path = tmp_path / "private" / "usage.sqlite3"
-    assert _ledger_calls(ledger_path, period_key="renewal:2026-08-01") == 10
-    assert _ledger_calls(ledger_path, period_key="renewal:2026-09-01") == 10
+    assert _ledger_calls(ledger_path, period_key="renewal:2026-08-01") == 12
+    assert _ledger_calls(ledger_path, period_key="renewal:2026-09-01") == 12
     with sqlite3.connect(ledger_path) as connection:
         natural_month = connection.execute(
             """
@@ -951,6 +1132,14 @@ def test_booking_verification_uses_only_remaining_hourly_capacity(
     assert len(client.search_calls) == 4
     assert len(client.booking_calls) == 1
     assert len(result.offers) == 1
+    assert result.eligible_candidate_count == 8
+    assert result.verification_attempted_count == 1
+    assert result.verified_candidate_count == 1
+    assert result.strictly_rejected_candidate_count == 0
+    assert result.provider_failed_candidate_count == 0
+    assert result.quota_skipped_candidate_count == 7
+    assert result.coverage_status == "quota_limited"
+    assert result.quota_limit == "hourly"
     ledger_path = tmp_path / "private" / "usage.sqlite3"
     assert _ledger_calls(ledger_path) == 5
     assert (
@@ -963,6 +1152,39 @@ def test_booking_verification_uses_only_remaining_hourly_capacity(
     )
 
 
+def test_quota_and_provider_failure_are_both_reported_with_verified_subset(
+    tmp_path: Path,
+) -> None:
+    class _PartialFailureClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            if (
+                url == SERPAPI_SEARCH_URL
+                and kwargs["params"].get("booking_token") == "booking-token-2"
+            ):
+                return _Response({"error": "booking provider unavailable"}, 503)
+            return response
+
+    client = _PartialFailureClient(hourly_usage=44, hourly_limit=100)
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert len(client.booking_calls) == 2
+    assert len(result.offers) == 1
+    assert result.offers[0].booking_verified is True
+    assert result.eligible_candidate_count == 8
+    assert result.verification_attempted_count == 2
+    assert result.verified_candidate_count == 1
+    assert result.strictly_rejected_candidate_count == 0
+    assert result.provider_failed_candidate_count == 1
+    assert result.quota_skipped_candidate_count == 6
+    assert result.deduplicated_verified_count == 0
+    assert result.coverage_status == "quota_and_provider_incomplete"
+    assert result.quota_limit == "hourly"
+
+
 def test_two_provider_instances_share_sqlite_limit_without_overwrite(
     tmp_path: Path,
 ) -> None:
@@ -971,9 +1193,7 @@ def test_two_provider_instances_share_sqlite_limit_without_overwrite(
     first_provider = _provider(tmp_path, first_client, monthly_limit=10)
     second_provider = _provider(tmp_path, second_client, monthly_limit=10)
     observed = _FETCHED_AT
-    first = first_provider.search(
-        "YYZ", "LHR", date(2026, 8, 20), fetched_at=observed
-    )
+    first = first_provider.search("YYZ", "LHR", date(2026, 8, 20), fetched_at=observed)
     second = second_provider.search(
         "YYZ",
         "CDG",
@@ -1058,15 +1278,13 @@ def test_five_minute_cache_and_force_refresh(tmp_path: Path) -> None:
     assert all(offer.provider_cache_hit for offer in cached.offers)
     assert all(offer.provider_cache_age_seconds == 240 for offer in cached.offers)
     assert refreshed.cache_hit is False
-    assert refreshed.calls_used == 10
+    assert refreshed.calls_used == 12
     assert len(client.search_calls) == 8
-    assert len(client.booking_calls) == 12
+    assert len(client.booking_calls) == 16
     assert all("no_cache" not in call["params"] for call in client.search_calls[:4])
     assert all(call["params"]["no_cache"] == "true" for call in client.search_calls[4:])
-    assert all("no_cache" not in call["params"] for call in client.booking_calls[:6])
-    assert all(
-        call["params"]["no_cache"] == "true" for call in client.booking_calls[6:]
-    )
+    assert all("no_cache" not in call["params"] for call in client.booking_calls[:8])
+    assert all(call["params"]["no_cache"] == "true" for call in client.booking_calls[8:])
 
 
 @pytest.mark.parametrize(
@@ -1120,7 +1338,7 @@ def test_explicit_cached_search_metadata_is_accepted_and_marked_exactly(
     )
 
     assert result.status == "confirmed_offers"
-    assert result.search_monthly_used == 10
+    assert result.search_monthly_used == 12
     assert result.offers
     assert all(offer.provider_cache_hit for offer in result.offers)
     assert all(offer.provider_cache_age_seconds == 0 for offer in result.offers)
@@ -1164,9 +1382,7 @@ def test_chosen_booking_option_baggage_is_parsed_conservatively(
         def get(self, url: str, **kwargs: Any) -> _Response:
             response = super().get(url, **kwargs)
             if url == SERPAPI_SEARCH_URL and "booking_token" in kwargs["params"]:
-                response.payload["booking_options"][0]["together"][
-                    "baggage_prices"
-                ] = policy
+                response.payload["booking_options"][0]["together"]["baggage_prices"] = policy
                 response.content = json.dumps(response.payload).encode("utf-8")
             return response
 
@@ -1183,7 +1399,7 @@ def test_chosen_booking_option_baggage_is_parsed_conservatively(
     )
 
 
-def test_additional_candidates_prioritize_direct_new_airlines(tmp_path: Path) -> None:
+def test_all_additional_candidates_are_submitted_for_verification(tmp_path: Path) -> None:
     class _DiverseClient(_Client):
         def get(self, url: str, **kwargs: Any) -> _Response:
             response = super().get(url, **kwargs)
@@ -1219,7 +1435,11 @@ def test_additional_candidates_prioritize_direct_new_airlines(tmp_path: Path) ->
     assert result.status == "confirmed_offers"
     tokens = {call["params"]["booking_token"] for call in client.booking_calls}
     assert {"booking-token-1-ua", "booking-token-1-ba"} <= tokens
-    assert "booking-token-1-high" not in tokens
+    assert "booking-token-1-high" in tokens
+    assert len(client.booking_calls) == 10
+    assert result.eligible_candidate_count == 10
+    assert result.verification_attempted_count == 10
+    assert result.coverage_status == "complete"
 
 
 def test_booking_token_verification_runs_in_parallel(tmp_path: Path) -> None:
@@ -1229,12 +1449,16 @@ def test_booking_token_verification_runs_in_parallel(tmp_path: Path) -> None:
             self.barrier = threading.Barrier(6)
             self.thread_ids: set[int] = set()
             self.thread_ids_lock = threading.Lock()
+            self.booking_started = 0
 
         def get(self, url: str, **kwargs: Any) -> _Response:
             if url == SERPAPI_SEARCH_URL and "booking_token" in kwargs["params"]:
                 with self.thread_ids_lock:
                     self.thread_ids.add(threading.get_ident())
-                self.barrier.wait(timeout=3)
+                    self.booking_started += 1
+                    booking_started = self.booking_started
+                if booking_started <= 6:
+                    self.barrier.wait(timeout=3)
             return super().get(url, **kwargs)
 
     client = _ParallelClient()
@@ -1244,6 +1468,7 @@ def test_booking_token_verification_runs_in_parallel(tmp_path: Path) -> None:
 
     assert result.status == "confirmed_offers"
     assert len(client.thread_ids) == 6
+    assert len(client.booking_calls) == 8
 
 
 @pytest.mark.parametrize(

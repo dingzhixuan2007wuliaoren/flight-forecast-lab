@@ -39,6 +39,13 @@ SearchStatus = Literal[
     "provider_error",
     "provider_unavailable",
 ]
+CandidateCoverageStatus = Literal[
+    "not_evaluated",
+    "complete",
+    "quota_limited",
+    "provider_incomplete",
+    "quota_and_provider_incomplete",
+]
 
 SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
 SERPAPI_ACCOUNT_URL = "https://serpapi.com/account.json"
@@ -53,7 +60,7 @@ REQUEST_TIMEOUT_SECONDS = 25.0
 ACCOUNT_REQUEST_TIMEOUT_SECONDS = 8.0
 SEARCH_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 2.0
 MAX_CACHE_ENTRIES = 128
-MAX_CANDIDATES = 6
+MAX_BOOKING_WORKERS = 6
 SERPAPI_MAX_HOURLY_LIMIT = 50
 MAX_PROVIDER_CACHE_AGE_SECONDS = 65 * 60
 MAX_PROVIDER_FUTURE_SKEW_SECONDS = 5 * 60
@@ -113,9 +120,7 @@ class ProviderDiagnostic:
             raise ValueError("provider diagnostic HTTP status is invalid")
         if not _EXCEPTION_TYPE_PATTERN.fullmatch(self.exception_type):
             raise ValueError("provider diagnostic exception type is invalid")
-        if self.search_id is not None and not _SEARCH_ID_PATTERN.fullmatch(
-            self.search_id
-        ):
+        if self.search_id is not None and not _SEARCH_ID_PATTERN.fullmatch(self.search_id):
             raise ValueError("provider diagnostic search ID is invalid")
 
 
@@ -191,9 +196,7 @@ class ConfirmedFlightOffer:
         if (
             isinstance(self.provider_cache_age_seconds, bool)
             or not isinstance(self.provider_cache_age_seconds, int)
-            or not 0
-            <= self.provider_cache_age_seconds
-            <= MAX_PROVIDER_CACHE_AGE_SECONDS
+            or not 0 <= self.provider_cache_age_seconds <= MAX_PROVIDER_CACHE_AGE_SECONDS
         ):
             raise ValueError("confirmed offer provider cache age is invalid")
         if not _safe_https_url(self.booking_url):
@@ -241,6 +244,34 @@ class ConfirmedFlightOffer:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @property
+    def lowest_price_group_key(self) -> tuple[Any, ...]:
+        """Group equivalent flight-and-cabin offers before choosing a seller.
+
+        Seller, fare brand, booking URL, and price are deliberately absent: a
+        provider response may expose the same dated itinerary through multiple
+        booking tokens or sellers, and strict mode keeps only the cheapest
+        successfully verified option for that flight and cabin.
+        """
+
+        return (
+            self.validating_airline_code,
+            self.cabin,
+            tuple(
+                (
+                    segment.origin,
+                    segment.destination,
+                    segment.departure_at,
+                    segment.arrival_at,
+                    segment.marketing_airline_code,
+                    segment.operating_airline_code,
+                    segment.flight_number,
+                    segment.cabin,
+                )
+                for segment in self.segments
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class FlightOfferSearchResult:
@@ -266,12 +297,78 @@ class FlightOfferSearchResult:
     pricing_monthly_used: int | None = None
     archive_poll_count: int = 0
     diagnostics: tuple[ProviderDiagnostic, ...] = ()
+    coverage_scope: Literal["provider_returned_booking_token_candidates"] = (
+        "provider_returned_booking_token_candidates"
+    )
+    eligible_candidate_count: int = 0
+    verification_attempted_count: int = 0
+    verified_candidate_count: int = 0
+    strictly_rejected_candidate_count: int = 0
+    provider_failed_candidate_count: int = 0
+    quota_skipped_candidate_count: int = 0
+    deduplicated_verified_count: int = 0
+    coverage_status: CandidateCoverageStatus = "not_evaluated"
+    quota_limit: QuotaLimit | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "offers", tuple(self.offers))
         object.__setattr__(self, "observed_at", _utc(self.observed_at))
         object.__setattr__(self, "searched_cabins", tuple(self.searched_cabins))
         object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
+        if self.coverage_scope != "provider_returned_booking_token_candidates":
+            raise ValueError("candidate coverage scope is invalid")
+        count_fields = {
+            "eligible candidates": self.eligible_candidate_count,
+            "verification attempts": self.verification_attempted_count,
+            "verified candidates": self.verified_candidate_count,
+            "strictly rejected candidates": self.strictly_rejected_candidate_count,
+            "provider-failed candidates": self.provider_failed_candidate_count,
+            "quota-skipped candidates": self.quota_skipped_candidate_count,
+            "deduplicated verified candidates": self.deduplicated_verified_count,
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in count_fields.values()
+        ):
+            raise ValueError("candidate coverage counts must be nonnegative integers")
+        if self.verification_attempted_count != (
+            self.verified_candidate_count
+            + self.strictly_rejected_candidate_count
+            + self.provider_failed_candidate_count
+        ):
+            raise ValueError("verification attempts must equal all verification outcomes")
+        if self.verified_candidate_count != (len(self.offers) + self.deduplicated_verified_count):
+            raise ValueError("verified candidates must equal returned plus deduplicated offers")
+        if self.coverage_status == "not_evaluated":
+            if any(
+                (
+                    self.verification_attempted_count,
+                    self.verified_candidate_count,
+                    self.strictly_rejected_candidate_count,
+                    self.provider_failed_candidate_count,
+                    self.quota_skipped_candidate_count,
+                    self.deduplicated_verified_count,
+                )
+            ):
+                raise ValueError("unevaluated candidate coverage cannot report outcomes")
+        elif self.eligible_candidate_count != (
+            self.verification_attempted_count + self.quota_skipped_candidate_count
+        ):
+            raise ValueError("eligible candidates must equal attempted plus quota-skipped")
+
+        expected_status = _candidate_coverage_status(
+            evaluated=self.coverage_status != "not_evaluated",
+            provider_failed=self.provider_failed_candidate_count,
+            quota_skipped=self.quota_skipped_candidate_count,
+        )
+        if self.coverage_status != expected_status:
+            raise ValueError("candidate coverage status does not match its counts")
+        quota_limited = self.coverage_status in {
+            "quota_limited",
+            "quota_and_provider_incomplete",
+        }
+        if quota_limited != (self.quota_limit is not None):
+            raise ValueError("candidate quota limit must match quota-truncated coverage")
 
     @property
     def configured_search_monthly_limit(self) -> int | None:
@@ -453,9 +550,7 @@ class _UsageLedger:
                 reserved_calls = min(calls, capacity)
             limiting_quota: QuotaLimit | None = None
             if reserved_calls < calls:
-                limiting_quota = (
-                    "monthly" if monthly_available <= hourly_available else "hourly"
-                )
+                limiting_quota = "monthly" if monthly_available <= hourly_available else "hourly"
             monthly_used = monthly_baseline + reserved_calls
             hourly_used = hourly_baseline + reserved_calls
             self._write_counter(
@@ -633,9 +728,7 @@ class _DiagnosticCollector:
             observed_at=observed_at,
             stage=stage,
             http_status=(
-                http_status
-                if http_status is not None and 100 <= http_status <= 599
-                else None
+                http_status if http_status is not None and 100 <= http_status <= 599 else None
             ),
             exception_type=_safe_exception_type(exception_type),
             search_id=_safe_search_id(search_id),
@@ -844,17 +937,13 @@ class SerpApiFlightOfferProvider:
         try:
             account = self._account_quota(diagnostics)
         except _AuthenticationError:
-            return self._diagnostic_result(
-                "authentication_failed", observed_at, diagnostics
-            )
+            return self._diagnostic_result("authentication_failed", observed_at, diagnostics)
         except _RateLimitError:
             return self._diagnostic_result("rate_limited", observed_at, diagnostics)
         except (_ProviderHttpError, _ProviderSearchError, _TransportError):
             return self._diagnostic_result("provider_error", observed_at, diagnostics)
         except Exception:
-            return self._diagnostic_result(
-                "provider_unavailable", observed_at, diagnostics
-            )
+            return self._diagnostic_result("provider_unavailable", observed_at, diagnostics)
 
         try:
             initial_reservation = self._ledger.synchronize_and_reserve(
@@ -868,9 +957,7 @@ class SerpApiFlightOfferProvider:
                 require_all=True,
             )
         except _UsageError:
-            return self._diagnostic_result(
-                "provider_unavailable", observed_at, diagnostics
-            )
+            return self._diagnostic_result("provider_unavailable", observed_at, diagnostics)
         if initial_reservation.reserved_calls != len(_CABINS):
             status: SearchStatus = (
                 "rate_limited"
@@ -917,9 +1004,7 @@ class SerpApiFlightOfferProvider:
                 conservative_monthly_used=initial_reservation.monthly_used,
             )
 
-        candidates = self._select_candidates(
-            payloads, origin, destination, departure_date
-        )
+        candidates = self._select_candidates(payloads, origin, destination, departure_date)
         if not candidates:
             return self._diagnostic_result(
                 "no_results",
@@ -928,6 +1013,7 @@ class SerpApiFlightOfferProvider:
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
                 conservative_monthly_used=initial_reservation.monthly_used,
+                coverage_status="complete",
             )
 
         confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
@@ -951,15 +1037,14 @@ class SerpApiFlightOfferProvider:
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
                 conservative_monthly_used=initial_reservation.monthly_used,
+                eligible_candidate_count=len(candidates),
             )
-        reserved_candidates = list(
-            enumerate(candidates[: booking_reservation.reserved_calls])
-        )
+        reserved_candidates = list(enumerate(candidates[: booking_reservation.reserved_calls]))
 
         booking_calls = len(reserved_candidates)
         if reserved_candidates:
             with ThreadPoolExecutor(
-                max_workers=min(MAX_CANDIDATES, booking_calls),
+                max_workers=min(MAX_BOOKING_WORKERS, booking_calls),
                 thread_name_prefix="serpapi-booking",
             ) as pool:
                 futures = {
@@ -979,9 +1064,7 @@ class SerpApiFlightOfferProvider:
                     payload: dict[str, Any] | None = None
                     provider_http_status: int | None = None
                     try:
-                        payload, provider_observation, provider_http_status = (
-                            future.result()
-                        )
+                        payload, provider_observation, provider_http_status = future.result()
                         offer = _parse_booking_confirmation(
                             payload,
                             candidate,
@@ -1004,13 +1087,36 @@ class SerpApiFlightOfferProvider:
                     if offer is not None:
                         confirmed_by_position[position] = offer
 
-        confirmed: list[ConfirmedFlightOffer] = []
-        seen_fingerprints: set[str] = set()
+        verified_candidate_count = len(confirmed_by_position)
+        provider_failed_candidate_count = len(booking_failures)
+        strictly_rejected_candidate_count = (
+            booking_calls - verified_candidate_count - provider_failed_candidate_count
+        )
+        quota_skipped_candidate_count = len(candidates) - booking_calls
+        coverage_status = _candidate_coverage_status(
+            evaluated=True,
+            provider_failed=provider_failed_candidate_count,
+            quota_skipped=quota_skipped_candidate_count,
+        )
+        quota_limit = booking_reservation.limiting_quota if quota_skipped_candidate_count else None
+
+        # A single itinerary can be returned through multiple booking tokens and
+        # sellers. All reserved tokens are verified first; only then is each
+        # flight-and-cabin group reduced to its cheapest confirmed price.
+        best_by_group: dict[tuple[Any, ...], tuple[int, ConfirmedFlightOffer]] = {}
         for position in range(booking_calls):
             offer = confirmed_by_position.get(position)
-            if offer is not None and offer.fingerprint not in seen_fingerprints:
-                confirmed.append(offer)
-                seen_fingerprints.add(offer.fingerprint)
+            if offer is None:
+                continue
+            group_key = offer.lowest_price_group_key
+            current = best_by_group.get(group_key)
+            if current is None:
+                best_by_group[group_key] = (position, offer)
+            elif _verified_offer_preference(offer) < _verified_offer_preference(current[1]):
+                # Preserve the group's first position while replacing its fare.
+                best_by_group[group_key] = (current[0], offer)
+        confirmed = [offer for _, offer in sorted(best_by_group.values(), key=lambda item: item[0])]
+        deduplicated_verified_count = verified_candidate_count - len(confirmed)
 
         if confirmed:
             return self._diagnostic_result(
@@ -1022,6 +1128,15 @@ class SerpApiFlightOfferProvider:
                 search_calls_used=len(_CABINS),
                 pricing_calls_used=booking_calls,
                 conservative_monthly_used=booking_reservation.monthly_used,
+                eligible_candidate_count=len(candidates),
+                verification_attempted_count=booking_calls,
+                verified_candidate_count=verified_candidate_count,
+                strictly_rejected_candidate_count=strictly_rejected_candidate_count,
+                provider_failed_candidate_count=provider_failed_candidate_count,
+                quota_skipped_candidate_count=quota_skipped_candidate_count,
+                deduplicated_verified_count=deduplicated_verified_count,
+                coverage_status=coverage_status,
+                quota_limit=quota_limit,
             )
         failure_status = _failure_status(booking_failures)
         if failure_status is not None:
@@ -1040,6 +1155,15 @@ class SerpApiFlightOfferProvider:
             search_calls_used=len(_CABINS),
             pricing_calls_used=booking_calls,
             conservative_monthly_used=booking_reservation.monthly_used,
+            eligible_candidate_count=len(candidates),
+            verification_attempted_count=booking_calls,
+            verified_candidate_count=verified_candidate_count,
+            strictly_rejected_candidate_count=strictly_rejected_candidate_count,
+            provider_failed_candidate_count=provider_failed_candidate_count,
+            quota_skipped_candidate_count=quota_skipped_candidate_count,
+            deduplicated_verified_count=deduplicated_verified_count,
+            coverage_status=coverage_status,
+            quota_limit=quota_limit,
         )
 
     def _account_quota(self, diagnostics: _DiagnosticCollector) -> _AccountQuota:
@@ -1066,12 +1190,8 @@ class SerpApiFlightOfferProvider:
             raise _AuthenticationError("provider account is not active")
         monthly_usage = _optional_nonnegative_int(payload.get("this_month_usage"))
         hourly_usage = _optional_nonnegative_int(payload.get("this_hour_searches"))
-        provider_monthly_limit = _optional_positive_int(
-            payload.get("searches_per_month")
-        )
-        provider_hourly_limit = _optional_positive_int(
-            payload.get("account_rate_limit_per_hour")
-        )
+        provider_monthly_limit = _optional_positive_int(payload.get("searches_per_month"))
+        provider_hourly_limit = _optional_positive_int(payload.get("account_rate_limit_per_hour"))
         renewal_date = _plan_renewal_date(
             payload.get("plan_renewal_date"),
             received_at=received_at,
@@ -1193,8 +1313,7 @@ class SerpApiFlightOfferProvider:
             parameters = payload.get("search_parameters")
             if (
                 not isinstance(parameters, dict)
-                or str(parameters.get("engine", "")).strip().lower()
-                != "google_flights"
+                or str(parameters.get("engine", "")).strip().lower() != "google_flights"
                 or str(parameters.get("currency", "")).strip().upper() != "USD"
             ):
                 raise _PayloadError("booking parameters were not echoed correctly")
@@ -1226,15 +1345,9 @@ class SerpApiFlightOfferProvider:
                 params=params,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": (
-                        "flight-forecast-lab/0.2.0 (strict booking verification)"
-                    ),
+                    "User-Agent": ("flight-forecast-lab/0.2.0 (strict booking verification)"),
                 },
-                timeout=(
-                    self._timeout_seconds
-                    if timeout_seconds is None
-                    else timeout_seconds
-                ),
+                timeout=(self._timeout_seconds if timeout_seconds is None else timeout_seconds),
             )
         except Exception as exc:
             received_at = self._provider_now()
@@ -1430,8 +1543,9 @@ class SerpApiFlightOfferProvider:
                 section = payload.get(key)
                 if isinstance(section, list):
                     rows.extend(section)
-            seen: set[tuple[Any, ...]] = set()
-            for row in rows[:40]:
+            by_token: dict[str, _SearchCandidate] = {}
+            conflicting_tokens: set[str] = set()
+            for row in rows:
                 candidate = _parse_search_candidate(
                     row,
                     cabin,
@@ -1440,47 +1554,48 @@ class SerpApiFlightOfferProvider:
                     departure_date,
                     google_flights_url,
                 )
-                if candidate is not None and candidate.identity not in seen:
-                    by_cabin[cabin].append(candidate)
-                    seen.add(candidate.identity)
+                if candidate is None or candidate.booking_token in conflicting_tokens:
+                    continue
+                existing = by_token.get(candidate.booking_token)
+                if existing is None:
+                    by_token[candidate.booking_token] = candidate
+                elif existing.identity != candidate.identity:
+                    # A token is only safe when every occurrence identifies the
+                    # same dated itinerary in the same requested cabin.
+                    by_token.pop(candidate.booking_token, None)
+                    conflicting_tokens.add(candidate.booking_token)
+                elif candidate.search_price_usd < existing.search_price_usd:
+                    by_token[candidate.booking_token] = candidate
+            by_cabin[cabin].extend(by_token.values())
             by_cabin[cabin].sort(
-                key=lambda item: (item.search_price_usd, item.identity)
+                key=lambda item: (
+                    item.search_price_usd,
+                    len(item.segments),
+                    item.identity,
+                    _opaque_token_digest(item.booking_token),
+                )
             )
 
+        # If the shared free quota only permits partial verification, first give
+        # each returned cabin one chance, then consume the remaining capacity in
+        # provider-price order. With sufficient quota, every eligible token is
+        # still returned and verified.
         selected: list[_SearchCandidate] = []
-        selected_identities: set[tuple[Any, ...]] = set()
         for cabin in _CABINS:
             if by_cabin[cabin]:
-                candidate = by_cabin[cabin][0]
-                selected.append(candidate)
-                selected_identities.add(candidate.identity)
-        selected_airlines = {candidate.primary_airline_code for candidate in selected}
-        remainder = [
-            candidate
-            for rows in by_cabin.values()
-            for candidate in rows
-            if candidate.identity not in selected_identities
-        ]
-        while remainder and len(selected) < MAX_CANDIDATES:
-            candidate = min(
-                remainder,
-                key=lambda item: (
-                    (len(item.segments) != 1)
-                    + (item.primary_airline_code in selected_airlines),
-                    len(item.segments) != 1,
-                    item.primary_airline_code in selected_airlines,
-                    item.search_price_usd,
-                    _CABINS.index(item.cabin),
-                    item.identity,
-                ),
+                selected.append(by_cabin[cabin][0])
+        remainder = [candidate for cabin in _CABINS for candidate in by_cabin[cabin][1:]]
+        remainder.sort(
+            key=lambda item: (
+                item.search_price_usd,
+                len(item.segments),
+                _CABINS.index(item.cabin),
+                item.identity,
+                _opaque_token_digest(item.booking_token),
             )
-            selected.append(candidate)
-            selected_identities.add(candidate.identity)
-            selected_airlines.add(candidate.primary_airline_code)
-            remainder = [
-                item for item in remainder if item.identity != candidate.identity
-            ]
-        return tuple(selected[:MAX_CANDIDATES])
+        )
+        selected.extend(remainder)
+        return tuple(selected)
 
     def _cached(
         self,
@@ -1547,6 +1662,18 @@ class SerpApiFlightOfferProvider:
         conservative_monthly_used: int | None = None,
         archive_poll_count: int = 0,
         diagnostics: tuple[ProviderDiagnostic, ...] = (),
+        coverage_scope: Literal["provider_returned_booking_token_candidates"] = (
+            "provider_returned_booking_token_candidates"
+        ),
+        eligible_candidate_count: int = 0,
+        verification_attempted_count: int = 0,
+        verified_candidate_count: int = 0,
+        strictly_rejected_candidate_count: int = 0,
+        provider_failed_candidate_count: int = 0,
+        quota_skipped_candidate_count: int = 0,
+        deduplicated_verified_count: int = 0,
+        coverage_status: CandidateCoverageStatus = "not_evaluated",
+        quota_limit: QuotaLimit | None = None,
     ) -> FlightOfferSearchResult:
         return FlightOfferSearchResult(
             offers=offers,
@@ -1566,6 +1693,16 @@ class SerpApiFlightOfferProvider:
             pricing_monthly_used=None,
             archive_poll_count=archive_poll_count,
             diagnostics=diagnostics,
+            coverage_scope=coverage_scope,
+            eligible_candidate_count=eligible_candidate_count,
+            verification_attempted_count=verification_attempted_count,
+            verified_candidate_count=verified_candidate_count,
+            strictly_rejected_candidate_count=strictly_rejected_candidate_count,
+            provider_failed_candidate_count=provider_failed_candidate_count,
+            quota_skipped_candidate_count=quota_skipped_candidate_count,
+            deduplicated_verified_count=deduplicated_verified_count,
+            coverage_status=coverage_status,
+            quota_limit=quota_limit,
         )
 
     def _diagnostic_result(
@@ -1717,7 +1854,7 @@ def _booking_evidence(
     expected_numbers = [_compact_flight_number(segment) for segment in segments]
     booking_response_flights_url = _metadata_google_flights_url(payload)
     evidence: list[_BookingEvidence] = []
-    for option in options[:40]:
+    for option in options:
         if not isinstance(option, dict) or option.get("separate_tickets") is True:
             continue
         together = option.get("together")
@@ -1735,16 +1872,12 @@ def _booking_evidence(
             or not isinstance(request_data, dict)
         ):
             continue
-        normalized_marketed = [
-            _normalized_full_flight_number(value) for value in marketed
-        ]
+        normalized_marketed = [_normalized_full_flight_number(value) for value in marketed]
         if any(value is None for value in normalized_marketed):
             continue
         if normalized_marketed != expected_numbers:
             continue
-        action_url = _safe_google_url(
-            request_data.get("url"), path_prefix="/travel/clk/"
-        )
+        action_url = _safe_google_url(request_data.get("url"), path_prefix="/travel/clk/")
         if action_url is None:
             continue
         post_data = request_data.get("post_data")
@@ -1755,9 +1888,7 @@ def _booking_evidence(
             # The action itself requires POST and cannot safely be exposed as an
             # anchor. Fall back to a provider-returned Google Flights results page;
             # this is navigation evidence, not a claim that an itinerary is selected.
-            booking_url = (
-                booking_response_flights_url or fallback_google_flights_url
-            )
+            booking_url = booking_response_flights_url or fallback_google_flights_url
             booking_url_kind = "google_flights_itinerary"
         else:
             continue
@@ -1794,9 +1925,7 @@ def _booking_evidence(
                 refundable=refundable,
                 no_penalty=no_penalty,
                 no_restriction=no_restriction,
-                checked_bags_quantity=_checked_bags_quantity(
-                    together.get("baggage_prices")
-                ),
+                checked_bags_quantity=_checked_bags_quantity(together.get("baggage_prices")),
             )
         )
     if not evidence:
@@ -1841,9 +1970,7 @@ def _parse_google_segments(
             if previous.destination != origin or departure_at <= previous.arrival_at:
                 return ()
         marketing_code, number = full_number
-        segment_key = (
-            f"{marketing_code}{number}-{departure_at:%Y%m%d%H%M}-{index}"
-        )
+        segment_key = f"{marketing_code}{number}-{departure_at:%Y%m%d%H%M}-{index}"
         segments.append(
             FlightOfferSegment(
                 segment_id=segment_key,
@@ -1929,21 +2056,13 @@ def _metadata_google_flights_url(payload: dict[str, Any]) -> str | None:
     return _safe_google_url(value, path_prefix="/travel/flights")
 
 
-def _provider_observation(
-    payload: dict[str, Any], received_at: datetime
-) -> _ProviderObservation:
+def _provider_observation(payload: dict[str, Any], received_at: datetime) -> _ProviderObservation:
     metadata = payload.get("search_metadata")
-    status = (
-        str(metadata.get("status", "")).strip().lower()
-        if isinstance(metadata, dict)
-        else ""
-    )
+    status = str(metadata.get("status", "")).strip().lower() if isinstance(metadata, dict) else ""
     if status not in {"success", "cached"}:
         raise _PayloadError("provider response status is invalid")
     created_at = (
-        _provider_created_at(metadata.get("created_at"))
-        if isinstance(metadata, dict)
-        else None
+        _provider_created_at(metadata.get("created_at")) if isinstance(metadata, dict) else None
     )
     if created_at is None:
         raise _PayloadError("provider creation time is missing or invalid")
@@ -1952,9 +2071,7 @@ def _provider_observation(
         raise _PayloadError("provider response time is outside the freshness window")
     return _ProviderObservation(
         created_at=created_at,
-        cache_hit=(
-            status == "cached" or cache_age > PROVIDER_CACHE_HIT_AGE_SECONDS
-        ),
+        cache_hit=(status == "cached" or cache_age > PROVIDER_CACHE_HIT_AGE_SECONDS),
         cache_age_seconds=cache_age,
     )
 
@@ -2110,6 +2227,12 @@ def _opaque_token(value: Any) -> str | None:
     return token
 
 
+def _opaque_token_digest(token: str) -> str:
+    """Return a deterministic sort key without retaining or exposing a token."""
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def _safe_https_url(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -2176,11 +2299,7 @@ def _payload_search_id(payload: Any) -> str | None:
 
 def _provider_search_status(payload: Any) -> str:
     metadata = payload.get("search_metadata") if isinstance(payload, dict) else None
-    return (
-        str(metadata.get("status", "")).strip().lower()
-        if isinstance(metadata, dict)
-        else ""
-    )
+    return str(metadata.get("status", "")).strip().lower() if isinstance(metadata, dict) else ""
 
 
 def _response_search_id(response: Any) -> str | None:
@@ -2230,6 +2349,34 @@ def _failure_status(failures: list[BaseException]) -> SearchStatus | None:
     if failures:
         return "provider_unavailable"
     return None
+
+
+def _candidate_coverage_status(
+    *,
+    evaluated: bool,
+    provider_failed: int,
+    quota_skipped: int,
+) -> CandidateCoverageStatus:
+    if not evaluated:
+        return "not_evaluated"
+    if provider_failed and quota_skipped:
+        return "quota_and_provider_incomplete"
+    if provider_failed:
+        return "provider_incomplete"
+    if quota_skipped:
+        return "quota_limited"
+    return "complete"
+
+
+def _verified_offer_preference(offer: ConfirmedFlightOffer) -> tuple[Any, ...]:
+    """Choose the cheapest verified seller, preferring a direct GET on ties."""
+
+    return (
+        offer.total_amount_usd,
+        offer.booking_url_kind != "direct_get",
+        offer.booking_provider.casefold(),
+        offer.provider_offer_id,
+    )
 
 
 def _status_code(response: Any) -> int:

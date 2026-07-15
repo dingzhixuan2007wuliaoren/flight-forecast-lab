@@ -6,6 +6,13 @@
     "log_loss": 0.662232856360249,
     "roc_auc": 0.6132485004186212
   },
+  "on_time_without_weather": {
+    "accuracy_at_0_5": 0.5733333333333334,
+    "baseline_brier_score": 0.24279281462585034,
+    "brier_score": 0.24396582606226333,
+    "log_loss": 0.6817441263593365,
+    "roc_auc": 0.5483421454049157
+  },
   "price": {
     "baseline_mae_usd": 366.62531111111116,
     "interval_80_empirical_coverage": 0.8122222222222222,

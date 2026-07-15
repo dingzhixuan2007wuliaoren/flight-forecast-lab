@@ -78,7 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    demo = subparsers.add_parser("train-demo", help="train both models on reproducible demo data")
+    demo = subparsers.add_parser(
+        "train-demo",
+        help="train the fare model and both on-time variants on reproducible demo data",
+    )
     demo.add_argument("--output", default="artifacts/demo")
     demo.add_argument("--price-rows", type=int, default=6_000)
     demo.add_argument("--ontime-rows", type=int, default=8_000)

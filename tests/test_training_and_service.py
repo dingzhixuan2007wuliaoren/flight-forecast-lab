@@ -3,9 +3,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pytest
 
-from flight_forecaster.context import ContextProvider
+from flight_forecaster.context import (
+    ContextProvider,
+    NewsSignal,
+    OperationsSignal,
+    PredictionContext,
+    WeatherSignal,
+)
 from flight_forecaster.route_info import AIRPORTS, RouteLookupError
 from flight_forecaster.schemas import (
     ComparisonOffer,
@@ -21,12 +28,14 @@ def test_training_writes_versioned_artifacts_and_beats_baselines(
     trained_model_dir: Path,
 ) -> None:
     bundle = joblib.load(trained_model_dir / ARTIFACT_FILENAME)
-    assert bundle["artifact_schema_version"] == 2
+    assert bundle["artifact_schema_version"] == 3
+    assert "ontime_model_without_weather" in bundle
     assert bundle["metrics"]["price"]["mae_usd"] < bundle["metrics"]["price"]["baseline_mae_usd"]
     assert (
         bundle["metrics"]["on_time"]["brier_score"]
         < bundle["metrics"]["on_time"]["baseline_brier_score"]
     )
+    assert 0 <= bundle["metrics"]["on_time_without_weather"]["brier_score"] <= 1
     assert bundle["context_priors"]["source"] == "pytest_synthetic_training_average"
     assert len(bundle["context_priors"]["weather_by_month"]) == 12
     assert bundle["context_priors"]["operations_by_origin"]
@@ -66,6 +75,125 @@ def test_service_predictions_are_bounded(trained_model_dir: Path, monkeypatch) -
     assert 0 <= on_time.on_time_probability <= 1
     assert 500 < on_time.distance_km < 700
     assert abs(on_time.on_time_probability + on_time.disruption_probability - 1) < 0.0011
+    assert on_time.weather_feature_status == "ignored"
+    assert "excludes the weather feature" in on_time.weather_feature_notice_en
+
+
+def test_proxy_weather_uses_the_no_weather_model(
+    trained_model_dir: Path,
+    monkeypatch,
+) -> None:
+    class _MustNotRun:
+        def predict_proba(self, _features):
+            raise AssertionError("weather-enhanced model must not run for proxy weather")
+
+    class _NoWeatherModel:
+        def __init__(self) -> None:
+            self.columns: list[str] = []
+
+        def predict_proba(self, features):
+            self.columns = list(features.columns)
+            return np.asarray([[0.25, 0.75]])
+
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    service = PredictionService(trained_model_dir)
+    no_weather_model = _NoWeatherModel()
+    service.bundle["ontime_model"] = _MustNotRun()
+    service.bundle["ontime_model_without_weather"] = no_weather_model
+
+    prediction = service.predict_ontime(
+        OnTimeRequest.model_validate(
+            {
+                "origin": "YYZ",
+                "destination": "JFK",
+                "airline": "AC",
+                "scheduled_departure": (datetime.now(UTC) + timedelta(days=60)).isoformat(),
+            }
+        )
+    )
+
+    assert prediction.on_time_probability == 0.75
+    assert prediction.weather_feature_status == "ignored"
+    assert "weather_severity_forecast" not in no_weather_model.columns
+
+
+def test_forecast_weather_uses_the_weather_enhanced_model(
+    trained_model_dir: Path,
+    monkeypatch,
+) -> None:
+    class _WeatherModel:
+        def __init__(self) -> None:
+            self.columns: list[str] = []
+
+        def predict_proba(self, features):
+            self.columns = list(features.columns)
+            return np.asarray([[0.4, 0.6]])
+
+    class _MustNotRun:
+        def predict_proba(self, _features):
+            raise AssertionError("no-weather model must not run for forecast weather")
+
+    now = datetime.now(UTC)
+    context = PredictionContext(
+        weather=WeatherSignal(0.35, "forecast", "test_forecast", now, "预报", "forecast"),
+        operations=OperationsSignal(0.2, "proxy", "test", now, "运行", "operations"),
+        news=NewsSignal(0.1, "neutral", "test", now, "新闻", "news"),
+        resolved_at=now,
+    )
+    service = PredictionService(trained_model_dir)
+    weather_model = _WeatherModel()
+    service.bundle["ontime_model"] = weather_model
+    service.bundle["ontime_model_without_weather"] = _MustNotRun()
+    monkeypatch.setattr(service, "_context", lambda _route, _departure: context)
+
+    prediction = service.predict_ontime(
+        OnTimeRequest.model_validate(
+            {
+                "origin": "YYZ",
+                "destination": "JFK",
+                "airline": "AC",
+                "scheduled_departure": (now + timedelta(days=1)).isoformat(),
+            }
+        )
+    )
+
+    assert prediction.on_time_probability == 0.6
+    assert prediction.weather_feature_status == "used"
+    assert "weather_severity_forecast" in weather_model.columns
+
+
+def test_date_level_weather_is_ignored_for_flights_far_from_reference_hour() -> None:
+    reference = datetime(2026, 8, 20, 16, 0, tzinfo=UTC)
+    context = PredictionContext(
+        weather=WeatherSignal(
+            0.35,
+            "forecast",
+            "test_forecast",
+            reference,
+            "预报",
+            "forecast",
+        ),
+        operations=OperationsSignal(0.2, "proxy", "test", reference, "运行", "operations"),
+        news=NewsSignal(0.1, "neutral", "test", reference, "新闻", "news"),
+        resolved_at=reference,
+    )
+
+    assert (
+        PredictionService._weather_feature_status(
+            context,
+            target_departure=reference + timedelta(hours=2),
+            weather_reference_departure=reference,
+        )
+        == "used"
+    )
+    assert (
+        PredictionService._weather_feature_status(
+            context,
+            target_departure=reference + timedelta(hours=3),
+            weather_reference_departure=reference,
+        )
+        == "ignored"
+    )
 
 
 def _student_offer(
@@ -132,6 +260,7 @@ def test_legacy_route_airline_hints_do_not_bypass_strict_bookable_mode(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
     service = PredictionService(
         trained_model_dir,
         context_provider=_ConfirmedRouteProvider(),

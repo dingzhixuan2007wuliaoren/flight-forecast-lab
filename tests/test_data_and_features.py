@@ -3,7 +3,11 @@ import pandas as pd
 import pytest
 
 from flight_forecaster.data import generate_demo_ontime_data, generate_demo_price_data
-from flight_forecaster.features import build_ontime_features, build_price_features
+from flight_forecaster.features import (
+    build_ontime_features,
+    build_ontime_features_without_weather,
+    build_price_features,
+)
 from flight_forecaster.training import temporal_split
 
 
@@ -33,6 +37,15 @@ def test_feature_builders_exclude_targets_and_post_flight_values() -> None:
     assert "on_time" not in ontime_features
 
 
+def test_no_weather_feature_builder_neither_requires_nor_emits_weather() -> None:
+    data = generate_demo_ontime_data(rows=500).iloc[:5].drop(columns=["weather_severity_forecast"])
+
+    features = build_ontime_features_without_weather(data)
+
+    assert "weather_severity_forecast" not in features.columns
+    assert len(features) == 5
+
+
 def test_price_feature_builder_rejects_departures_in_the_past() -> None:
     data = generate_demo_price_data(rows=500).iloc[:1].copy()
     data["departure_time"] = data["quote_time"]
@@ -51,6 +64,4 @@ def test_local_departure_components_override_utc_clock_features() -> None:
 
     assert features.iloc[0]["is_peak_hour"] == 1
     assert features.iloc[0]["is_weekend"] == 0
-    assert features.iloc[0]["departure_hour_sin"] == pytest.approx(
-        np.sin(2 * np.pi * 7 / 24)
-    )
+    assert features.iloc[0]["departure_hour_sin"] == pytest.approx(np.sin(2 * np.pi * 7 / 24))

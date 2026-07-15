@@ -1573,6 +1573,11 @@
           <span id="strict-mode-notice-text"></span>
         </aside>
 
+        <aside id="fare-coverage-notice" class="strict-mode-notice" aria-live="polite">
+          <strong data-i18n="fareCoverage">候选覆盖</strong>
+          <span id="fare-coverage-notice-text"></span>
+        </aside>
+
         <div class="rank-toolbar">
           <div class="rank-heading">
             <div class="rank-title-line">
@@ -1691,7 +1696,7 @@
           pointTwo: "实时数据失败时透明回退",
           pointThree: "绝不把预测冒充实时票价",
           searchTitle: "比较一条航线",
-          searchHint: "可输入全球机场的三字 IATA 代码，例如 YYZ、JFK、LHR；返回结果受 Google Flights 覆盖和单次最多 10 次 provider 查询限制，并非全球全量清单。",
+          searchHint: "可输入全球机场的三字 IATA 代码，例如 YYZ、JFK、LHR；系统处理 SerpApi 四舱搜索实际返回的候选，但结果仍受 Google Flights 覆盖、免费额度和供应商响应限制，并非全球全量清单。",
           autoContext: "自动补全外部信号",
           origin: "出发机场",
           destination: "到达机场",
@@ -1708,6 +1713,7 @@
           contextTitle: "预测上下文",
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
           weather: "实时 / 预测航空天气",
+          weatherIgnoredNotice: "本次准点预测已忽略天气变量。",
           operations: "机场运行",
           plannedBaseline: "计划时刻模型输入",
           currentSnapshot: "机场当前实时状态",
@@ -1716,8 +1722,20 @@
           viewDetails: "查看详情",
           offersTitle: "严格验证航班",
           strictMode: "严格模式",
+          fareCoverage: "候选覆盖",
           strictScheduleOnly: "仅购票选项已验证",
-          strictModeDefaultNotice: "主列表只显示 SerpApi 返回且通过购票选项验证的 Google Flights 结果。每次比较最多进行 4 次舱位搜索和 6 次候选验证，候选优先保持航司多样性；已启用 deep_search 与 show_hidden，但仍不代表所有航司、航班或销售方的全量结果。来源缓存最长约 1 小时。",
+          strictModeDefaultNotice: "系统处理 SerpApi 四舱搜索实际返回的全部候选，但主列表只显示在免费额度与供应商响应范围内成功通过购票选项严格验证的 Google Flights 结果。已启用 deep_search 与 show_hidden，但仍不代表所有航司、航班或销售方的全球全量；来源缓存最长约 1 小时。",
+          coverageNotEvaluated: "本次未获得可评估的 SerpApi 候选覆盖统计。",
+          coverageScope: "范围：SerpApi 四舱搜索实际返回的候选。",
+          coverageComplete: "所有符合初步条件的返回候选均已尝试严格验证。",
+          coverageQuotaLimited: "免费额度不足，部分候选未验证，当前列表已截断。",
+          coverageProviderIncomplete: "部分候选因供应商响应失败而未能完成验证，当前列表不完整。",
+          coverageQuotaAndProviderIncomplete: "免费额度和供应商响应均限制了验证，当前列表已截断且不完整。",
+          coverageCacheSnapshot: "以下覆盖统计来自 5 分钟严格缓存的原查询；本次没有新增供应商调用。",
+          coverageCounts: "发现 {eligible} 个候选；尝试 {attempted} 个，验证通过 {verified} 个，严格排除 {rejected} 个，供应商失败 {failed} 个，额度跳过 {skipped} 个；同航程同舱位去重 {deduplicated} 个，最终显示 {displayed} 个最低价选项。",
+          quotaLimitHourly: "小时额度",
+          quotaLimitMonthly: "结算周期额度",
+          quotaLimitUnknown: "免费额度",
           directFirst: "直飞优先",
           lowestPrice: "低价优先",
           studentFirst: "学生友好优先",
@@ -1725,8 +1743,8 @@
           allCabins: "全部舱位",
           directDescription: "仅在 Google Flights 购票选项已验证的结果中优先展示直飞，并可按来源返回的舱位筛选。",
           priceDescription: "仅在购票选项已验证的结果中按来源结果价格从低到高展示。",
-          studentDescription: "仅在最多 6 个已验证结果中，依次按来源结果价格、免费托运行李、实际学生折扣、免费退改、年龄与验证条件比较；普通 Google Flights 免费查询不能验证实际学生专属折扣，因此该项显示未知且不加分。",
-          offersCaption: "严格模式下最多 6 个 Google Flights 已验证购票选项；不是所有航司或航班的全量清单",
+          studentDescription: "在本次成功严格验证的全部结果中，依次按来源结果价格、免费托运行李、实际学生折扣、免费退改、年龄与验证条件比较；普通 Google Flights 免费查询不能验证实际学生专属折扣，因此该项显示未知且不加分。",
+          offersCaption: "SerpApi 四舱搜索返回候选中，在免费额度与供应商响应范围内成功严格验证的 Google Flights 购票选项",
           airline: "航司",
           cabin: "舱位",
           route: "航程",
@@ -1873,7 +1891,7 @@
           pointTwo: "Transparent fallback when live data fails",
           pointThree: "Predictions are never presented as live fares",
           searchTitle: "Compare a route",
-          searchHint: "Use worldwide three-letter IATA airport codes such as YYZ, JFK, or LHR. Results are bounded by Google Flights coverage and at most 10 provider searches per comparison; they are not a complete global list.",
+          searchHint: "Use worldwide three-letter IATA airport codes such as YYZ, JFK, or LHR. The system processes candidates actually returned by the four SerpApi cabin searches, but results remain bounded by Google Flights coverage, free quota, and provider responses; they are not a complete global list.",
           autoContext: "External signals filled automatically",
           origin: "Origin airport",
           destination: "Destination airport",
@@ -1890,6 +1908,7 @@
           contextTitle: "Forecast context",
           contextHint: "Every card shows its data status, source, and observation time.",
           weather: "Live / forecast aviation weather",
+          weatherIgnoredNotice: "Weather was omitted from this on-time prediction.",
           operations: "Airport operations",
           plannedBaseline: "Planned-time model input",
           currentSnapshot: "Current live airport status",
@@ -1898,8 +1917,20 @@
           viewDetails: "View details",
           offersTitle: "Strictly verified flights",
           strictMode: "Strict mode",
+          fareCoverage: "Candidate coverage",
           strictScheduleOnly: "Verified booking options only",
-          strictModeDefaultNotice: "The main list contains only SerpApi Google Flights results that pass booking-option verification. Each comparison makes at most four cabin searches plus six candidate validations, with candidate selection favouring airline diversity. deep_search and show_hidden are enabled, but the result is still not a complete list of every airline, flight, or seller. Provider cache can be up to about one hour old.",
+          strictModeDefaultNotice: "The system processes every candidate actually returned by the four SerpApi cabin searches, but the main list contains only Google Flights results successfully passing strict booking-option verification within the free quota and available provider responses. deep_search and show_hidden are enabled, but this is still not a globally complete list of every airline, flight, or seller. Provider cache can be up to about one hour old.",
+          coverageNotEvaluated: "No evaluable SerpApi candidate-coverage statistics were available for this response.",
+          coverageScope: "Scope: candidates actually returned by the four SerpApi cabin searches.",
+          coverageComplete: "Every returned candidate that passed initial eligibility checks was attempted for strict verification.",
+          coverageQuotaLimited: "Free quota was insufficient to verify every candidate, so the current list is truncated.",
+          coverageProviderIncomplete: "Some candidates could not complete verification because of provider-response failures, so the current list is incomplete.",
+          coverageQuotaAndProviderIncomplete: "Both free quota and provider responses limited verification, so the current list is truncated and incomplete.",
+          coverageCacheSnapshot: "These coverage counts come from the original search in the five-minute strict cache; this response made no new provider calls.",
+          coverageCounts: "Found {eligible} candidates; attempted {attempted}, verified {verified}, strictly rejected {rejected}, provider failed {failed}, and quota skipped {skipped}; deduplicated {deduplicated} same-itinerary/cabin results and display {displayed} lowest-price options.",
+          quotaLimitHourly: "hourly quota",
+          quotaLimitMonthly: "billing-period quota",
+          quotaLimitUnknown: "free quota",
           directFirst: "Direct first",
           lowestPrice: "Lowest price",
           studentFirst: "Student friendly",
@@ -1907,8 +1938,8 @@
           allCabins: "All cabins",
           directDescription: "Prioritizes direct routing only among Google Flights results with a verified booking option, with filtering by the source-provided cabin.",
           priceDescription: "Sorts only results with a verified booking option by provider-result fare, lowest first.",
-          studentDescription: "Compares at most six verified results by provider-result fare, free checked baggage, actual student discounts, free changes/refunds, then age and verification. Ordinary free Google Flights queries cannot verify an actual student-only discount, so it stays Unknown and adds no score.",
-          offersCaption: "Up to six verified Google Flights booking options in the active strict-mode ranking; not a complete airline or flight list",
+          studentDescription: "Compares all successfully verified results in this response by provider-result fare, free checked baggage, actual student discounts, free changes/refunds, then age and verification. Ordinary free Google Flights queries cannot verify an actual student-only discount, so it stays Unknown and adds no score.",
+          offersCaption: "Google Flights booking options successfully verified, within free quota and provider responses, from candidates returned by the four SerpApi cabin searches",
           airline: "Airline",
           cabin: "Cabin",
           route: "Route",
@@ -2078,6 +2109,14 @@
 
       function byId(id) { return document.getElementById(id); }
       function t(key) { return translations[currentLanguage][key] || key; }
+
+      function fillTemplate(key, values) {
+        var result = t(key);
+        Object.keys(values || {}).forEach(function (name) {
+          result = result.replace("{" + name + "}", String(values[name]));
+        });
+        return result;
+      }
 
       function pad(value) { return String(value).padStart(2, "0"); }
 
@@ -2401,7 +2440,7 @@
 
       async function requestComparison(payload) {
         var controller = new AbortController();
-        var timeout = window.setTimeout(function () { controller.abort(); }, 90000);
+        var timeout = window.setTimeout(function () { controller.abort(); }, 360000);
         try {
           var response = await fetch("/v1/compare", {
             method: "POST",
@@ -2422,7 +2461,7 @@
         }
       }
 
-      function renderContext(kind, context) {
+      function renderContext(kind, context, weatherFeatureStatus) {
         context = context || {};
         var status = byId(kind + "-status");
         status.textContent = localizeStatus(context.status);
@@ -2430,11 +2469,80 @@
         byId(kind + "-value").textContent = formatContextValue(context.value, kind);
         var summary = currentLanguage === "zh" ? context.summary_zh : context.summary_en;
         if (!hasValue(summary)) summary = currentLanguage === "zh" ? context.summary_en : context.summary_zh;
+        if (kind === "weather" && normalizeKey(weatherFeatureStatus) === "ignored") {
+          var ignoredNotice = t("weatherIgnoredNotice");
+          summary = ignoredNotice + (hasValue(summary) ? " " + summary : "");
+        }
         byId(kind + "-summary").textContent = safeText(summary);
         byId(kind + "-source").textContent = hasValue(context.source) ? t("source") + ": " + context.source : t("source") + ": —";
         byId(kind + "-source").title = safeText(context.source, "");
         byId(kind + "-time").textContent = formatDate(context.observed_at);
         byId(kind + "-time").dateTime = safeText(context.observed_at, "");
+      }
+
+      function coverageCount(value) {
+        var number = asNumber(value);
+        return number === null ? 0 : Math.max(0, Math.round(number));
+      }
+
+      function coverageQuotaLabel(value) {
+        var normalized = normalizeKey(value);
+        if (normalized === "hourly") return t("quotaLimitHourly");
+        if (normalized === "monthly") return t("quotaLimitMonthly");
+        return t("quotaLimitUnknown");
+      }
+
+      function renderFareCoverage(data) {
+        var root = byId("fare-coverage-notice");
+        var textNode = byId("fare-coverage-notice-text");
+        var metadata = data && data.fare_search_metadata && typeof data.fare_search_metadata === "object" ? data.fare_search_metadata : {};
+        var coverageStatus = normalizeKey(metadata.coverage_status);
+        var coverageScope = normalizeKey(metadata.coverage_scope);
+        if (!coverageStatus && !coverageScope) {
+          textNode.textContent = "";
+          root.classList.remove("visible");
+          return;
+        }
+        if (!coverageStatus || coverageStatus === "not_evaluated") {
+          textNode.textContent = t("coverageNotEvaluated");
+          root.classList.add("visible");
+          return;
+        }
+
+        var statusKey = {
+          complete: "coverageComplete",
+          quota_limited: "coverageQuotaLimited",
+          provider_incomplete: "coverageProviderIncomplete",
+          quota_and_provider_incomplete: "coverageQuotaAndProviderIncomplete"
+        }[coverageStatus] || "coverageProviderIncomplete";
+        var eligible = coverageCount(metadata.eligible_candidate_count);
+        var attempted = coverageCount(metadata.verification_attempted_count);
+        var verified = coverageCount(metadata.verified_candidate_count);
+        var rejected = coverageCount(metadata.strictly_rejected_candidate_count);
+        var failed = coverageCount(metadata.provider_failed_candidate_count);
+        var skipped = coverageCount(metadata.quota_skipped_candidate_count);
+        var deduplicated = coverageCount(metadata.deduplicated_verified_count);
+        var displayed = Array.isArray(data && data.offers) ? data.offers.length : 0;
+        var parts = [
+          t("coverageScope"),
+          t(statusKey),
+          fillTemplate("coverageCounts", {
+            eligible: eligible,
+            attempted: attempted,
+            verified: verified,
+            rejected: rejected,
+            failed: failed,
+            skipped: skipped,
+            deduplicated: deduplicated,
+            displayed: displayed
+          })
+        ];
+        if (metadata.cache_hit === true) parts.push(t("coverageCacheSnapshot"));
+        if (coverageStatus === "quota_limited" || coverageStatus === "quota_and_provider_incomplete") {
+          parts.push("(" + coverageQuotaLabel(metadata.quota_limit) + ")");
+        }
+        textNode.textContent = parts.join(" ");
+        root.classList.add("visible");
       }
 
       function operationsMetricLabel(key) {
@@ -2746,6 +2854,9 @@
         var risk = riskLabel(offer.risk_level, offer.on_time_probability);
         appendTinyBadge(probability, risk.label, risk.css);
         appendSubvalue(probability, localizeStatus(offer.punctuality_basis));
+        if (normalizeKey(offer.weather_feature_status) === "ignored") {
+          appendSubvalue(probability, t("weatherIgnoredNotice"));
+        }
 
         var baggage = cell(row, "", "baggage");
         appendTinyBadge(baggage, localizeStatus(offer.baggage_status), benefitClass(offer.baggage_status));
@@ -3026,7 +3137,7 @@
         byId("route-departure").textContent = formatDepartureDate(resolvedDeparture);
         byId("generated-time").textContent = formatDate(data.generated_at);
 
-        renderContext("weather", context.weather);
+        renderContext("weather", context.weather, context.weather_feature_status);
         renderContext("operations", context.operations);
         renderOperationsSnapshot(context.operations);
         renderContext("news", context.news);
@@ -3042,6 +3153,7 @@
         var strictNotice = localizedText(data.strict_mode_notice, t("strictModeDefaultNotice"));
         byId("strict-mode-notice-text").textContent = strictNotice;
         byId("strict-mode-notice").classList.toggle("visible", strictMode || Boolean(strictNotice));
+        renderFareCoverage(data);
         renderOffers(data);
         renderTimetableReferences(data);
 

@@ -6,6 +6,14 @@ from flight_forecaster.data import generate_demo_ontime_data, generate_demo_pric
 from flight_forecaster.training import train_models
 
 
+@pytest.fixture(autouse=True)
+def isolate_external_api_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests must never consume credentials configured on the developer machine."""
+
+    monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
+    monkeypatch.delenv("AIRLABS_API_KEY", raising=False)
+
+
 @pytest.fixture(scope="session")
 def trained_model_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     output = tmp_path_factory.mktemp("models")
