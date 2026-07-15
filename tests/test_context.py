@@ -8,17 +8,31 @@ import pytest
 
 from flight_forecaster.context import (
     ADSB_LOL_URL,
+    ADSB_MAX_AGE_MINUTES,
+    ADSB_MODEL_MAX_LEAD_MINUTES,
+    AIRLABS_FREE_SAMPLE_LIMIT,
     AIRLABS_ROUTES_URL,
     AIRLABS_SCHEDULES_URL,
+    FAA_CACHE_TTL_SECONDS,
+    FAA_NAS_STATUS_URL,
     GDELT_DOC_URL,
     GDELT_GAL_RSS_URL,
     GDELT_REQUEST_TIMEOUT_SECONDS,
+    GDELT_RSS_REQUEST_TIMEOUT_SECONDS,
     NEWS_CACHE_TTL_SECONDS,
     NOAA_METAR_URL,
     NOAA_TAF_URL,
     OPEN_METEO_URL,
     ContextProvider,
+    NewsSignal,
+    OperationsEvent,
+    OperationsMetric,
+    OperationsSignal,
+    OperationsSnapshot,
+    PredictionContext,
+    WeatherSignal,
 )
+from flight_forecaster.service import PredictionService
 
 
 class FakeResponse:
@@ -74,6 +88,71 @@ class FailingClient:
         raise TimeoutError("provider unavailable")
 
 
+def test_service_serializes_target_operations_and_current_snapshot() -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    current = OperationsSnapshot(
+        value=0.72,
+        status="live",
+        source="faa_nas_status",
+        observed_at=now,
+        summary_zh="当前机场有地面等待。",
+        summary_en="A current airport ground delay is active.",
+        method="reported_event",
+        data_tier="authoritative_current",
+        metrics=(OperationsMetric("average_delay_minutes", 42, "minutes"),),
+        events=(OperationsEvent("ground_delay", 0.72, reason="weather"),),
+        sample_size=1,
+    )
+    operations = OperationsSignal(
+        value=0.36,
+        status="proxy",
+        source="synthetic_model_prior",
+        observed_at=now,
+        summary_zh="未来时刻采用历史先验。",
+        summary_en="The future departure uses a historical prior.",
+        method="synthetic_prior",
+        data_tier="historical_prior",
+        applicability="target_departure_prior",
+        current_snapshot=current,
+        fallback_reason="target_outside_live_window",
+    )
+    context = PredictionContext(
+        weather=WeatherSignal(0.1, "proxy", "test", now, "天气", "Weather"),
+        operations=operations,
+        news=NewsSignal(0.0, "neutral", "test", now, "新闻", "News"),
+        resolved_at=now,
+    )
+
+    payload = PredictionService._context_response(context).model_dump()
+
+    assert payload["operations"]["method"] == "synthetic_prior"
+    assert payload["operations"]["current_snapshot"]["source"] == "faa_nas_status"
+    assert payload["operations"]["current_snapshot"]["metrics"] == [
+        {"key": "average_delay_minutes", "value": 42.0, "unit": "minutes"}
+    ]
+    assert payload["operations"]["current_snapshot"]["events"][0]["event_type"] == (
+        "ground_delay"
+    )
+
+
+def test_context_cache_keeps_distinct_departure_minutes(monkeypatch) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    provider = ContextProvider()
+    base = datetime.now(UTC).replace(minute=5, second=0, microsecond=0)
+
+    provider.resolve("JFK", "LAX", base, 40.6413, -73.7781, origin_country="US")
+    provider.resolve(
+        "JFK",
+        "LAX",
+        base.replace(minute=55),
+        40.6413,
+        -73.7781,
+        origin_country="US",
+    )
+
+    assert len(provider._cache) == 2  # noqa: SLF001
+
+
 def _open_meteo_payload(
     departure: datetime,
     weather_code: int = 1,
@@ -110,7 +189,7 @@ def enable_external_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_live_weather_proxy_operations_and_news_scoring() -> None:
-    departure = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=2)
+    departure = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     seen = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     adsb_url = ADSB_LOL_URL.format(latitude=40.6413, longitude=-73.7781)
     client = FakeClient(
@@ -368,7 +447,7 @@ def test_gdelt_doc_failure_uses_free_gal_rss_fallback() -> None:
     ]
     assert [(url, timeout) for url, _, timeout in client.calls] == [
         (GDELT_DOC_URL, GDELT_REQUEST_TIMEOUT_SECONDS),
-        (GDELT_GAL_RSS_URL, 3.0),
+        (GDELT_GAL_RSS_URL, GDELT_RSS_REQUEST_TIMEOUT_SECONDS),
     ]
 
 
@@ -401,6 +480,45 @@ def test_rss_route_matching_does_not_treat_lowercase_iata_word_as_airport_code()
     assert [article.url for article in signal.articles] == [
         "https://rss-news.test/uppercase-can"
     ]
+
+
+def test_route_name_matching_rejects_single_generic_person_name_token() -> None:
+    provider = ContextProvider()
+
+    assert not provider._title_mentions_route(  # noqa: SLF001
+        "John Smith discusses an unrelated airport closure",
+        "JFK",
+        "LAX",
+        "John F. Kennedy International Airport",
+        "Los Angeles International Airport",
+    )
+    assert provider._title_mentions_route(  # noqa: SLF001
+        "Kennedy airport closure disrupts flights",
+        "JFK",
+        "LAX",
+        "John F. Kennedy International Airport",
+        "Los Angeles International Airport",
+    )
+
+
+def test_disabled_news_provider_never_calls_external_services(monkeypatch) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    client = FailingClient()
+    provider = ContextProvider(client=client)
+    now = datetime.now(UTC)
+
+    signal = provider._news(  # noqa: SLF001
+        "JFK",
+        "LAX",
+        now + timedelta(days=10),
+        now,
+        origin_name="John F. Kennedy International Airport",
+        destination_name="Los Angeles International Airport",
+    )
+
+    assert signal.status == "neutral"
+    assert signal.source == "offline_fallback"
+    assert client.calls == 0
 
 
 def test_news_refresh_failure_uses_attenuated_stale_last_good_cache() -> None:
@@ -451,8 +569,35 @@ def test_news_refresh_failure_uses_attenuated_stale_last_good_cache() -> None:
 def test_airlabs_schedules_and_route_airline_cache() -> None:
     departure = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     schedules = [
-        {"status": "scheduled", "dep_delayed": 20 if index < 10 else 0}
-        for index in range(20)
+        {
+            "dep_iata": "JFK",
+            "dep_time_utc": departure.isoformat(),
+            "status": "scheduled",
+            "dep_delayed": 20,
+            "arr_delayed": 0,
+        },
+        {
+            "dep_iata": "JFK",
+            "dep_time_utc": departure.isoformat(),
+            "status": "delayed",
+            "dep_delayed": 0,
+            "arr_delayed": 90,
+        },
+        {
+            "dep_iata": "JFK",
+            "dep_time_utc": departure.isoformat(),
+            "status": "cancelled",
+            "dep_delayed": 0,
+        },
+        *[
+            {
+                "dep_iata": "JFK",
+                "dep_time_utc": (departure + timedelta(days=1)).isoformat(),
+                "status": "scheduled",
+                "dep_delayed": 90,
+            }
+            for _ in range(AIRLABS_FREE_SAMPLE_LIMIT - 3)
+        ],
     ]
     client = FakeClient(
         {
@@ -476,11 +621,236 @@ def test_airlabs_schedules_and_route_airline_cache() -> None:
 
     assert context.operations.status == "live"
     assert context.operations.source == "airlabs_schedules"
-    assert context.operations.value == pytest.approx(0.4083)
+    assert context.operations.value == pytest.approx(0.3972)
+    assert context.operations.method == "actual_departure_sample"
+    assert context.operations.sample_size == 3
+    assert context.operations.sample_limit == AIRLABS_FREE_SAMPLE_LIMIT
+    assert context.operations.sample_truncated is True
+    operation_metrics = {
+        metric.key: metric.value for metric in context.operations.metrics
+    }
+    assert operation_metrics["delayed_departures"] == 1
+    assert operation_metrics["cancelled_departures"] == 1
+    assert operation_metrics["mean_departure_delay"] == pytest.approx(6.67)
     assert first_airlines == {"AA", "DL"}
     assert second_airlines == first_airlines
     assert sum(url == AIRLABS_ROUTES_URL for url, _, _ in client.calls) == 1
     assert not any(url.startswith("https://api.adsb.lol") for url, _, _ in client.calls)
+    schedules_call = next(
+        params for url, params, _ in client.calls if url == AIRLABS_SCHEDULES_URL
+    )
+    assert schedules_call["limit"] == AIRLABS_FREE_SAMPLE_LIMIT
+
+
+def test_faa_scoped_free_form_restriction_is_not_a_full_airport_closure() -> None:
+    assert 60 <= FAA_CACHE_TTL_SECONDS <= 120
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    client = FakeClient(
+        {
+            FAA_NAS_STATUS_URL: [
+                {
+                    "airportId": "JFK",
+                    "airportClosure": None,
+                    "freeForm": {
+                        "text": "TO TRANSIENT GA ACFT EXC 24HR PPR",
+                        "startTime": (now - timedelta(hours=1)).isoformat(),
+                        "endTime": (now + timedelta(days=1)).isoformat(),
+                        "updatedAt": now.isoformat(),
+                    },
+                    "airportConfig": {
+                        "arrivalRate": 44,
+                        "arrivalRunwayConfig": "22L/22R",
+                        "departureRunwayConfig": "22R/31L",
+                        "sourceTimeStamp": now.isoformat(),
+                    },
+                }
+            ]
+        }
+    )
+    provider = ContextProvider(client=client)
+
+    jfk = provider._operations(
+        "JFK",
+        now + timedelta(minutes=30),
+        40.6413,
+        -73.7781,
+        "large_airport",
+        now,
+        "US",
+    )
+    lax = provider._operations(
+        "LAX",
+        now + timedelta(minutes=30),
+        33.9416,
+        -118.4085,
+        "large_airport",
+        now,
+        "US",
+    )
+
+    assert jfk.source == "synthetic_model_prior"
+    assert jfk.data_tier == "historical_prior"
+    assert jfk.events == ()
+    assert jfk.current_snapshot is not None
+    assert jfk.current_snapshot.value == pytest.approx(0.08)
+    assert [event.event_type for event in jfk.current_snapshot.events] == [
+        "restriction"
+    ]
+    assert all(
+        event.event_type != "airport_closure"
+        for event in jfk.current_snapshot.events
+    )
+    assert lax.current_snapshot is not None
+    assert lax.current_snapshot.value == 0
+    assert sum(url == FAA_NAS_STATUS_URL for url, _, _ in client.calls) == 1
+
+
+def test_far_faa_event_overrides_prior_only_when_its_window_covers_departure() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(days=5)
+    client = FakeClient(
+        {
+            FAA_NAS_STATUS_URL: [
+                {
+                    "airportId": "JFK",
+                    "airportClosure": {
+                        "text": "Airport closed",
+                        "startTime": (departure - timedelta(hours=1)).isoformat(),
+                        "endTime": (departure + timedelta(hours=1)).isoformat(),
+                        "updatedAt": now.isoformat(),
+                    },
+                    "freeForm": None,
+                }
+            ]
+        }
+    )
+
+    operations = ContextProvider(client=client)._operations(
+        "JFK",
+        departure,
+        40.6413,
+        -73.7781,
+        "large_airport",
+        now,
+        "US",
+    )
+
+    assert operations.source == "faa_nas_status"
+    assert operations.data_tier == "authoritative_current"
+    assert operations.applicability == "target_departure"
+    assert operations.value == 1
+    assert [event.event_type for event in operations.events] == ["airport_closure"]
+    assert operations.current_snapshot is not None
+    assert operations.current_snapshot.value == 0
+    assert operations.current_snapshot.events == ()
+
+
+def test_far_open_ended_faa_event_does_not_override_target_prior() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    departure = now + timedelta(days=30)
+    client = FakeClient(
+        {
+            FAA_NAS_STATUS_URL: [
+                {
+                    "airportId": "JFK",
+                    "groundStop": {
+                        "reason": "weather",
+                        "startTime": (now - timedelta(minutes=10)).isoformat(),
+                        "endTime": None,
+                        "updatedAt": now.isoformat(),
+                    },
+                }
+            ]
+        }
+    )
+
+    operations = ContextProvider(client=client)._operations(
+        "JFK",
+        departure,
+        40.6413,
+        -73.7781,
+        "large_airport",
+        now,
+        "US",
+    )
+
+    assert operations.source == "synthetic_model_prior"
+    assert operations.applicability == "target_departure_prior"
+    assert operations.current_snapshot is not None
+    assert [event.event_type for event in operations.current_snapshot.events] == [
+        "ground_stop"
+    ]
+
+
+def test_adsb_density_is_displayed_but_not_used_beyond_ninety_minutes() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    adsb_url = ADSB_LOL_URL.format(latitude=43.6777, longitude=-79.6248)
+    client = FakeClient(
+        {
+            adsb_url: {
+                "now": int(now.timestamp() * 1000),
+                "ac": [{"hex": str(index)} for index in range(100)],
+            }
+        }
+    )
+    provider = ContextProvider(client=client)
+
+    far = provider._operations(
+        "YYZ",
+        now + timedelta(minutes=ADSB_MODEL_MAX_LEAD_MINUTES + 1),
+        43.6777,
+        -79.6248,
+        "large_airport",
+        now,
+        "CA",
+    )
+    near = provider._operations(
+        "YYZ",
+        now + timedelta(minutes=ADSB_MODEL_MAX_LEAD_MINUTES),
+        43.6777,
+        -79.6248,
+        "large_airport",
+        now,
+        "CA",
+    )
+
+    assert far.source == "synthetic_model_prior"
+    assert far.current_snapshot is not None
+    assert far.current_snapshot.source == "adsb_lol"
+    assert far.current_snapshot.value == 1
+    assert near.source == "adsb_lol"
+    assert near.value == 1
+    assert near.current_snapshot is not None
+
+
+def test_stale_adsb_snapshot_is_not_used_as_current_or_target_signal() -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    adsb_url = ADSB_LOL_URL.format(latitude=43.6777, longitude=-79.6248)
+    client = FakeClient(
+        {
+            adsb_url: {
+                "now": int(
+                    (now - timedelta(minutes=ADSB_MAX_AGE_MINUTES + 1)).timestamp()
+                    * 1000
+                ),
+                "ac": [{"hex": str(index)} for index in range(100)],
+            }
+        }
+    )
+
+    operations = ContextProvider(client=client)._operations(
+        "YYZ",
+        now + timedelta(minutes=30),
+        43.6777,
+        -79.6248,
+        "large_airport",
+        now,
+        "CA",
+    )
+
+    assert operations.source == "synthetic_model_prior"
+    assert operations.current_snapshot is None
+    assert "adsb_lol_unavailable" in (operations.fallback_reason or "")
 
 
 def test_noaa_aviation_weather_supplements_open_meteo() -> None:
@@ -838,10 +1208,23 @@ def test_external_context_can_be_disabled_without_http(
 
 
 def test_future_departure_does_not_use_current_operations_or_noaa() -> None:
-    departure = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(days=5)
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    departure = now + timedelta(days=5)
     client = FakeClient(
         {
             OPEN_METEO_URL: _open_meteo_payload(departure),
+            FAA_NAS_STATUS_URL: [
+                {
+                    "airportId": "JFK",
+                    "departureDelay": {
+                        "reason": "WX:Wind",
+                        "averageDelay": "30",
+                        "updateTime": now.isoformat(),
+                    },
+                    "airportClosure": None,
+                    "freeForm": None,
+                }
+            ],
             GDELT_DOC_URL: {"articles": []},
         }
     )
@@ -855,15 +1238,20 @@ def test_future_departure_does_not_use_current_operations_or_noaa() -> None:
         icao_code="KJFK",
         origin_name="John F. Kennedy International",
         destination_name="Los Angeles International",
+        origin_country="US",
     )
 
     called_urls = {url for url, _, _ in client.calls}
     assert context.weather.status == "forecast"
     assert context.operations.status == "proxy"
     assert context.operations.source == "synthetic_model_prior"
+    assert context.operations.current_snapshot is not None
+    assert context.operations.current_snapshot.source == "faa_nas_status"
+    assert context.operations.current_snapshot.value > 0
     assert NOAA_TAF_URL not in called_urls
     assert NOAA_METAR_URL not in called_urls
     assert AIRLABS_SCHEDULES_URL not in called_urls
     assert not any(url.startswith("https://api.adsb.lol") for url in called_urls)
+    assert FAA_NAS_STATUS_URL in called_urls
     gdelt_call = next(params for url, params, _ in client.calls if url == GDELT_DOC_URL)
     assert '"John F. Kennedy International"' in gdelt_call["query"]

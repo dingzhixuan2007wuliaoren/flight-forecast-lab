@@ -25,6 +25,15 @@ PolicyStatus = Literal[
     "not_applicable",
     "unknown",
 ]
+NewsCategory = Literal[
+    "airport_closure",
+    "airspace_conflict",
+    "labor_strike",
+    "extreme_weather",
+    "cancellation_delay",
+    "security_cyber",
+    "other_disruption",
+]
 
 
 def _normalise_code(value: str, *, min_length: int, max_length: int) -> str:
@@ -131,6 +140,10 @@ class ComparisonRequest(BaseModel):
         return self
 
 
+class ContextDetailRequest(ComparisonRequest):
+    """Route and local departure time used by second-level context pages."""
+
+
 class PricePrediction(BaseModel):
     estimated_price_usd: float
     interval_80_low_usd: float
@@ -162,6 +175,39 @@ class ContextSignal(BaseModel):
     summary_en: str
 
 
+class OperationsMetric(BaseModel):
+    key: str = Field(min_length=1, max_length=80)
+    value: float | int | str | bool
+    unit: str | None = Field(default=None, max_length=32)
+
+
+class OperationsEvent(BaseModel):
+    event_type: str = Field(min_length=1, max_length=80)
+    severity: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(default="", max_length=1_000)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    scope: str | None = Field(default=None, max_length=500)
+
+
+class OperationsSnapshot(ContextSignal):
+    method: str = Field(default="unknown", max_length=80)
+    data_tier: str = Field(default="unknown", max_length=80)
+    applicability: str = Field(default="current_only", max_length=80)
+    metrics: list[OperationsMetric] = Field(default_factory=list, max_length=24)
+    events: list[OperationsEvent] = Field(default_factory=list, max_length=20)
+    fallback_reason: str | None = Field(default=None, max_length=1_000)
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    sample_size: int = Field(default=0, ge=0)
+    sample_limit: int | None = Field(default=None, ge=1)
+    sample_truncated: bool = False
+
+
+class OperationsSignal(OperationsSnapshot):
+    current_snapshot: OperationsSnapshot | None = None
+
+
 class NewsArticle(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     url: str = Field(min_length=1, max_length=2048, pattern=r"^https?://")
@@ -176,8 +222,123 @@ class NewsSignal(ContextSignal):
 
 class PredictionContextResponse(BaseModel):
     weather: ContextSignal
-    operations: ContextSignal
+    operations: OperationsSignal
     news: NewsSignal
+
+
+class BilingualText(BaseModel):
+    zh: str
+    en: str
+
+
+class ProviderMetadata(BaseModel):
+    status: SignalStatus
+    source: str
+    observed_at: datetime | None = None
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    fallback_reason: BilingualText | None = None
+
+
+class WeatherRiskComponent(BaseModel):
+    key: Literal["weather_code", "wind", "gust", "precipitation", "visibility"]
+    label: BilingualText
+    input_value: float | None = None
+    unit: str
+    risk: float = Field(ge=0.0, le=1.0)
+
+
+class WeatherObservation(BaseModel):
+    time: datetime
+    temperature_c: float | None = None
+    weather_code: int | None = None
+    weather_description: BilingualText
+    wind_speed_kmh: float | None = Field(default=None, ge=0.0)
+    wind_gust_kmh: float | None = Field(default=None, ge=0.0)
+    precipitation_mm: float | None = Field(default=None, ge=0.0)
+    precipitation_probability_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+    visibility_m: float | None = Field(default=None, ge=0.0)
+    risk: float = Field(ge=0.0, le=1.0)
+    risk_components: list[WeatherRiskComponent] = Field(default_factory=list, max_length=5)
+
+
+class HourlyWeatherPoint(BaseModel):
+    time: datetime
+    temperature_c: float | None = None
+    weather_code: int | None = None
+    wind_speed_kmh: float | None = Field(default=None, ge=0.0)
+    wind_gust_kmh: float | None = Field(default=None, ge=0.0)
+    precipitation_mm: float | None = Field(default=None, ge=0.0)
+    precipitation_probability_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+    visibility_m: float | None = Field(default=None, ge=0.0)
+    risk: float = Field(ge=0.0, le=1.0)
+
+
+class AviationWeatherReport(BaseModel):
+    product: Literal["METAR", "TAF"]
+    raw_report: str = Field(min_length=1, max_length=10_000)
+    issued_at: datetime | None = None
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    explanation: BilingualText
+    risk: float = Field(ge=0.0, le=1.0)
+    source: Literal["NOAA AviationWeather"] = "NOAA AviationWeather"
+
+
+class AirportWeatherDetail(BaseModel):
+    airport_code: str = Field(min_length=3, max_length=3)
+    airport_name: str
+    icao_code: str | None = None
+    timezone: str
+    target_time: datetime
+    current: WeatherObservation | None = None
+    target: WeatherObservation | None = None
+    hourly: list[HourlyWeatherPoint] = Field(default_factory=list, max_length=25)
+    aviation_reports: list[AviationWeatherReport] = Field(default_factory=list, max_length=4)
+    aviation_metadata: ProviderMetadata
+    overall_risk: float = Field(ge=0.0, le=1.0)
+    metadata: ProviderMetadata
+
+
+class WeatherDetailResponse(BaseModel):
+    origin: str
+    destination: str
+    departure_time: datetime
+    estimated_arrival_time: datetime
+    duration_minutes: int = Field(gt=0)
+    generated_at: datetime
+    origin_weather: AirportWeatherDetail
+    destination_weather: AirportWeatherDetail
+    notice: BilingualText
+
+
+class NewsDetailArticle(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    url: str = Field(min_length=1, max_length=2048, pattern=r"^https?://")
+    source: str = Field(min_length=1, max_length=255)
+    language: str | None = Field(default=None, max_length=16, pattern=r"^[a-z0-9-]+$")
+    indexed_at: datetime
+    category: NewsCategory
+    matched_risk_terms: list[str] = Field(default_factory=list, max_length=12)
+    raw_score: float = Field(ge=0.0, le=1.0)
+    recency_factor: float = Field(ge=0.0, le=1.0)
+    weighted_score: float = Field(ge=0.0, le=1.0)
+
+
+class NewsDetailResponse(BaseModel):
+    origin: str
+    destination: str
+    departure_time: datetime
+    generated_at: datetime
+    article_count: int = Field(ge=0, le=20)
+    articles: list[NewsDetailArticle] = Field(default_factory=list, max_length=20)
+    route_raw_risk: float = Field(ge=0.0, le=1.0)
+    departure_attenuation_factor: float = Field(ge=0.0, le=1.0)
+    model_effect: float = Field(ge=0.0, le=1.0)
+    model_signal: ContextSignal
+    metadata: ProviderMetadata
+    summary: BilingualText
+    indexed_time_notice: BilingualText
 
 
 class ComparisonOffer(BaseModel):

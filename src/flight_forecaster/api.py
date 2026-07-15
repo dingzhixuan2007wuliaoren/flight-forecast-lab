@@ -11,10 +11,13 @@ from flight_forecaster.route_info import RouteLookupError
 from flight_forecaster.schemas import (
     ComparisonRequest,
     ComparisonResponse,
+    ContextDetailRequest,
+    NewsDetailResponse,
     OnTimePrediction,
     OnTimeRequest,
     PricePrediction,
     PriceRequest,
+    WeatherDetailResponse,
 )
 from flight_forecaster.service import PredictionService
 from flight_forecaster.training import ARTIFACT_FILENAME
@@ -48,6 +51,16 @@ def _service_or_503() -> PredictionService:
 @app.get("/", include_in_schema=False)
 def dashboard() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+
+@app.get("/details/weather", include_in_schema=False)
+def weather_details_page() -> FileResponse:
+    return FileResponse(Path(__file__).parent / "static" / "weather.html")
+
+
+@app.get("/details/news", include_in_schema=False)
+def news_details_page() -> FileResponse:
+    return FileResponse(Path(__file__).parent / "static" / "news.html")
 
 
 @app.get("/health")
@@ -89,5 +102,21 @@ def predict_ontime(request: OnTimeRequest) -> OnTimePrediction:
 def compare_flights(request: ComparisonRequest) -> ComparisonResponse:
     try:
         return _service_or_503().compare(request)
+    except RouteLookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/context/weather-detail", response_model=WeatherDetailResponse)
+def weather_detail(request: ContextDetailRequest) -> WeatherDetailResponse:
+    try:
+        return _service_or_503().weather_detail(request)
+    except RouteLookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/context/news-detail", response_model=NewsDetailResponse)
+def news_detail(request: ContextDetailRequest) -> NewsDetailResponse:
+    try:
+        return _service_or_503().news_detail(request)
     except RouteLookupError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

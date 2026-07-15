@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -15,6 +16,7 @@ from timezonefinder import TimezoneFinder
 
 from flight_forecaster.catalog import AirlineProfile, comparison_airlines, get_airline_profile
 from flight_forecaster.context import ContextProvider, PredictionContext
+from flight_forecaster.details import DetailProvider
 from flight_forecaster.features import build_ontime_features, build_price_features
 from flight_forecaster.route_info import (
     Airport,
@@ -25,19 +27,27 @@ from flight_forecaster.route_info import (
     estimate_route,
 )
 from flight_forecaster.schemas import (
+    BilingualText,
     BilingualWarning,
     ComparisonOffer,
     ComparisonRankings,
     ComparisonRequest,
     ComparisonResponse,
+    ContextDetailRequest,
     ContextSignal,
     NewsArticle,
+    NewsDetailResponse,
     NewsSignal,
     OnTimePrediction,
     OnTimeRequest,
+    OperationsEvent,
+    OperationsMetric,
+    OperationsSignal,
+    OperationsSnapshot,
     PredictionContextResponse,
     PricePrediction,
     PriceRequest,
+    WeatherDetailResponse,
 )
 from flight_forecaster.training import ARTIFACT_FILENAME, SCHEMA_VERSION
 
@@ -83,6 +93,7 @@ class PredictionService:
         *,
         context_provider: ContextProvider | None = None,
         airport_resolver: AirportResolver | None = None,
+        detail_provider: DetailProvider | None = None,
     ) -> None:
         self.model_dir = Path(model_dir)
         artifact_path = self.model_dir / ARTIFACT_FILENAME
@@ -99,6 +110,7 @@ class PredictionService:
             airlabs_api_key=os.getenv("AIRLABS_API_KEY"),
             context_priors=self.bundle.get("context_priors"),
         )
+        self.detail_provider = detail_provider or DetailProvider(self.context_provider)
         if airport_resolver is not None:
             self.airport_resolver = airport_resolver
         elif self.context_provider.external_context_enabled:
@@ -133,10 +145,11 @@ class PredictionService:
             icao_code=route.origin.icao or None,
             origin_name=route.origin.name,
             destination_name=route.destination.name,
+            origin_country=route.origin.country,
         )
 
     @staticmethod
-    def _departure_at_origin(value: datetime, airport: Airport) -> tuple[datetime, str]:
+    def _airport_timezone(airport: Airport) -> tuple[ZoneInfo, str]:
         timezone_name = _timezone_finder().timezone_at(
             lng=airport.longitude,
             lat=airport.latitude,
@@ -151,6 +164,11 @@ class PredictionService:
             raise RouteLookupError(
                 f"无法加载 {airport.iata} 的时区 / unable to load airport timezone"
             ) from exc
+        return timezone, timezone_name
+
+    @staticmethod
+    def _departure_at_origin(value: datetime, airport: Airport) -> tuple[datetime, str]:
+        timezone, timezone_name = PredictionService._airport_timezone(airport)
 
         if value.tzinfo is None or value.utcoffset() is None:
             departure = value.replace(tzinfo=timezone, fold=0)
@@ -332,6 +350,40 @@ class PredictionService:
                 summary_en=value.summary_en,
             )
 
+        def operations_snapshot(value: Any) -> OperationsSnapshot:
+            return OperationsSnapshot(
+                value=value.value,
+                status=value.status,
+                source=value.source,
+                observed_at=value.observed_at,
+                summary_zh=value.summary_zh,
+                summary_en=value.summary_en,
+                method=value.method,
+                data_tier=value.data_tier,
+                applicability=value.applicability,
+                metrics=[
+                    OperationsMetric(key=metric.key, value=metric.value, unit=metric.unit)
+                    for metric in value.metrics
+                ],
+                events=[
+                    OperationsEvent(
+                        event_type=event.event_type,
+                        severity=event.severity,
+                        reason=event.reason,
+                        start_at=event.start_at,
+                        end_at=event.end_at,
+                        scope=event.scope,
+                    )
+                    for event in value.events
+                ],
+                fallback_reason=value.fallback_reason,
+                window_start=value.window_start,
+                window_end=value.window_end,
+                sample_size=value.sample_size,
+                sample_limit=value.sample_limit,
+                sample_truncated=value.sample_truncated,
+            )
+
         articles = [
             NewsArticle(
                 title=article.title,
@@ -346,7 +398,14 @@ class PredictionService:
         ]
         return PredictionContextResponse(
             weather=signal(context.weather),
-            operations=signal(context.operations),
+            operations=OperationsSignal(
+                **operations_snapshot(context.operations).model_dump(),
+                current_snapshot=(
+                    operations_snapshot(context.operations.current_snapshot)
+                    if context.operations.current_snapshot is not None
+                    else None
+                ),
+            ),
             news=NewsSignal(
                 value=context.news.value,
                 status=context.news.status,
@@ -564,6 +623,113 @@ class PredictionService:
                 ),
             ),
             model_version=self.model_version,
+        )
+
+    def weather_detail(self, request: ContextDetailRequest) -> WeatherDetailResponse:
+        route = self._route(request.origin, request.destination)
+        departure, origin_timezone = self._departure_at_origin(
+            request.departure_time,
+            route.origin,
+        )
+        destination_zone, destination_timezone = self._airport_timezone(route.destination)
+        arrival = (
+            departure.astimezone(UTC) + timedelta(minutes=route.duration_minutes)
+        ).astimezone(destination_zone)
+        generated_at = datetime.now(UTC)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            origin_future = executor.submit(
+                self.detail_provider.airport_weather,
+                route.origin,
+                origin_timezone,
+                departure,
+                generated_at=generated_at,
+            )
+            destination_future = executor.submit(
+                self.detail_provider.airport_weather,
+                route.destination,
+                destination_timezone,
+                arrival,
+                generated_at=generated_at,
+            )
+            origin_weather = origin_future.result()
+            destination_weather = destination_future.result()
+        return WeatherDetailResponse(
+            origin=route.origin.iata,
+            destination=route.destination.iata,
+            departure_time=departure,
+            estimated_arrival_time=arrival,
+            duration_minutes=route.duration_minutes,
+            generated_at=generated_at,
+            origin_weather=origin_weather,
+            destination_weather=destination_weather,
+            notice=BilingualText(
+                zh=(
+                    "到达时刻由航线模型估算；自动 METAR/TAF 解读仅供参考，"
+                    "不能替代官方航空气象简报。"
+                ),
+                en=(
+                    "Arrival time is route-model estimated. Automated METAR/TAF "
+                    "interpretation is informational and does not replace an official "
+                    "aviation-weather briefing."
+                ),
+            ),
+        )
+
+    def news_detail(self, request: ContextDetailRequest) -> NewsDetailResponse:
+        route = self._route(request.origin, request.destination)
+        departure, _ = self._departure_at_origin(request.departure_time, route.origin)
+        generated_at = datetime.now(UTC)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            detail_future = executor.submit(
+                self.detail_provider.news,
+                route.origin.iata,
+                route.destination.iata,
+                origin_name=route.origin.name,
+                destination_name=route.destination.name,
+                generated_at=generated_at,
+            )
+            model_future = executor.submit(
+                self.context_provider._news,  # noqa: SLF001
+                route.origin.iata,
+                route.destination.iata,
+                departure,
+                generated_at,
+                origin_name=route.origin.name,
+                destination_name=route.destination.name,
+            )
+            snapshot = detail_future.result()
+            model_signal = model_future.result()
+        attenuation = self.detail_provider.departure_attenuation(departure, generated_at)
+        return NewsDetailResponse(
+            origin=route.origin.iata,
+            destination=route.destination.iata,
+            departure_time=departure,
+            generated_at=generated_at,
+            article_count=len(snapshot.articles),
+            articles=list(snapshot.articles),
+            route_raw_risk=snapshot.route_raw_risk,
+            departure_attenuation_factor=attenuation,
+            model_effect=model_signal.value,
+            model_signal=ContextSignal(
+                value=model_signal.value,
+                status=model_signal.status,
+                source=model_signal.source,
+                observed_at=model_signal.observed_at,
+                summary_zh=model_signal.summary_zh,
+                summary_en=model_signal.summary_en,
+            ),
+            metadata=snapshot.metadata,
+            summary=snapshot.summary,
+            indexed_time_notice=BilingualText(
+                zh=(
+                    "文章时间是 GDELT 观察/索引时间，不保证是媒体发布时间；"
+                    "标题保留来源语言。"
+                ),
+                en=(
+                    "Article times are GDELT observed/indexed times, not guaranteed "
+                    "publisher timestamps; titles remain in their source language."
+                ),
+            ),
         )
 
     def model_info(self) -> dict[str, Any]:

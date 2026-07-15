@@ -93,11 +93,17 @@ NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预
 | --- | --- | --- |
 | 全球机场坐标 | [OurAirports public-domain data](https://ourairports.com/data/) | 内置主要全球机场目录；未知代码返回校验错误 |
 | 当前天气与预报 | [Open-Meteo](https://open-meteo.com/en/docs) 当前模型天气/小时预报与 [NOAA Aviation Weather](https://aviationweather.gov/data/api/) METAR/TAF | 同月训练平均值或季节模型先验，并明确标为 `proxy` |
-| 机场运行 | 配置免费 AirLabs key 后使用 [AirLabs schedules](https://airlabs.co/docs/schedules) | [ADSB.lol](https://api.adsb.lol/) 密度代理，再回退机场/时段先验 |
+| 机场运行 | 美国机场使用无需密钥的 [FAA NAS Status](https://nasstatus.faa.gov/) 当前事件；其他机场配置免费 AirLabs key 后使用 [AirLabs schedules](https://airlabs.co/docs/schedules) | [ADSB.lol](https://www.adsb.lol/docs/open-data/api/) 当前飞机密度代理；目标时刻不适用时回退训练平均值/合成先验 |
 | 时事新闻 | 无需密钥的 [GDELT DOC 2.0](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) 近七日中断类新闻（`DateDesc`）；DOC 失败时使用官方 [GAL 滚动 RSS](https://blog.gdeltproject.org/announcing-the-gdelt-article-list-rss-feed/) | 先返回不超过 6 小时、降低影响且标为 `historical` 的航线缓存；无缓存时返回中性值且不虚构文章 |
 | 航线航司 | AirLabs route records | 60 家全球航司的模型比较场景，并标为 `model_scenario` |
 
 GDELT DOC 属于近实时来源，全球数据通常约每 15 分钟更新；GAL RSS 每分钟更新并滚动保留最近约 15 分钟的链接。服务按航线缓存成功结果 15 分钟以减少重复请求。文章字段中的时间表示 GDELT 观察 / 索引时间，不保证是媒体的准确发布时间；标题保持来源语言。使用或再分发 GDELT 数据时须注明并链接 [GDELT Project](https://www.gdeltproject.org/about.html)。
+
+机场运行必须区分“当前快照”和“适用于目标起飞时刻的模型信号”。FAA NAS Status 是美国当前运行事件的权威来源，但机场没有出现在事件列表中只表示没有列出的当前 FAA 事件；不能推导出所有航班正常。范围有限的 `freeForm` 限制不能当作完整机场关闭。FAA 事件只有在时间范围覆盖计划起飞时才可进入目标信号。
+
+AirLabs 免费 schedules 结果按当前或目标时刻前后 90 分钟筛选，并受最多 50 行、免费配额和提供方可见计划时段限制，因此是实际航班样本而不是完整机场统计。ADSB.lol 只统计机场坐标附近的飞机并生成密度代理；它不提供真实延误、取消、机场容量或官方地面管制数据，且只有计划起飞距查询时刻不超过 90 分钟时才允许作为目标信号。其他情况继续使用明确标记的训练平均值/合成先验。
+
+天气详情接口在出发机场计划起飞时刻和到达机场模型估算抵达时刻分别查询 Open-Meteo，并显示当前条件、目标小时、前后 12 小时趋势和风险拆解；可用时还显示 NOAA METAR/TAF 原始报文与自动解释。新闻详情接口最多显示最近 7 天的 20 篇匹配文章及分类、命中词和时效权重。网页分别每 10 分钟和 15 分钟刷新，但服务端同样使用短期缓存以遵守免费来源的负载与配额边界。
 
 详细的状态、缓存、严格政策字段和失败回退语义见 [`runtime-context.md`](runtime-context.md)。免费服务的配额、覆盖和条款可能变化，公开部署前应重新核对官方说明。
 

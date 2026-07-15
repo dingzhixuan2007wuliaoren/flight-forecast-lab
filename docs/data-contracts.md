@@ -117,12 +117,29 @@ else:
 
 ### 响应结构
 
-- `context.weather`、`context.operations`、`context.news`：自动获取的三个上下文信号，均含 `[0, 1]` 数值、来源、获取时间、双语摘要和明确状态；新闻还可含最多五篇去重后的来源文章。
+- `context.weather`、`context.operations`、`context.news`：自动获取的三个上下文信号，均含 `[0, 1]` 数值、来源、获取时间、双语摘要和明确状态；新闻还可含最多五篇去重后的来源文章。`context.operations` 顶层是实际进入目标起飞时刻模型的信号，不能与嵌套的查询时刻 `current_snapshot` 混为一谈。
 - `offers`：逐航司、逐支持舱位的模型估价、80% 区间、行程时长、准点概率、风险等级、行李/学生/改签/退票状态及学生验证说明；`cabin_status=catalog_scenario` 明确表示舱位来自比较目录而非实时报价确认。
 - `rankings.direct_first`、`rankings.lowest_price`、`rankings.student_first`：引用 `offers[].id` 的完整排序。
 - `departure_time` / `departure_timezone`：服务按出发机场坐标解析后的带偏移时间和 IANA 时区；`warnings`：中英文限制说明；`model_version`：本次比较所用模型版本。
 
 上下文状态只允许 `live`、`forecast`、`proxy`、`historical`、`neutral` 或 `unavailable`。`route_status=provider_confirmed` 表示免费航线提供方确认该航司经营直飞航线；`model_scenario` 是一站中转比较场景，不能解释为真实可售航班。比较始终保留全球目录中的所有航司；提供方返回的其他航司也会追加到结果中。
+
+`context.operations` 与可选的 `context.operations.current_snapshot` 使用以下解释字段：
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `value` / `status` / `source` / `observed_at` | 通用信号字段 | `[0,1]` 风险/压力、来源状态、来源名与观测/获取时间 |
+| `method` | string | 计算方法，例如 FAA 事件、实际出港样本、飞机密度、训练平均值或合成先验 |
+| `data_tier` | string | 证据层级，例如权威当前事件、实际航班样本、当前代理或先验 |
+| `applicability` | string | `current_only`、`target_departure` 或 `target_departure_prior` 等时间适用范围 |
+| `metrics[]` | array | `key`、数值/文本 `value` 与可选 `unit`；例如事件数、延误样本数或飞机数 |
+| `events[]` | array | 事件类型、`[0,1]` 严重度、原因、起止时间和可选影响范围 |
+| `window_start` / `window_end` | datetime / null | 事件或样本用于解释的时间窗口 |
+| `sample_size` / `sample_limit` / `sample_truncated` | integer / integer / boolean | 样本量、提供方行数上限与是否可能截断 |
+| `fallback_reason` | string / null | 当前来源缺失或降级的机器可读原因组合 |
+| `current_snapshot` | object / null | 仅顶层目标信号拥有；查询时刻的独立快照，不保证适用于目标起飞时刻 |
+
+美国机场的 FAA `freeForm` 限制只作为低严重度 `restriction` 当前事件，不能当作全机场关闭，也不会进入目标信号。ADSB.lol 的 `traffic_density` 只代表附近飞机密度，不能解释为真实延误率、取消率或官方机场管制状态。AirLabs 免费出港样本以目标/当前时刻前后 90 分钟过滤，最多请求 50 行；`sample_truncated=true` 时尤其不得把它当作完整机场统计。
 
 `context.news.articles[]` 的字段语义如下：
 
@@ -142,6 +159,30 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 
 学生优先排序依次比较：最低模型价格、免费托运行李、已确认实际学生折扣、免费改签/退票、年龄与身份验证门槛。`program_available` 本身不满足“实际折扣”条件，只在最后一级使用其公开年龄和验证信息。由于价格是第一排序键，后续条件主要用于同价时打破平局。
 
+## 上下文详情 API
+
+两个详情接口都使用与比较接口相同的三字段请求：`origin`、`destination`、`departure_time`。无偏移时间按出发机场当地时区解释；时间必须在未来且不超过 370 天。页面路由 `GET /details/weather` 与 `GET /details/news` 不直接返回数据，而是读取查询参数并调用下列 API。
+
+### `POST /v1/context/weather-detail`
+
+响应包含航线、带时区的计划起飞、根据航线模型时长估算的抵达时刻、生成时间，以及 `origin_weather` 和 `destination_weather`。每个机场对象包含：
+
+- 机场代码/名称、可选 ICAO、IANA 时区和目标时刻；
+- `current` 与 `target` 天气：温度、WMO 天气代码及双语描述、风速、阵风、降水、降水概率、能见度、风险值；
+- 目标时刻前后 12 小时最多 25 个 `hourly` 点；
+- 最多五项 `risk_components`：天气代码、风、阵风、降水、能见度；
+- 当前实现最多返回一条最近有效的 `METAR` 和一条适用于目标时刻的 `TAF`；每条含原始报文、签发/有效时间、风险和保守的双语解释（响应模式为未来扩展保留最多四条容量）；
+- `aviation_metadata`：明确区分 NOAA 报告可用、无适用报告、缺少 ICAO、部分产品失败或服务不可用，并给出来源、时间和双语原因；
+- `metadata`：总体天气风险的状态、实际主导来源、观测时间、有效期及可选双语回退原因。当适用的 NOAA 报告风险更高时，总体风险和这些时间字段都以该报告为准。
+
+到达时刻是模型估计，不是实际航班计划；自动 METAR/TAF 解读不能替代官方航空气象简报。页面每 10 分钟自动刷新，并提供手动刷新。
+
+### `POST /v1/context/news-detail`
+
+响应包含航线、计划起飞、生成时间、最多 20 篇文章、`route_raw_risk`、`departure_attenuation_factor`、`model_effect`、`model_signal`、元数据、双语摘要与 GDELT 索引时间提示。`route_raw_risk` 是详情页较大文章集的解释性分数；`model_effect` 与 `model_signal.value` 是主预测上下文实际使用的新闻输入，`model_signal` 还给出其状态、来源、观测时间和双语摘要。每篇文章包含原始 `title`、清理后的 HTTP(S) `url`、来源域名、可选语言、`indexed_at`、风险 `category`、最多 12 个 `matched_risk_terms`、`raw_score`、`recency_factor` 和 `weighted_score`。
+
+允许的类别为 `airport_closure`、`airspace_conflict`、`labor_strike`、`extreme_weather`、`cancellation_delay`、`security_cyber` 与 `other_disruption`。文章时间是 GDELT 观察/索引时间，不保证是媒体发布时间；标题保留来源语言。页面每 15 分钟自动刷新，并提供手动刷新。
+
 ## 服务辅助端点
 
 | 方法与路径 | 用途 |
@@ -149,6 +190,10 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 | `GET /health` | 进程与模型加载健康状态；不代表模型仍然准确 |
 | `GET /v1/model-info` | 模型版本、训练来源、时间和可用任务信息 |
 | `POST /v1/compare` | 用三个输入生成多航司、多舱位结果与三类完整排序 |
+| `GET /details/weather` | 中英双语天气详情页面；查询参数由主页生成 |
+| `GET /details/news` | 中英双语新闻详情页面；查询参数由主页生成 |
+| `POST /v1/context/weather-detail` | 出发与到达机场的当前/目标天气、趋势和 METAR/TAF 详情 |
+| `POST /v1/context/news-detail` | 最近七日最多 20 篇中断新闻及文章级风险解释 |
 
 健康响应不得暴露本地绝对路径、密钥或原始训练记录。模型信息应能让调用方识别是否误用了 `synthetic` 演示模型。
 

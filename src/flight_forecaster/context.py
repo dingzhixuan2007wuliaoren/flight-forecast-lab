@@ -13,7 +13,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from time import monotonic
@@ -29,8 +29,13 @@ NOAA_MAX_LEAD_HOURS = 30
 CURRENT_WEATHER_MAX_LEAD_HOURS = 2
 CURRENT_WEATHER_MAX_AGE_MINUTES = 90
 METAR_MAX_AGE_HOURS = 2
-CURRENT_OPERATIONS_MAX_LEAD_HOURS = 6
+ADSB_MODEL_MAX_LEAD_MINUTES = 90
+ADSB_MAX_AGE_MINUTES = 5
+OPERATIONS_SAMPLE_WINDOW_MINUTES = 90
+FAA_CACHE_TTL_SECONDS = 90.0
+AIRLABS_FREE_SAMPLE_LIMIT = 50
 GDELT_REQUEST_TIMEOUT_SECONDS = 15.0
+GDELT_RSS_REQUEST_TIMEOUT_SECONDS = 8.0
 NEWS_CACHE_TTL_SECONDS = 900.0
 NEWS_STALE_TTL_SECONDS = 21_600.0
 NEWS_FAILURE_TTL_SECONDS = 60.0
@@ -44,6 +49,7 @@ NOAA_METAR_URL = "https://aviationweather.gov/api/data/metar"
 AIRLABS_SCHEDULES_URL = "https://airlabs.co/api/v9/schedules"
 AIRLABS_ROUTES_URL = "https://airlabs.co/api/v9/routes"
 ADSB_LOL_URL = "https://api.adsb.lol/v2/lat/{latitude}/lon/{longitude}/dist/100"
+FAA_NAS_STATUS_URL = "https://nasstatus.faa.gov/api/airport-events"
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 GDELT_GAL_RSS_URL = (
     "https://storage.googleapis.com/data.gdeltproject.org/gdeltv3/gal/feed.rss"
@@ -119,8 +125,90 @@ class WeatherSignal(ContextSignal):
 
 
 @dataclass(frozen=True, slots=True)
+class OperationsMetric:
+    """A serializable measurement used to explain an operations score."""
+
+    key: str
+    value: float | int | str | bool
+    unit: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OperationsEvent:
+    """A structured airport event reported by an operations provider."""
+
+    event_type: str
+    severity: float
+    reason: str = ""
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    scope: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "severity", _bounded(self.severity))
+        if self.start_at is not None:
+            object.__setattr__(self, "start_at", _utc(self.start_at))
+        if self.end_at is not None:
+            object.__setattr__(self, "end_at", _utc(self.end_at))
+
+
+@dataclass(frozen=True, slots=True)
+class OperationsSnapshot(ContextSignal):
+    """Current airport conditions kept separate from a future prediction signal."""
+
+    method: str = "unknown"
+    data_tier: str = "unknown"
+    applicability: str = "current_only"
+    metrics: tuple[OperationsMetric, ...] = ()
+    events: tuple[OperationsEvent, ...] = ()
+    fallback_reason: str | None = None
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    sample_size: int = 0
+    sample_limit: int | None = None
+    sample_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        ContextSignal.__post_init__(self)
+        object.__setattr__(self, "metrics", tuple(self.metrics))
+        object.__setattr__(self, "events", tuple(self.events))
+        if self.window_start is not None:
+            object.__setattr__(self, "window_start", _utc(self.window_start))
+        if self.window_end is not None:
+            object.__setattr__(self, "window_end", _utc(self.window_end))
+        object.__setattr__(self, "sample_size", max(0, int(self.sample_size)))
+        if self.sample_limit is not None:
+            object.__setattr__(self, "sample_limit", max(1, int(self.sample_limit)))
+
+
+@dataclass(frozen=True, slots=True)
 class OperationsSignal(ContextSignal):
-    """Origin-airport operating pressure, where 1 is highly congested."""
+    """Prediction-appropriate origin pressure plus a separate current snapshot."""
+
+    method: str = "model_prior"
+    data_tier: str = "historical_prior"
+    applicability: str = "target_departure"
+    current_snapshot: OperationsSnapshot | None = None
+    metrics: tuple[OperationsMetric, ...] = ()
+    events: tuple[OperationsEvent, ...] = ()
+    fallback_reason: str | None = None
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    sample_size: int = 0
+    sample_limit: int | None = None
+    sample_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        ContextSignal.__post_init__(self)
+        object.__setattr__(self, "metrics", tuple(self.metrics))
+        object.__setattr__(self, "events", tuple(self.events))
+        if self.window_start is not None:
+            object.__setattr__(self, "window_start", _utc(self.window_start))
+        if self.window_end is not None:
+            object.__setattr__(self, "window_end", _utc(self.window_end))
+        object.__setattr__(self, "sample_size", max(0, int(self.sample_size)))
+        if self.sample_limit is not None:
+            object.__setattr__(self, "sample_limit", max(1, int(self.sample_limit)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,9 +311,11 @@ class ContextProvider:
         self._cache: dict[tuple[Any, ...], tuple[float, PredictionContext]] = {}
         self._route_cache: dict[tuple[str, str], tuple[float, set[str] | None]] = {}
         self._noaa_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._faa_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._news_cache: dict[tuple[str, ...], tuple[float, NewsSignal]] = {}
         self._news_failure_cache: dict[tuple[str, ...], tuple[float, NewsSignal]] = {}
         self._news_locks = tuple(threading.Lock() for _ in range(16))
+        self._faa_lock = threading.Lock()
         self._cache_lock = threading.Lock()
 
     def resolve(
@@ -239,6 +329,7 @@ class ContextProvider:
         icao_code: str | None = None,
         origin_name: str | None = None,
         destination_name: str | None = None,
+        origin_country: str | None = None,
     ) -> PredictionContext:
         """Return a complete context; provider outages never escape this method."""
 
@@ -261,15 +352,20 @@ class ContextProvider:
         key = (
             origin_code,
             destination_code,
-            departure.replace(minute=0, second=0, microsecond=0),
+            departure.replace(second=0, microsecond=0),
             round(latitude_value, 4),
             round(longitude_value, 4),
             airport_type,
             icao,
             origin_name,
             destination_name,
+            self._country_key(origin_country),
         )
-        found, cached = self._cache_get(self._cache, key)
+        found, cached = self._cache_get(
+            self._cache,
+            key,
+            ttl_seconds=FAA_CACHE_TTL_SECONDS,
+        )
         if found:
             return cached
 
@@ -291,6 +387,7 @@ class ContextProvider:
                     longitude_value,
                     airport_type,
                     resolved_at,
+                    origin_country,
                 )
                 news_future = pool.submit(
                     self._news,
@@ -664,72 +761,434 @@ class ContextProvider:
         longitude: float,
         airport_type: str,
         fetched_at: datetime,
+        origin_country: str | None = None,
     ) -> OperationsSignal:
-        lead = departure - fetched_at
-        if not timedelta(hours=-2) <= lead <= timedelta(
-            hours=CURRENT_OPERATIONS_MAX_LEAD_HOURS
-        ):
-            return self._operations_prior(origin, departure, airport_type, fetched_at)
+        departure_utc = _utc(departure)
+        fetched_at = _utc(fetched_at)
+        prior = self._operations_prior(origin, departure, airport_type, fetched_at)
+        current_snapshot: OperationsSnapshot | None = None
+        target_snapshot: OperationsSnapshot | None = None
+        fallback_reasons: list[str] = []
+        is_us_airport = self._is_us_country(origin_country)
 
-        if self.airlabs_api_key:
+        if is_us_airport:
             try:
-                payload = self._get_json(
-                    AIRLABS_SCHEDULES_URL,
-                    {"api_key": self.airlabs_api_key, "dep_iata": origin},
+                current_snapshot, target_snapshot = self._faa_operations_snapshots(
+                    origin,
+                    departure_utc,
+                    fetched_at,
                 )
-                rows = payload.get("response") if isinstance(payload, dict) else None
-                if isinstance(rows, list) and rows:
-                    delayed = 0
-                    for row in rows:
-                        if not isinstance(row, dict):
-                            continue
-                        status = str(row.get("status", "")).lower()
-                        delays = (row.get("dep_delayed", 0), row.get("arr_delayed", 0))
-                        has_delay = any(self._number(value) >= 15 for value in delays)
-                        delayed += int(has_delay or status in {"delayed", "cancelled"})
-                    delayed_fraction = delayed / len(rows)
-                    pressure = _bounded(0.55 * min(len(rows) / 60, 1) + 0.45 * delayed_fraction)
-                    return OperationsSignal(
-                        pressure,
-                        "live",
-                        "airlabs_schedules",
-                        fetched_at,
-                        f"AirLabs 返回 {len(rows)} 个出港班次；运行压力 {pressure:.0%}。",
-                        (
-                            f"AirLabs returned {len(rows)} departures; "
-                            f"operating pressure {pressure:.0%}."
-                        ),
-                    )
             except Exception:
-                pass
+                fallback_reasons.append("faa_nas_status_unavailable")
 
-        try:
-            url = ADSB_LOL_URL.format(
-                latitude=round(latitude, 4), longitude=round(longitude, 4)
+        if current_snapshot is None and self.airlabs_api_key:
+            try:
+                airlabs_current, airlabs_target = self._airlabs_operations_snapshots(
+                    origin,
+                    departure_utc,
+                    fetched_at,
+                )
+                current_snapshot = airlabs_current
+                target_snapshot = target_snapshot or airlabs_target
+                if airlabs_current is None:
+                    fallback_reasons.append("airlabs_no_current_departure_sample")
+            except Exception:
+                fallback_reasons.append("airlabs_schedules_unavailable")
+        elif current_snapshot is None:
+            fallback_reasons.append("airlabs_api_key_missing")
+
+        if current_snapshot is None:
+            try:
+                current_snapshot = self._adsb_operations_snapshot(
+                    latitude,
+                    longitude,
+                    airport_type,
+                    fetched_at,
+                )
+            except Exception:
+                fallback_reasons.append("adsb_lol_unavailable")
+
+        fallback_reason = ";".join(dict.fromkeys(fallback_reasons)) or None
+        if current_snapshot is not None and fallback_reason:
+            current_snapshot = replace(
+                current_snapshot,
+                fallback_reason=fallback_reason,
             )
-            payload = self._get_json(url, {})
-            aircraft = payload.get("ac") if isinstance(payload, dict) else None
-            if not isinstance(aircraft, list):
-                raise LookupError("ADSB.lol aircraft list missing")
-            denominator = {
-                "large_airport": 75,
-                "medium_airport": 35,
-                "small_airport": 15,
-            }.get(airport_type, 35)
-            pressure = _bounded(0.05 + 0.95 * min(len(aircraft) / denominator, 1))
-            return OperationsSignal(
-                pressure,
-                "proxy",
-                "adsb_lol",
+
+        if target_snapshot is not None:
+            return self._operations_signal_from_snapshot(
+                target_snapshot,
+                current_snapshot,
+                fallback_reason,
+            )
+
+        lead_minutes = abs((departure_utc - fetched_at).total_seconds()) / 60
+        if (
+            current_snapshot is not None
+            and current_snapshot.source == "adsb_lol"
+            and lead_minutes <= ADSB_MODEL_MAX_LEAD_MINUTES
+        ):
+            target = replace(
+                current_snapshot,
+                applicability="target_departure",
+                window_start=departure_utc
+                - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+                window_end=departure_utc
+                + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            )
+            return self._operations_signal_from_snapshot(
+                target,
+                current_snapshot,
+                fallback_reason,
+            )
+
+        return replace(
+            prior,
+            current_snapshot=current_snapshot,
+            fallback_reason=fallback_reason,
+        )
+
+    def _faa_operations_snapshots(
+        self,
+        origin: str,
+        departure: datetime,
+        fetched_at: datetime,
+    ) -> tuple[OperationsSnapshot, OperationsSnapshot | None]:
+        found, rows = self._cache_get(
+            self._faa_cache,
+            "global",
+            ttl_seconds=FAA_CACHE_TTL_SECONDS,
+        )
+        if not found:
+            with self._faa_lock:
+                found, rows = self._cache_get(
+                    self._faa_cache,
+                    "global",
+                    ttl_seconds=FAA_CACHE_TTL_SECONDS,
+                )
+                if not found:
+                    payload = self._get_json(FAA_NAS_STATUS_URL, {})
+                    if not isinstance(payload, list) or not all(
+                        isinstance(row, dict) for row in payload
+                    ):
+                        raise LookupError("FAA airport event list missing")
+                    rows = payload
+                    self._cache_set(self._faa_cache, "global", rows)
+
+        airport_row = next(
+            (
+                row
+                for row in rows
+                if self._airport_code(row.get("airportId")) == origin
+            ),
+            None,
+        )
+        events = self._faa_events(airport_row or {})
+        active_events = tuple(
+            event
+            for event in events
+            if self._operations_event_covers(event, fetched_at, allow_unbounded=True)
+        )
+        current_value = max(
+            (event.severity for event in active_events),
+            default=0.0,
+        )
+        observed_at = self._faa_observed_at(airport_row or {}) or fetched_at
+        metrics = self._faa_metrics(airport_row or {}, events, active_events)
+        if airport_row is None:
+            summary_zh = f"FAA NAS Status 未列出 {origin} 的当前运行事件。"
+            summary_en = f"FAA NAS Status lists no current operating event for {origin}."
+        else:
+            summary_zh = (
+                f"FAA NAS Status 列出 {len(active_events)} 个当前事件；"
+                f"当前运行压力 {current_value:.0%}。"
+            )
+            summary_en = (
+                f"FAA NAS Status lists {len(active_events)} current events; "
+                f"current operating pressure {current_value:.0%}."
+            )
+        current = OperationsSnapshot(
+            current_value,
+            "live",
+            "faa_nas_status",
+            observed_at,
+            summary_zh,
+            summary_en,
+            method="faa_nas_events",
+            data_tier="authoritative_current",
+            applicability="current_only",
+            metrics=metrics,
+            events=active_events,
+            window_start=fetched_at
+            - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            window_end=fetched_at
+            + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+        )
+
+        near_departure = (
+            abs((departure - fetched_at).total_seconds())
+            <= ADSB_MODEL_MAX_LEAD_MINUTES * 60
+        )
+        target_events = tuple(
+            event
+            for event in events
+            if event.event_type != "restriction"
+            and self._operations_event_covers(
+                event,
+                departure,
+                allow_unbounded=near_departure,
+            )
+        )
+        if not target_events:
+            return current, None
+        target_value = max(
+            (event.severity for event in target_events),
+            default=0.0,
+        )
+        target = replace(
+            current,
+            value=target_value,
+            applicability="target_departure",
+            events=target_events,
+            window_start=departure
+            - timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            window_end=departure
+            + timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES),
+            summary_zh=(
+                f"FAA NAS Status 有 {len(target_events)} 个事件适用于目标起飞时刻；"
+                f"运行压力 {target_value:.0%}。"
+            ),
+            summary_en=(
+                f"{len(target_events)} FAA NAS Status events apply to the target "
+                f"departure; operating pressure {target_value:.0%}."
+            ),
+        )
+        return current, target
+
+    def _airlabs_operations_snapshots(
+        self,
+        origin: str,
+        departure: datetime,
+        fetched_at: datetime,
+    ) -> tuple[OperationsSnapshot | None, OperationsSnapshot | None]:
+        payload = self._get_json(
+            AIRLABS_SCHEDULES_URL,
+            {
+                "api_key": self.airlabs_api_key,
+                "dep_iata": origin,
+                "limit": AIRLABS_FREE_SAMPLE_LIMIT,
+            },
+        )
+        rows = payload.get("response") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise LookupError("AirLabs schedules list missing")
+        raw_count = len(rows)
+        parsed_rows: list[tuple[datetime, dict[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_origin = self._airport_code(row.get("dep_iata"))
+            if row_origin and row_origin != origin:
+                continue
+            scheduled = self._airlabs_departure_time(row)
+            if scheduled is not None:
+                parsed_rows.append((scheduled, row))
+
+        window = timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES)
+        current_rows = [
+            row for scheduled, row in parsed_rows if abs(scheduled - fetched_at) <= window
+        ]
+        target_rows = [
+            row for scheduled, row in parsed_rows if abs(scheduled - departure) <= window
+        ]
+        truncated = raw_count >= AIRLABS_FREE_SAMPLE_LIMIT
+        current = (
+            self._airlabs_sample_snapshot(
+                current_rows,
                 fetched_at,
-                f"机场周边发现 {len(aircraft)} 架飞机；以航班密度估算拥堵 {pressure:.0%}。",
-                (
-                    f"{len(aircraft)} aircraft detected near the airport; "
-                    f"traffic-density congestion proxy {pressure:.0%}."
-                ),
+                fetched_at,
+                "current_only",
+                truncated,
             )
-        except Exception:
-            return self._operations_prior(origin, departure, airport_type, fetched_at)
+            if current_rows
+            else None
+        )
+        target = (
+            self._airlabs_sample_snapshot(
+                target_rows,
+                departure,
+                fetched_at,
+                "target_departure",
+                truncated,
+            )
+            if target_rows
+            else None
+        )
+        return current, target
+
+    def _airlabs_sample_snapshot(
+        self,
+        rows: list[dict[str, Any]],
+        center: datetime,
+        fetched_at: datetime,
+        applicability: str,
+        truncated: bool,
+    ) -> OperationsSnapshot:
+        delays = [max(0.0, self._number(row.get("dep_delayed"))) for row in rows]
+        delayed_count = sum(delay >= 15 for delay in delays)
+        cancelled_count = sum(
+            str(row.get("status") or "").strip().lower()
+            in {"cancelled", "canceled"}
+            for row in rows
+        )
+        disrupted_count = sum(
+            delay >= 15
+            or str(row.get("status") or "").strip().lower()
+            in {"cancelled", "canceled"}
+            for row, delay in zip(rows, delays, strict=True)
+        )
+        sample_size = len(rows)
+        disruption_rate = disrupted_count / sample_size
+        mean_departure_delay = sum(delays) / sample_size
+        pressure = _bounded(
+            0.2 * min(sample_size / AIRLABS_FREE_SAMPLE_LIMIT, 1)
+            + 0.55 * disruption_rate
+            + 0.25 * min(mean_departure_delay / 90, 1)
+        )
+        truncation_zh = "（免费接口上限，样本可能被截断）" if truncated else ""
+        truncation_en = " (free-tier limit; sample may be truncated)" if truncated else ""
+        events: list[OperationsEvent] = []
+        if delayed_count:
+            events.append(
+                OperationsEvent(
+                    "sampled_departure_delays",
+                    min(0.85, 0.35 + 0.5 * delayed_count / sample_size),
+                    f"{delayed_count} departures delayed at least 15 minutes",
+                )
+            )
+        if cancelled_count:
+            events.append(
+                OperationsEvent(
+                    "sampled_cancellations",
+                    min(1.0, 0.65 + 0.35 * cancelled_count / sample_size),
+                    f"{cancelled_count} cancelled departures",
+                )
+            )
+        window = timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES)
+        return OperationsSnapshot(
+            pressure,
+            "live",
+            "airlabs_schedules",
+            fetched_at,
+            (
+                f"AirLabs 在±{OPERATIONS_SAMPLE_WINDOW_MINUTES}分钟窗口内有 "
+                f"{sample_size} 个有效出港样本{truncation_zh}；"
+                f"运行压力 {pressure:.0%}。"
+            ),
+            (
+                f"AirLabs has {sample_size} valid departures in the "
+                f"±{OPERATIONS_SAMPLE_WINDOW_MINUTES}-minute window{truncation_en}; "
+                f"operating pressure {pressure:.0%}."
+            ),
+            method="actual_departure_sample",
+            data_tier="actual_flight_sample",
+            applicability=applicability,
+            metrics=(
+                OperationsMetric("sample_size", sample_size, "flights"),
+                OperationsMetric("delayed_departures", delayed_count, "flights"),
+                OperationsMetric("cancelled_departures", cancelled_count, "flights"),
+                OperationsMetric("disruption_rate", round(disruption_rate, 4), "ratio"),
+                OperationsMetric(
+                    "mean_departure_delay",
+                    round(mean_departure_delay, 2),
+                    "minutes",
+                ),
+            ),
+            events=tuple(events),
+            window_start=center - window,
+            window_end=center + window,
+            sample_size=sample_size,
+            sample_limit=AIRLABS_FREE_SAMPLE_LIMIT,
+            sample_truncated=truncated,
+        )
+
+    def _adsb_operations_snapshot(
+        self,
+        latitude: float,
+        longitude: float,
+        airport_type: str,
+        fetched_at: datetime,
+    ) -> OperationsSnapshot:
+        url = ADSB_LOL_URL.format(
+            latitude=round(latitude, 4), longitude=round(longitude, 4)
+        )
+        payload = self._get_json(url, {})
+        aircraft = payload.get("ac") if isinstance(payload, dict) else None
+        if not isinstance(aircraft, list):
+            raise LookupError("ADSB.lol aircraft list missing")
+        denominator = {
+            "large_airport": 75,
+            "medium_airport": 35,
+            "small_airport": 15,
+        }.get(airport_type, 35)
+        pressure = _bounded(0.05 + 0.95 * min(len(aircraft) / denominator, 1))
+        provider_time = _parse_datetime(payload.get("now"))
+        if provider_time is not None:
+            age = fetched_at - provider_time
+            if not timedelta(minutes=-2) <= age <= timedelta(
+                minutes=ADSB_MAX_AGE_MINUTES
+            ):
+                raise LookupError("ADSB.lol snapshot is stale")
+        observed_at = provider_time or fetched_at
+        window = timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES)
+        return OperationsSnapshot(
+            pressure,
+            "proxy",
+            "adsb_lol",
+            observed_at,
+            f"机场周边发现 {len(aircraft)} 架飞机；当前密度代理值 {pressure:.0%}。",
+            (
+                f"{len(aircraft)} aircraft detected near the airport; "
+                f"current traffic-density proxy {pressure:.0%}."
+            ),
+            method="traffic_density",
+            data_tier="current_proxy",
+            applicability="current_only",
+            metrics=(
+                OperationsMetric("aircraft_count", len(aircraft), "aircraft"),
+                OperationsMetric("density_denominator", denominator, "aircraft"),
+            ),
+            window_start=fetched_at - window,
+            window_end=fetched_at + window,
+            sample_size=len(aircraft),
+        )
+
+    @staticmethod
+    def _operations_signal_from_snapshot(
+        target: OperationsSnapshot,
+        current: OperationsSnapshot | None,
+        fallback_reason: str | None,
+    ) -> OperationsSignal:
+        return OperationsSignal(
+            target.value,
+            target.status,
+            target.source,
+            target.observed_at,
+            target.summary_zh,
+            target.summary_en,
+            method=target.method,
+            data_tier=target.data_tier,
+            applicability="target_departure",
+            current_snapshot=current,
+            metrics=target.metrics,
+            events=target.events,
+            fallback_reason=fallback_reason,
+            window_start=target.window_start,
+            window_end=target.window_end,
+            sample_size=target.sample_size,
+            sample_limit=target.sample_limit,
+            sample_truncated=target.sample_truncated,
+        )
 
     def _news(
         self,
@@ -741,6 +1200,8 @@ class ContextProvider:
         origin_name: str | None = None,
         destination_name: str | None = None,
     ) -> NewsSignal:
+        if not self.external_context_enabled:
+            return self._neutral_news(fetched_at, "offline_fallback")
         cache_key = (
             origin,
             destination,
@@ -848,7 +1309,10 @@ class ContextProvider:
             )
             return self._news_from_doc(payload, fetched_at)
         except Exception:
-            rss = self._get_text(GDELT_GAL_RSS_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+            rss = self._get_text(
+                GDELT_GAL_RSS_URL,
+                timeout=GDELT_RSS_REQUEST_TIMEOUT_SECONDS,
+            )
             return self._news_from_rss(
                 rss,
                 origin,
@@ -1136,6 +1600,9 @@ class ContextProvider:
                         "Current operations do not apply to this departure; using the "
                         f"origin-airport training average {risk:.0%}."
                     ),
+                    method="training_average",
+                    data_tier="historical_prior",
+                    applicability="target_departure_prior",
                 )
 
         risk = {
@@ -1159,6 +1626,9 @@ class ContextProvider:
                 "Current airport operations do not apply to this departure; using the "
                 f"synthetic-demo model prior {risk:.0%}."
             ),
+            method="synthetic_prior",
+            data_tier="historical_prior",
+            applicability="target_departure_prior",
         )
 
     def _get_json(
@@ -1363,6 +1833,155 @@ class ContextProvider:
             return 0.48
         return 0.08
 
+    @classmethod
+    def _faa_events(cls, row: dict[str, Any]) -> tuple[OperationsEvent, ...]:
+        specifications = (
+            ("airportClosure", "airport_closure", 1.0),
+            ("groundStop", "ground_stop", 0.95),
+            ("groundDelay", "ground_delay_program", 0.55),
+            ("departureDelay", "departure_delay", 0.35),
+            ("arrivalDelay", "arrival_delay", 0.3),
+            ("deicing", "deicing", 0.45),
+            # FAA uses freeForm for scoped NOTAM restrictions such as closures only
+            # to transient GA aircraft. It is deliberately not an airport closure.
+            ("freeForm", "restriction", 0.08),
+        )
+        events: list[OperationsEvent] = []
+        for field, event_type, base_severity in specifications:
+            item = row.get(field)
+            if not isinstance(item, dict):
+                continue
+            delay = cls._optional_number(item.get("avgDelay"))
+            if delay is None:
+                delay = cls._optional_number(item.get("averageDelay"))
+            severity = base_severity
+            if event_type == "ground_delay_program" and delay is not None:
+                severity = min(0.95, 0.45 + delay / 180)
+            elif event_type == "departure_delay" and delay is not None:
+                severity = min(0.9, 0.3 + delay / 180)
+            elif event_type == "arrival_delay" and delay is not None:
+                severity = min(0.85, 0.25 + delay / 200)
+            reason = next(
+                (
+                    str(item.get(key)).strip()
+                    for key in (
+                        "reason",
+                        "impactingCondition",
+                        "text",
+                        "simpleText",
+                    )
+                    if item.get(key)
+                ),
+                "",
+            )
+            events.append(
+                OperationsEvent(
+                    event_type,
+                    severity,
+                    reason=reason[:500],
+                    start_at=cls._first_datetime(item, "startTime"),
+                    end_at=cls._first_datetime(item, "endTime"),
+                    scope=(
+                        str(item.get("includedFlights") or "").strip()[:500] or None
+                    ),
+                )
+            )
+        return tuple(events)
+
+    @classmethod
+    def _faa_observed_at(cls, row: dict[str, Any]) -> datetime | None:
+        timestamps: list[datetime] = []
+        for value in row.values():
+            if not isinstance(value, dict):
+                continue
+            observed = cls._first_datetime(
+                value,
+                "sourceTimeStamp",
+                "updateTime",
+                "updatedAt",
+                "issuedDate",
+                "createdAt",
+            )
+            if observed is not None:
+                timestamps.append(observed)
+        return max(timestamps, default=None)
+
+    @classmethod
+    def _faa_metrics(
+        cls,
+        row: dict[str, Any],
+        events: tuple[OperationsEvent, ...],
+        active_events: tuple[OperationsEvent, ...],
+    ) -> tuple[OperationsMetric, ...]:
+        metrics: list[OperationsMetric] = [
+            OperationsMetric("event_count", len(events), "events"),
+            OperationsMetric("active_event_count", len(active_events), "events"),
+            OperationsMetric(
+                "restriction_count",
+                sum(event.event_type == "restriction" for event in events),
+                "events",
+            ),
+        ]
+        config = row.get("airportConfig")
+        if isinstance(config, dict):
+            arrival_rate = cls._optional_number(config.get("arrivalRate"))
+            if arrival_rate is not None:
+                metrics.append(
+                    OperationsMetric("arrival_rate", arrival_rate, "aircraft_per_hour")
+                )
+            arrival_runways = str(config.get("arrivalRunwayConfig") or "").strip()
+            departure_runways = str(config.get("departureRunwayConfig") or "").strip()
+            if arrival_runways:
+                metrics.append(
+                    OperationsMetric("arrival_runways", arrival_runways[:100])
+                )
+            if departure_runways:
+                metrics.append(
+                    OperationsMetric("departure_runways", departure_runways[:100])
+                )
+        return tuple(metrics)
+
+    @staticmethod
+    def _operations_event_covers(
+        event: OperationsEvent,
+        moment: datetime,
+        *,
+        allow_unbounded: bool,
+    ) -> bool:
+        if event.start_at is None and event.end_at is None:
+            return allow_unbounded
+        if event.start_at is not None and moment < event.start_at:
+            return False
+        if event.end_at is None:
+            return allow_unbounded
+        return moment <= event.end_at
+
+    @classmethod
+    def _airlabs_departure_time(cls, row: dict[str, Any]) -> datetime | None:
+        return cls._first_datetime(
+            row,
+            "dep_time_utc",
+            "dep_scheduled_utc",
+            "dep_scheduled",
+            "dep_time",
+            "departure_time",
+            "dep_estimated_utc",
+            "dep_actual_utc",
+        )
+
+    @staticmethod
+    def _country_key(value: Any) -> str:
+        return re.sub(r"[^a-z]", "", str(value or "").casefold())[:40]
+
+    @classmethod
+    def _is_us_country(cls, value: Any) -> bool:
+        return cls._country_key(value) in {
+            "us",
+            "usa",
+            "unitedstates",
+            "unitedstatesofamerica",
+        }
+
     @staticmethod
     def _news_cache_name(value: Any) -> str:
         return re.sub(r"\s+", " ", str(value or "").strip()).casefold()[:100]
@@ -1515,10 +2134,12 @@ class ContextProvider:
                 for token in normalized_name.split()
                 if len(token) >= 4 and token not in ignored
             }
-            if any(
-                re.search(rf"(?<!\w){re.escape(token)}(?!\w)", normalized_title)
+            matched = {
+                token
                 for token in meaningful
-            ):
+                if re.search(rf"(?<!\w){re.escape(token)}(?!\w)", normalized_title)
+            }
+            if len(matched) >= 2 or any(len(token) >= 7 for token in matched):
                 return True
         return False
 

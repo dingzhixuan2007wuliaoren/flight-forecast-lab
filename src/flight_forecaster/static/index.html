@@ -633,6 +633,79 @@
       line-height: 1.1;
     }
 
+    .context-basis {
+      margin: -2px 0 5px;
+      color: var(--slate-500);
+      font-size: 8px;
+      font-weight: 720;
+      letter-spacing: 0.035em;
+      text-transform: uppercase;
+    }
+
+    .operations-current {
+      margin-top: 13px;
+      padding: 12px;
+      border: 1px solid var(--blue-100);
+      border-radius: 11px;
+      background: var(--blue-50);
+    }
+
+    .operations-current[hidden] { display: none; }
+
+    .operations-current-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 9px;
+      margin-bottom: 7px;
+      color: var(--navy-800);
+      font-size: 9px;
+      font-weight: 790;
+    }
+
+    .operations-current-summary {
+      margin: 0;
+      color: var(--slate-700);
+      font-size: 9px;
+      line-height: 1.5;
+    }
+
+    .operations-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 8px;
+    }
+
+    .operations-metric {
+      padding: 4px 7px;
+      color: var(--slate-700);
+      border: 1px solid rgba(216, 225, 234, 0.9);
+      border-radius: 7px;
+      background: white;
+      font-size: 8px;
+    }
+
+    .operations-events {
+      display: grid;
+      gap: 4px;
+      margin: 8px 0 0;
+      padding-left: 15px;
+      color: var(--slate-700);
+      font-size: 8px;
+    }
+
+    .operations-current-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 8px;
+      padding-top: 7px;
+      color: var(--slate-500);
+      border-top: 1px solid rgba(216, 225, 234, 0.85);
+      font-size: 7px;
+    }
+
     .context-summary {
       min-height: 39px;
       margin-bottom: 13px;
@@ -696,6 +769,48 @@
       font-size: 8px;
       line-height: 1.5;
     }
+
+    .context-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 13px;
+      padding-top: 11px;
+      border-top: 1px solid var(--slate-100);
+    }
+
+    .context-detail {
+      display: inline-flex;
+      min-height: 34px;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 11px;
+      color: var(--blue-700);
+      border: 1px solid var(--blue-100);
+      border-radius: 9px;
+      background: var(--blue-50);
+      font-size: 10px;
+      font-weight: 760;
+      text-decoration: none;
+      transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease;
+    }
+
+    .context-detail:hover {
+      border-color: #abcaf5;
+      background: #e5f0ff;
+      transform: translateY(-1px);
+    }
+
+    .context-detail:focus-visible { outline: none; box-shadow: var(--focus); }
+
+    .context-detail[aria-disabled="true"] {
+      cursor: not-allowed;
+      color: var(--slate-500);
+      border-color: var(--slate-200);
+      background: var(--slate-50);
+      transform: none;
+    }
+
+    .context-detail svg { width: 13px; height: 13px; }
 
     .response-warning {
       display: none;
@@ -1173,6 +1288,12 @@
               <span id="weather-source" class="context-source">—</span>
               <time id="weather-time">—</time>
             </div>
+            <div class="context-actions">
+              <a id="weather-detail-link" class="context-detail" href="/details/weather" aria-disabled="true" tabindex="-1">
+                <span data-i18n="viewDetails">查看详情</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+              </a>
+            </div>
           </article>
 
           <article class="context-card" aria-labelledby="operations-title">
@@ -1187,12 +1308,26 @@
               </div>
               <span id="operations-status" class="status-badge neutral">—</span>
             </div>
+            <p class="context-basis" data-i18n="plannedBaseline">计划时刻模型输入</p>
             <div id="operations-value" class="context-value">—</div>
             <p id="operations-summary" class="context-summary">—</p>
             <div class="context-meta">
               <span id="operations-source" class="context-source">—</span>
               <time id="operations-time">—</time>
             </div>
+            <section id="operations-current" class="operations-current" hidden aria-labelledby="operations-current-title">
+              <div class="operations-current-head">
+                <span id="operations-current-title" data-i18n="currentSnapshot">机场当前实时状态</span>
+                <span id="operations-current-status" class="status-badge neutral">—</span>
+              </div>
+              <p id="operations-current-summary" class="operations-current-summary">—</p>
+              <div id="operations-current-metrics" class="operations-metrics"></div>
+              <ul id="operations-current-events" class="operations-events"></ul>
+              <div class="operations-current-meta">
+                <span id="operations-current-source">—</span>
+                <time id="operations-current-time">—</time>
+              </div>
+            </section>
           </article>
 
           <article class="context-card" aria-labelledby="news-title">
@@ -1215,6 +1350,12 @@
             </div>
             <p class="news-semantics" data-i18n="newsSemantics">文章时间为 GDELT 观察 / 索引时间，不一定是媒体发布时间；标题保留来源语言。</p>
             <ul id="news-links" class="news-links"></ul>
+            <div class="context-actions">
+              <a id="news-detail-link" class="context-detail" href="/details/news" aria-disabled="true" tabindex="-1">
+                <span data-i18n="viewDetails">查看详情</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+              </a>
+            </div>
           </article>
         </div>
 
@@ -1317,8 +1458,11 @@
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
           weather: "实时 / 预测航空天气",
           operations: "机场运行",
+          plannedBaseline: "计划时刻模型输入",
+          currentSnapshot: "机场当前实时状态",
           news: "近实时航空中断新闻",
           newsSemantics: "文章时间为 GDELT 观察 / 索引时间，不一定是媒体发布时间；标题保留来源语言。",
+          viewDetails: "查看详情",
           offersTitle: "航司与舱位比较",
           directFirst: "直飞优先",
           lowestPrice: "低价优先",
@@ -1424,8 +1568,11 @@
           contextHint: "Every card shows its data status, source, and observation time.",
           weather: "Live / forecast aviation weather",
           operations: "Airport operations",
+          plannedBaseline: "Planned-time model input",
+          currentSnapshot: "Current live airport status",
           news: "Near-real-time aviation disruption news",
           newsSemantics: "Article times are GDELT observed/indexed times, not necessarily publisher timestamps; headlines remain in their source language.",
+          viewDetails: "View details",
           offersTitle: "Airline and cabin comparison",
           directFirst: "Direct first",
           lowestPrice: "Lowest price",
@@ -1531,6 +1678,7 @@
       var currentLanguage = "zh";
       var activeRanking = "direct_first";
       var lastData = null;
+      var sessionKey = "flight-forecast-session-v1";
 
       function byId(id) { return document.getElementById(id); }
       function t(key) { return translations[currentLanguage][key] || key; }
@@ -1547,6 +1695,71 @@
         date.setDate(date.getDate() + 7);
         date.setHours(9, 0, 0, 0);
         byId("departure-time").value = localInputValue(date);
+      }
+
+      function formState() {
+        return {
+          origin: byId("origin").value.trim().toUpperCase(),
+          destination: byId("destination").value.trim().toUpperCase(),
+          departure_time: byId("departure-time").value
+        };
+      }
+
+      function saveSessionState() {
+        try {
+          window.sessionStorage.setItem(sessionKey, JSON.stringify({
+            form: formState(),
+            language: currentLanguage,
+            ranking: activeRanking,
+            comparison: lastData
+          }));
+        } catch (error) { /* storage may be unavailable or full */ }
+      }
+
+      function restoreSessionState() {
+        try {
+          var raw = window.sessionStorage.getItem(sessionKey);
+          if (!raw) return null;
+          var state = JSON.parse(raw);
+          if (!state || typeof state !== "object") return null;
+          var form = state.form || {};
+          if (/^[A-Z]{3}$/.test(String(form.origin || ""))) byId("origin").value = form.origin;
+          if (/^[A-Z]{3}$/.test(String(form.destination || ""))) byId("destination").value = form.destination;
+          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(String(form.departure_time || ""))) {
+            byId("departure-time").value = String(form.departure_time).slice(0, 16);
+          }
+          if (state.comparison && typeof state.comparison === "object") lastData = state.comparison;
+          return state;
+        } catch (error) {
+          return null;
+        }
+      }
+
+      function updateDetailLinks(data) {
+        var state = formState();
+        var origin = safeText(data && data.origin, state.origin).toUpperCase();
+        var destination = safeText(data && data.destination, state.destination).toUpperCase();
+        var departureTime = safeText(data && data.departure_time, state.departure_time);
+        var valid = /^[A-Z]{3}$/.test(origin) && /^[A-Z]{3}$/.test(destination) &&
+          origin !== destination && hasValue(departureTime);
+        [["weather-detail-link", "/details/weather"], ["news-detail-link", "/details/news"]].forEach(function (entry) {
+          var link = byId(entry[0]);
+          if (!valid) {
+            link.href = entry[1];
+            link.setAttribute("aria-disabled", "true");
+            link.tabIndex = -1;
+            return;
+          }
+          var params = new URLSearchParams({
+            origin: origin,
+            destination: destination,
+            departure_time: departureTime,
+            lang: currentLanguage
+          });
+          link.href = entry[1] + "?" + params.toString();
+          link.removeAttribute("aria-disabled");
+          link.tabIndex = 0;
+        });
       }
 
       function asNumber(value) {
@@ -1692,6 +1905,8 @@
         try { window.localStorage.setItem("flight-forecast-language", currentLanguage); } catch (error) { /* storage can be unavailable */ }
         updateRankingDescription();
         if (lastData) renderResponse(lastData, false);
+        else updateDetailLinks(null);
+        saveSessionState();
       }
 
       function setMessage(type, message) {
@@ -1758,9 +1973,94 @@
         byId(kind + "-time").dateTime = safeText(context.observed_at, "");
       }
 
+      function operationsMetricLabel(key) {
+        var labels = {
+          sample_size: ["有效样本", "Valid sample"], delayed_departures: ["延误出港", "Delayed departures"],
+          cancelled_departures: ["取消出港", "Cancelled departures"], disruption_rate: ["中断率", "Disruption rate"],
+          mean_departure_delay: ["平均出港延误", "Mean departure delay"], aircraft_count: ["周边飞机数", "Nearby aircraft"],
+          density_denominator: ["密度基准", "Density baseline"], event_count: ["事件总数", "Total events"],
+          active_event_count: ["当前事件", "Active events"], restriction_count: ["限制事件", "Restrictions"],
+          arrival_rate: ["到港容量", "Arrival rate"], arrival_runways: ["到港跑道", "Arrival runways"],
+          departure_runways: ["离港跑道", "Departure runways"]
+        };
+        return labels[key] ? labels[key][currentLanguage === "zh" ? 0 : 1] : String(key).replace(/_/g, " ");
+      }
+
+      function operationsMetricValue(metric) {
+        if (metric.unit === "ratio" && asNumber(metric.value) !== null) return Math.round(asNumber(metric.value) * 100) + "%";
+        var units = {
+          flights: ["航班", "flights"], aircraft: ["架", "aircraft"], events: ["项", "events"],
+          aircraft_per_hour: ["架/小时", "aircraft/hour"], minutes: ["分钟", "min"]
+        };
+        var unit = units[metric.unit] ? units[metric.unit][currentLanguage === "zh" ? 0 : 1] : metric.unit;
+        return safeText(metric.value) + (hasValue(unit) ? " " + unit : "");
+      }
+
+      function operationsEventLabel(key) {
+        var labels = {
+          sampled_departure_delays: ["抽样出港延误", "Sampled departure delays"], sampled_cancellations: ["抽样取消", "Sampled cancellations"],
+          ground_stop: ["地面停飞", "Ground stop"], ground_delay_program: ["地面延误计划", "Ground delay programme"],
+          closure: ["机场关闭", "Airport closure"], departure_delay: ["出港延误", "Departure delay"],
+          arrival_delay: ["到港延误", "Arrival delay"], restriction: ["运行限制", "Operational restriction"]
+        };
+        return labels[key] ? labels[key][currentLanguage === "zh" ? 0 : 1] : String(key || "").replace(/_/g, " ");
+      }
+
+      function renderOperationsSnapshot(operations) {
+        operations = operations || {};
+        var snapshot = operations.current_snapshot || operations.current || operations.live_snapshot;
+        var section = byId("operations-current");
+        if (!snapshot || typeof snapshot !== "object") {
+          section.hidden = true;
+          return;
+        }
+        section.hidden = false;
+        var status = byId("operations-current-status");
+        status.textContent = localizeStatus(snapshot.status);
+        status.className = statusClass(snapshot.status);
+        var summary = currentLanguage === "zh" ? snapshot.summary_zh : snapshot.summary_en;
+        if (!hasValue(summary)) summary = currentLanguage === "zh" ? snapshot.summary_en : snapshot.summary_zh;
+        byId("operations-current-summary").textContent = safeText(summary);
+        byId("operations-current-source").textContent = hasValue(snapshot.source) ? t("source") + ": " + snapshot.source : t("source") + ": —";
+        byId("operations-current-time").textContent = formatDate(snapshot.observed_at || snapshot.updated_at);
+
+        var metrics = byId("operations-current-metrics");
+        metrics.replaceChildren();
+        var metricSource = snapshot.metrics && typeof snapshot.metrics === "object" ? snapshot.metrics : {};
+        var metricKeys = Array.isArray(metricSource) ? metricSource.map(function (_, index) { return index; }) : Object.keys(metricSource);
+        metricKeys.slice(0, 8).forEach(function (key) {
+          var item = document.createElement("span");
+          item.className = "operations-metric";
+          var metric = metricSource[key];
+          if (metric && typeof metric === "object") {
+            var metricLabel = currentLanguage === "zh" ? metric.label_zh : metric.label_en;
+            if (!hasValue(metricLabel)) metricLabel = operationsMetricLabel(metric.name || metric.key || key);
+            item.textContent = metricLabel + ": " + operationsMetricValue(metric);
+          } else {
+            item.textContent = String(key).replace(/_/g, " ") + ": " + safeText(metric);
+          }
+          metrics.appendChild(item);
+        });
+
+        var events = byId("operations-current-events");
+        events.replaceChildren();
+        (Array.isArray(snapshot.events) ? snapshot.events : []).slice(0, 5).forEach(function (event) {
+          var item = document.createElement("li");
+          if (event && typeof event === "object") {
+            var value = currentLanguage === "zh" ? event.summary_zh : event.summary_en;
+            var eventType = operationsEventLabel(event.event_type || event.type);
+            var reason = safeText(value, event.reason || event.title || "");
+            item.textContent = eventType + (hasValue(reason) && reason !== "—" ? ": " + reason : "");
+          } else {
+            item.textContent = safeText(event);
+          }
+          events.appendChild(item);
+        });
+      }
+
       function safeArticleUrl(value) {
         try {
-          var url = new URL(value, window.location.href);
+          var url = new URL(String(value));
           return (url.protocol === "https:" || url.protocol === "http:") ? url.href : null;
         } catch (error) {
           return null;
@@ -1965,8 +2265,10 @@
 
         renderContext("weather", context.weather);
         renderContext("operations", context.operations);
+        renderOperationsSnapshot(context.operations);
         renderContext("news", context.news);
         renderArticles(context.news && context.news.articles);
+        updateDetailLinks(data);
 
         var warning = warningText(data.warnings);
         byId("response-warning-text").textContent = warning;
@@ -1975,6 +2277,7 @@
 
         byId("results").classList.add("visible");
         byId("initial-state").classList.add("hidden");
+        saveSessionState();
         if (reveal) byId("results").scrollIntoView({ behavior: "smooth", block: "start" });
       }
 
@@ -1988,6 +2291,7 @@
         });
         updateRankingDescription();
         if (lastData) renderOffers(lastData);
+        saveSessionState();
       }
 
       byId("compare-form").addEventListener("submit", async function (event) {
@@ -2030,6 +2334,19 @@
           var start = input.selectionStart;
           input.value = input.value.toUpperCase().replace(/[^A-Z]/g, "");
           if (start !== null) input.setSelectionRange(start, start);
+          saveSessionState();
+        });
+      });
+
+      byId("departure-time").addEventListener("change", saveSessionState);
+
+      ["weather-detail-link", "news-detail-link"].forEach(function (id) {
+        byId(id).addEventListener("click", function (event) {
+          if (event.currentTarget.getAttribute("aria-disabled") === "true") {
+            event.preventDefault();
+            return;
+          }
+          saveSessionState();
         });
       });
 
@@ -2053,10 +2370,18 @@
       });
 
       setDefaultDeparture();
-      selectRanking("direct_first", false);
+      var restoredState = restoreSessionState();
+      var restoredRanking = restoredState && ["direct_first", "lowest_price", "student_first"].indexOf(restoredState.ranking) >= 0 ? restoredState.ranking : "direct_first";
+      selectRanking(restoredRanking, false);
       var storedLanguage = "zh";
-      try { storedLanguage = window.localStorage.getItem("flight-forecast-language") || "zh"; } catch (error) { /* use default */ }
+      try { storedLanguage = window.localStorage.getItem("flight-forecast-language") || (restoredState && restoredState.language) || "zh"; } catch (error) { /* use default */ }
       applyLanguage(storedLanguage);
+      window.addEventListener("pageshow", function () {
+        var pageLanguage = currentLanguage;
+        try { pageLanguage = window.localStorage.getItem("flight-forecast-language") || currentLanguage; } catch (error) { /* keep active language */ }
+        if (pageLanguage !== currentLanguage) applyLanguage(pageLanguage);
+        else if (lastData) renderResponse(lastData, false);
+      });
     }());
   </script>
 </body>
