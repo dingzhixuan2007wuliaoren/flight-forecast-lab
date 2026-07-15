@@ -5,7 +5,7 @@
 ## 通用约定
 
 - 字段名使用 `snake_case`；CSV 使用 UTF-8，推荐处理后数据使用 Parquet。
-- 日期使用 ISO 8601 `YYYY-MM-DD`；单项接口时间戳必须含 UTC 偏移，例如 `2026-08-15T13:30:00-04:00` 或 `2026-08-15T17:30:00Z`。比较接口另允许无偏移墙钟时间，并按出发机场当地时区解释。
+- 日期使用 ISO 8601 `YYYY-MM-DD`；单项预测接口时间戳必须含 UTC 偏移，例如 `2026-08-15T13:30:00-04:00` 或 `2026-08-15T17:30:00Z`。比较接口只要求 `departure_date`，不要求用户猜测航班钟点。
 - 机场使用大写三位字母或数字代码。通常是 IATA 风格代码，但训练数据必须保留代码体系与有效期元数据。
 - 航司代码统一大写；代码复用或历史更名应由带有效日期的映射表处理。
 - 距离统一为公里，时长统一为分钟，票价统一为美元。
@@ -113,16 +113,30 @@ else:
 | --- | --- | --- | --- |
 | `origin` | string | 是 | 起飞机场 IATA 风格三位代码 |
 | `destination` | string | 是 | 到达机场 IATA 风格三位代码；不得与起点相同 |
-| `departure_time` | datetime | 是 | 未来计划时间；无偏移时按出发机场当地时区解释，有偏移时视为绝对时刻；不得超过当前时间后 370 天 |
+| `departure_date` | date | 是 | 不得早于出发机场当地今天、且不超过当地今天后 370 天，ISO 8601 `YYYY-MM-DD`；未来日期使用当地正午；同日查询使用仍满足 30 分钟安全余量的正午，否则使用生成时刻后 30 分钟的同日参考；若安全参考跨入次日则返回 422；这些都不代表真实航班起飞时刻 |
 
 ### 响应结构
 
 - `context.weather`、`context.operations`、`context.news`：自动获取的三个上下文信号，均含 `[0, 1]` 数值、来源、获取时间、双语摘要和明确状态；新闻还可含最多五篇去重后的来源文章。`context.operations` 顶层是实际进入目标起飞时刻模型的信号，不能与嵌套的查询时刻 `current_snapshot` 混为一谈。
-- `offers`：逐航司、逐支持舱位的模型估价、80% 区间、行程时长、准点概率、风险等级、行李/学生/改签/退票状态及学生验证说明；`cabin_status=catalog_scenario` 明确表示舱位来自比较目录而非实时报价确认。
+- `offers`：逐航司、逐支持舱位的模型估价、80% 区间、行程时长、准点概率、风险等级、行李/学生/改签/退票状态及学生验证说明；每个 offer 都有稳定的 `id`，可传入 `/v1/offer-detail`。`cabin_status=catalog_scenario` 明确表示舱位来自比较目录而非实时报价或库存确认。
 - `rankings.direct_first`、`rankings.lowest_price`、`rankings.student_first`：引用 `offers[].id` 的完整排序。
-- `departure_time` / `departure_timezone`：服务按出发机场坐标解析后的带偏移时间和 IANA 时区；`warnings`：中英文限制说明；`model_version`：本次比较所用模型版本。
+- `departure_date`：用户选择的日期；`departure_time` / `departure_timezone`：服务生成的出发机场当地带偏移参考时刻和 IANA 时区。`departure_time_basis=origin_local_noon_model_reference` 表示当地正午参考；`origin_local_remaining_day_model_reference` 表示同日生成时刻后 30 分钟参考。两者仅用于模型、天气与新闻上下文，不是真实航班计划。`schedule_sample_limit=50` 是免费查询行数上限；`schedule_sample_truncated=true` 表示至少一个 AirLabs 端点报告仍有更多行或已返回到上限，真实航班列表可能不完整。`false` 只表示实际查询到的端点未观察到截断信号；端点被跳过、不可用、配额受限或覆盖不足时，仍不能推断航班清单完整。`warnings` 为包含这些限制的中英文说明；`model_version` 为本次比较所用模型版本。
 
-上下文状态只允许 `live`、`forecast`、`proxy`、`historical`、`neutral` 或 `unavailable`。`route_status=provider_confirmed` 表示免费航线提供方确认该航司经营直飞航线；`model_scenario` 是一站中转比较场景，不能解释为真实可售航班。比较始终保留全球目录中的所有航司；提供方返回的其他航司也会追加到结果中。
+上下文状态只允许 `live`、`forecast`、`proxy`、`historical`、`neutral` 或 `unavailable`。`routing_status=provider_direct` 表示提供方确认直达路由，此时 `stops=0`；`model_one_stop` 表示使用该航司不同于起终点的映射枢纽，此时 `stops=1`；`model_route_unresolved` 表示无法诚实确定直达或中转，此时 `stops=null`，不能称为直飞，详情也不得生成航段。`direct_first` 按上述顺序排序，将 unresolved 放在最后。比较始终保留全球目录中的所有航司；提供方返回的其他航司也会追加到结果中。
+
+每个 offer 的航班计划证据使用以下字段：
+
+| 字段 | 语义 |
+| --- | --- |
+| `schedule_status` | `live_schedule`、`recurring_timetable_projection` 或 `model_scenario` |
+| `schedule_source` | `airlabs_schedules`、`airlabs_routes` 或 `model_fallback` |
+| `routing_status` / `stops` | `provider_direct/0`、`model_one_stop/1` 或 `model_route_unresolved/null`；模型内部可用零经停特征计算 unresolved 的 O&D 参考，但公开响应不声称直飞 |
+| `flight_number` | 仅完整 provider 行可返回；模型回退必须为 `null` |
+| `scheduled_departure_local` / `scheduled_arrival_local` | provider 提供并通过时区/先后顺序校验的当地钟点；模型回退为 `null` |
+| `scheduled_departure_utc` / `scheduled_arrival_utc` | 对应的 UTC 绝对时刻；模型回退为 `null` |
+| `provider_flight_status` / `schedule_observed_at` | 可选状态与来源时间；`live_schedule` 的 observed time 是本次抓取时间，`recurring_timetable_projection` 则是 provider route record 的 `updated` 时间，不得统一解释为实时查询观测 |
+
+AirLabs `schedules` 是临近当前时刻的近实时航班计划，只有完整、未来起飞且状态为 scheduled 或未识别状态的行才可标为 `live_schedule`。取消、已起飞、active、landed、departed 或其他明确非未来可选状态的 live identity 会先覆盖相同的 routes 投影，再整体过滤，禁止周期投影将其“复活”。AirLabs `routes` 表达按星期重复的周期时刻表；匹配所选日期后仍必须标为 `recurring_timetable_projection`，不能称为已确认执行的实时航班，且可能航站楼及 last-used 机型不得作为该日期事实返回。两个端点都需要免费 `AIRLABS_API_KEY`，并受免费层时间窗口、配额、每次最多 50 行和全球覆盖限制；任一端点的 `request.has_more` 为真或返回行数达到 50 时，响应将 `schedule_sample_truncated` 标为真。本演示为控制免费配额和调用量不继续分页。
 
 `context.operations` 与可选的 `context.operations.current_snapshot` 使用以下解释字段：
 
@@ -153,19 +167,42 @@ else:
 
 GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败时可使用官方 GAL 滚动 RSS。成功新闻按航线新鲜缓存 15 分钟。实时来源失败时，不超过 6 小时的成功缓存可标为 `historical` 并降低模型影响；没有缓存时必须返回 `neutral`、值 0 和空文章列表。`context.news.observed_at` 表示该新闻上下文快照的获取时间，而不是某篇文章的发布时间。
 
-直飞 offer 使用 `punctuality_basis=direct_leg_model`。一站场景使用 `two_leg_independence_scenario`：其时长在直飞基准上增加 90 分钟，其行程准点率按两个同概率、相互独立航段同时准点的保守场景计算，即 `p_itinerary = p_leg²`。这是显式的模型假设，不是已确认转机方案。
+`provider_direct` 使用 `punctuality_basis=direct_leg_model`。`model_one_stop` 使用 `two_leg_independence_scenario`：总时长由两个经该航司示例枢纽分别估算的航段时长加 90 分钟模型转机组成，其行程准点率按两个同概率、相互独立航段同时准点的保守场景计算，即 `p_itinerary = p_leg²`。无法确定路由时使用 `model_route_unresolved` 与 `route_only_model`；距离和时长仅为 O&D 模型参考，不生成航段、航班号、精确钟点或无关枢纽。
 
 政策状态采用严格证据语义。`unknown` 不等于“不包含”；公开学生计划只标为 `program_available`，不能当成当前航线、日期和舱位已经获得实际学生折扣。只有报价级证据才可使用 `confirmed_free`、`confirmed_included` 或 `confirmed_discount`。
 
 学生优先排序依次比较：最低模型价格、免费托运行李、已确认实际学生折扣、免费改签/退票、年龄与身份验证门槛。`program_available` 本身不满足“实际折扣”条件，只在最后一级使用其公开年龄和验证信息。由于价格是第一排序键，后续条件主要用于同价时打破平局。
 
+## Offer 详情 API
+
+页面：`GET /details/offer`；数据端点：`POST /v1/offer-detail`。
+
+主页中的每个 offer 都提供二级详情入口。请求字段：
+
+| 字段 | 类型 | 必填 | 语义 |
+| --- | --- | --- | --- |
+| `origin` | string | 是 | 与比较请求相同的三位机场代码 |
+| `destination` | string | 是 | 与比较请求相同的三位机场代码 |
+| `departure_date` | date | 是 | 与比较请求相同的出发日期 |
+| `offer_id` | string | 是 | 比较响应中 `offers[].id` 的不透明稳定标识；客户端不得自行拼接或修改 |
+
+响应中的 `offer` 沿用比较响应的价格、准点、政策、舱位和 schedule 字段；`itinerary` 提供：
+
+- `kind=direct|one_stop|route_unresolved`、`time_basis=provider_schedule|model_duration_only`、总距离与总时长；
+- `legs[]` 中每个已确定航段的起终点、日期上下文、距离、时长和 `data_basis`；`route_unresolved` 必须返回空列表，避免把 O&D 参考虚称为航段；
+- 完整 provider 行可额外给出航班号和当地/UTC 钟点；仅 live schedules 的航站楼字段可返回，语义仍是 provider-estimated terminal，不是当天已确认航站楼。Routes 的 possible terminals 与 last-used aircraft 不返回；
+- 模型中转使用 `layover_minutes=90` 与 `layover_status=model_assumption`。没有适用 provider 数据时，所有航班号和钟点保持 `null`，航段 `data_basis=model_duration_only`；
+- `schedule_status` / `schedule_source` / `schedule_observed_at`、`schedule_sample_truncated` / `schedule_sample_limit`、双语 `fallback_reason` 和 `notice` 明确说明证据边界；触及免费 50 行上限时，详情同样提示列表可能不完整。
+
+`airlabs_live_schedule` 只用于完整、日期匹配、尚未起飞且状态可用的 AirLabs schedules 行；`airlabs_recurring_timetable_projection` 表示把 routes 的周期时刻表投影到所选日期，不保证实际执行。无 key、无覆盖、额度耗尽、超时、空结果或字段不完整都回退到 `model_duration_only`，绝不补造航班号或精确钟点。无论 schedule 来源如何，舱位仍保持 `catalog_scenario`。
+
 ## 上下文详情 API
 
-两个详情接口都使用与比较接口相同的三字段请求：`origin`、`destination`、`departure_time`。无偏移时间按出发机场当地时区解释；时间必须在未来且不超过 370 天。页面路由 `GET /details/weather` 与 `GET /details/news` 不直接返回数据，而是读取查询参数并调用下列 API。
+两个上下文详情接口都要求 `origin`、`destination`，并且必须且只能提供一个 `departure_date` 或兼容字段 `departure_time`。主页链接传递 canonical `departure_date` 与当前 `departure_time_basis`；详情页每次刷新只向 API 提交日期，由服务根据新的 `generated_at` 重新生成安全参考。因此旧的同日 +30 分钟参考过期后刷新不会因重复提交旧钟点而 422。响应返回重新计算后的 `departure_time` 和 `departure_time_basis`：`origin_local_noon_model_reference` 是内部正午参考，`origin_local_remaining_day_model_reference` 是同日生成时刻后 30 分钟参考；两者都不是真实航班钟点。兼容调用可只提交 `departure_time`；无偏移时间按出发机场当地时区解释，必须在未来且不超过 370 天，响应 basis 为 `legacy_input`。页面路由 `GET /details/weather` 与 `GET /details/news` 不直接返回数据，而是读取查询参数并调用下列 API。
 
 ### `POST /v1/context/weather-detail`
 
-响应包含航线、带时区的计划起飞、根据航线模型时长估算的抵达时刻、生成时间，以及 `origin_weather` 和 `destination_weather`。每个机场对象包含：
+响应包含航线、带时区的模型/天气参考时刻、`departure_time_basis`、根据航线模型时长估算的抵达参考、生成时间，以及 `origin_weather` 和 `destination_weather`。日期级参考和抵达参考都不是航班计划。每个机场对象包含：
 
 - 机场代码/名称、可选 ICAO、IANA 时区和目标时刻；
 - `current` 与 `target` 天气：温度、WMO 天气代码及双语描述、风速、阵风、降水、降水概率、能见度、风险值；
@@ -179,7 +216,7 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 
 ### `POST /v1/context/news-detail`
 
-响应包含航线、计划起飞、生成时间、最多 20 篇文章、`route_raw_risk`、`departure_attenuation_factor`、`model_effect`、`model_signal`、元数据、双语摘要与 GDELT 索引时间提示。`route_raw_risk` 是详情页较大文章集的解释性分数；`model_effect` 与 `model_signal.value` 是主预测上下文实际使用的新闻输入，`model_signal` 还给出其状态、来源、观测时间和双语摘要。每篇文章包含原始 `title`、清理后的 HTTP(S) `url`、来源域名、可选语言、`indexed_at`、风险 `category`、最多 12 个 `matched_risk_terms`、`raw_score`、`recency_factor` 和 `weighted_score`。
+响应包含航线、模型/新闻参考时刻及其 `departure_time_basis`、生成时间、最多 20 篇文章、`route_raw_risk`、`departure_attenuation_factor`、`model_effect`、`model_signal`、元数据、双语摘要与 GDELT 索引时间提示。参考时刻不是航班计划。`route_raw_risk` 是详情页较大文章集的解释性分数；`model_effect` 与 `model_signal.value` 是主预测上下文实际使用的新闻输入，`model_signal` 还给出其状态、来源、观测时间和双语摘要。每篇文章包含原始 `title`、清理后的 HTTP(S) `url`、来源域名、可选语言、`indexed_at`、风险 `category`、最多 12 个 `matched_risk_terms`、`raw_score`、`recency_factor` 和 `weighted_score`。
 
 允许的类别为 `airport_closure`、`airspace_conflict`、`labor_strike`、`extreme_weather`、`cancellation_delay`、`security_cyber` 与 `other_disruption`。文章时间是 GDELT 观察/索引时间，不保证是媒体发布时间；标题保留来源语言。页面每 15 分钟自动刷新，并提供手动刷新。
 
@@ -190,6 +227,8 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 | `GET /health` | 进程与模型加载健康状态；不代表模型仍然准确 |
 | `GET /v1/model-info` | 模型版本、训练来源、时间和可用任务信息 |
 | `POST /v1/compare` | 用三个输入生成多航司、多舱位结果与三类完整排序 |
+| `GET /details/offer` | 每个比较 offer 的中英双语航班/模型行程详情页面 |
+| `POST /v1/offer-detail` | 按 `offer_id` 返回 provider schedule 或明确标记的模型航段详情 |
 | `GET /details/weather` | 中英双语天气详情页面；查询参数由主页生成 |
 | `GET /details/news` | 中英双语新闻详情页面；查询参数由主页生成 |
 | `POST /v1/context/weather-detail` | 出发与到达机场的当前/目标天气、趋势和 METAR/TAF 详情 |

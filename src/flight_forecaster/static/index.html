@@ -875,11 +875,59 @@
     }
 
     .tab:focus-visible,
+    .cabin-tab:focus-visible,
     .language-switch button:focus-visible,
     .submit-button:focus-visible {
       outline: none;
       box-shadow: var(--focus);
     }
+
+    .cabin-filter {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: -3px 2px 13px;
+      padding: 12px 14px;
+      border: 1px solid var(--blue-100);
+      border-radius: 13px;
+      background: var(--blue-50);
+    }
+
+    .cabin-filter[hidden] { display: none; }
+
+    .cabin-filter-label {
+      flex: 0 0 auto;
+      color: var(--navy-800);
+      font-size: 10px;
+      font-weight: 780;
+    }
+
+    .cabin-tabs {
+      display: flex;
+      min-width: 0;
+      gap: 5px;
+      overflow-x: auto;
+    }
+
+    .cabin-tab {
+      min-height: 32px;
+      padding: 5px 11px;
+      color: var(--blue-700);
+      border: 1px solid var(--blue-100);
+      border-radius: 999px;
+      background: white;
+      font-size: 10px;
+      font-weight: 720;
+      white-space: nowrap;
+    }
+
+    .cabin-tab[aria-selected="true"] {
+      color: white;
+      border-color: var(--blue-700);
+      background: var(--blue-700);
+    }
+
+    .cabin-tab[hidden] { display: none; }
 
     .offer-panel {
       overflow: hidden;
@@ -991,6 +1039,27 @@
     .tiny-badge.caution { color: var(--amber-700); background: var(--amber-100); }
     .tiny-badge.risk { color: var(--red-700); background: var(--red-100); }
 
+    .offer-detail-link {
+      display: inline-flex;
+      min-height: 31px;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      padding: 6px 9px;
+      color: var(--blue-700);
+      border: 1px solid var(--blue-100);
+      border-radius: 8px;
+      background: var(--blue-50);
+      font-size: 9px;
+      font-weight: 760;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .offer-detail-link:hover { border-color: #abcaf5; background: #e5f0ff; }
+    .offer-detail-link:focus-visible { outline: none; box-shadow: var(--focus); }
+    .offer-detail-link svg { width: 12px; height: 12px; }
+
     .empty-state {
       display: none;
       padding: 46px 22px;
@@ -1071,6 +1140,8 @@
       .rank-toolbar { align-items: stretch; flex-direction: column; }
       .tabs { width: 100%; }
       .tab { flex: 1 0 auto; }
+      .cabin-filter { align-items: flex-start; flex-direction: column; gap: 8px; }
+      .cabin-tabs { width: 100%; }
 
       .table-scroll { overflow: visible; }
       table, thead, tbody, tr, td { display: block; width: 100%; }
@@ -1211,7 +1282,7 @@
             </div>
             <div class="field datetime-field">
               <label for="departure-time" data-i18n="departure">计划出发时间</label>
-              <input id="departure-time" name="departure_time" type="datetime-local" required>
+              <input id="departure-time" name="departure_date" type="date" required>
             </div>
             <button class="submit-button" id="submit-button" type="submit">
               <span class="spinner" aria-hidden="true"></span>
@@ -1378,14 +1449,25 @@
           </div>
         </div>
 
+        <div id="cabin-filter" class="cabin-filter" aria-labelledby="cabin-filter-label">
+          <span id="cabin-filter-label" class="cabin-filter-label" data-i18n="cabinBranch">按舱位筛选</span>
+          <div class="cabin-tabs" role="tablist" aria-label="Cabin class">
+            <button class="cabin-tab" id="cabin-tab-all" type="button" role="tab" aria-selected="true" data-cabin="all" data-i18n="allCabins">全部舱位</button>
+            <button class="cabin-tab" id="cabin-tab-economy" type="button" role="tab" aria-selected="false" data-cabin="economy" data-i18n="economy">经济舱</button>
+            <button class="cabin-tab" id="cabin-tab-premium_economy" type="button" role="tab" aria-selected="false" data-cabin="premium_economy" data-i18n="premiumEconomy">超级经济舱</button>
+            <button class="cabin-tab" id="cabin-tab-business" type="button" role="tab" aria-selected="false" data-cabin="business" data-i18n="business">商务舱</button>
+            <button class="cabin-tab" id="cabin-tab-first" type="button" role="tab" aria-selected="false" data-cabin="first" data-i18n="first">头等舱</button>
+          </div>
+        </div>
+
         <div id="offer-panel" class="offer-panel" role="tabpanel" aria-labelledby="tab-direct_first" tabindex="0">
           <div class="table-scroll">
             <table>
               <caption data-i18n="offersCaption">当前排序下的所有航司与舱位预测结果</caption>
               <colgroup>
-                <col style="width:12%"><col style="width:8%"><col style="width:7%"><col style="width:12%">
-                <col style="width:10%"><col style="width:9%"><col style="width:9%"><col style="width:7%">
-                <col style="width:7%"><col style="width:12%"><col style="width:7%">
+                <col style="width:11%"><col style="width:7%"><col style="width:7%"><col style="width:11%">
+                <col style="width:9%"><col style="width:8%"><col style="width:8%"><col style="width:7%">
+                <col style="width:7%"><col style="width:11%"><col style="width:7%"><col style="width:7%">
               </colgroup>
               <thead>
                 <tr>
@@ -1400,6 +1482,7 @@
                   <th data-i18n="refund">退票</th>
                   <th data-i18n="eligibility">年龄与验证</th>
                   <th data-i18n="routeStatus">航线状态</th>
+                  <th data-i18n="details">详情</th>
                 </tr>
               </thead>
               <tbody id="offer-rows"></tbody>
@@ -1435,7 +1518,7 @@
           skip: "跳至主要内容",
           eyebrow: "航旅决策 · 免费数据优先",
           heroTitle: "用更完整的信号，比较下一趟航班",
-          heroLede: "只需航线与出发时间。系统自动结合天气、机场运行和相关新闻，比较不同航司与舱位的价格区间和准点概率。",
+          heroLede: "只需航线与出发日期。系统自动结合天气、机场运行和相关新闻，比较不同航司与舱位的价格区间和准点概率。",
           pointOne: "天气、拥堵与新闻自动获取",
           pointTwo: "实时数据失败时透明回退",
           pointThree: "绝不把预测冒充实时票价",
@@ -1444,15 +1527,15 @@
           autoContext: "自动补全外部信号",
           origin: "出发机场",
           destination: "到达机场",
-          departure: "计划出发时间（出发机场当地时间）",
+          departure: "计划出发日期（出发机场当地日期）",
           compare: "开始比较",
           comparing: "正在比较",
           autoNote: "无需输入距离、飞行时长、天气、机场拥堵、航司或舱位；系统将自动推算并展开比较。",
           integrityNotice: "数据诚信提示：页面中的价格和准点率都来自合成演示模型，价格不是可购买报价。行李、学生优惠和退改信息只有在数据源明确确认时才标记为已确认；缺失信息显示为“未知”，不会被虚构或默认加分。",
-          initialState: "输入航线和出发时间后，比较结果会显示在这里。",
+          initialState: "输入航线和出发日期后，比较结果会显示在这里。",
           distance: "航线距离",
           duration: "直飞基准时长",
-          plannedTime: "计划出发",
+          plannedTime: "计划出发日期",
           generatedAt: "结果生成时间",
           contextTitle: "预测上下文",
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
@@ -1467,7 +1550,9 @@
           directFirst: "直飞优先",
           lowestPrice: "低价优先",
           studentFirst: "学生友好优先",
-          directDescription: "优先展示免费来源确认的直飞航司；未确认航司按中转模型场景展示。",
+          cabinBranch: "按舱位筛选",
+          allCabins: "全部舱位",
+          directDescription: "依次展示提供商确认直达航路、航司枢纽一站式模型，以及置后的航路未解析 O&D 参考。",
           priceDescription: "按模型估算价格从低到高展示。",
           studentDescription: "严格按最低价格、免费托运行李、已确认学生折扣、免费退改、年龄与验证条件依次比较。",
           offersCaption: "当前排序下的所有航司与舱位预测结果",
@@ -1482,6 +1567,8 @@
           refund: "退票",
           eligibility: "年龄与验证",
           routeStatus: "航线状态",
+          details: "详情",
+          offerDetails: "查看此选项详情",
           emptyTitle: "此分类暂无可比较结果",
           emptyBody: "免费数据源可能未覆盖该航线或当前排序。请尝试其他分类、日期或机场。",
           footerNote: "结果仅用于决策参考。模型估价、准点概率、天气、机场运行与新闻信号都可能存在延迟或误差；预订前请以航司或出票平台的实时条款为准。",
@@ -1506,9 +1593,16 @@
           notApplicable: "不适用",
           providerConfirmed: "免费来源确认直飞航司",
           modelScenario: "中转模型场景",
+          liveSchedule: "AirLabs 近实时航班计划",
+          recurringSchedule: "周期时刻表投影",
+          noRealSchedule: "无真实时刻 · 模型场景",
+          providerDirect: "提供商确认直达航路",
+          modelOneStop: "一站式模型航路",
+          routingUnresolved: "航路未解析模型",
           cabinScenario: "舱位模型场景",
           directLegBasis: "直飞单航段模型",
           twoLegBasis: "两航段独立假设场景",
+          routeOnlyBasis: "仅 O&D 航路模型",
           officialProgram: "官方学生计划",
           free: "免费",
           eligible: "可申请",
@@ -1532,7 +1626,7 @@
           noArticles: "暂无相关报道",
           articles: "篇相关报道",
           invalidRoute: "请输入两个不同的三字 IATA 机场代码。",
-          invalidDate: "计划出发时间必须晚于当前时间。",
+          invalidDate: "请输入有效的计划出发日期。",
           requestFailed: "比较请求失败，请稍后重试。",
           timeout: "外部数据获取超时，请稍后重试。",
           offline: "无法连接预测服务，请确认服务已经启动。",
@@ -1545,7 +1639,7 @@
           skip: "Skip to main content",
           eyebrow: "Travel decisions · Free-data first",
           heroTitle: "Compare your next flight with a fuller signal",
-          heroLede: "Enter only a route and departure time. The system automatically combines weather, airport operations, and current news to compare price ranges and punctuality across airlines and cabins.",
+          heroLede: "Enter only a route and departure date. The system automatically combines weather, airport operations, and current news to compare price ranges and punctuality across airlines and cabins.",
           pointOne: "Weather, congestion, and news gathered automatically",
           pointTwo: "Transparent fallback when live data fails",
           pointThree: "Predictions are never presented as live fares",
@@ -1554,15 +1648,15 @@
           autoContext: "External signals filled automatically",
           origin: "Origin airport",
           destination: "Destination airport",
-          departure: "Planned departure (origin local time)",
+          departure: "Planned departure date (origin local date)",
           compare: "Compare flights",
           comparing: "Comparing",
           autoNote: "No distance, duration, weather, congestion, airline, or cabin input is needed; the system derives and compares them automatically.",
           integrityNotice: "Data integrity notice: prices and on-time probabilities come from synthetic-demo models; prices are not bookable quotes. Baggage, student, change, and refund benefits are marked confirmed only when explicitly supported by a source. Missing facts remain “Unknown” and are never invented or awarded points.",
-          initialState: "Enter a route and departure time to see comparisons here.",
+          initialState: "Enter a route and departure date to see comparisons here.",
           distance: "Route distance",
           duration: "Direct baseline duration",
-          plannedTime: "Planned departure",
+          plannedTime: "Planned departure date",
           generatedAt: "Results generated",
           contextTitle: "Forecast context",
           contextHint: "Every card shows its data status, source, and observation time.",
@@ -1577,7 +1671,9 @@
           directFirst: "Direct first",
           lowestPrice: "Lowest price",
           studentFirst: "Student friendly",
-          directDescription: "Direct carriers confirmed by a free source appear first; unconfirmed carriers are connecting model scenarios.",
+          cabinBranch: "Filter by cabin",
+          allCabins: "All cabins",
+          directDescription: "Shows provider-confirmed direct routing, then airline-hub one-stop models, with routing-unresolved O&D references last.",
           priceDescription: "Sorted from lowest to highest model-estimated price.",
           studentDescription: "Compared in strict order: lowest price, free checked bag, confirmed student discount, free changes/refunds, then age and verification requirements.",
           offersCaption: "All airline and cabin predictions in the active ranking",
@@ -1592,6 +1688,8 @@
           refund: "Refund",
           eligibility: "Age & verification",
           routeStatus: "Route status",
+          details: "Details",
+          offerDetails: "View this option's details",
           emptyTitle: "No comparable results in this category",
           emptyBody: "The free data sources may not cover this route or ranking. Try another category, date, or airport.",
           footerNote: "Results are decision support only. Model prices, punctuality, weather, airport operations, and news signals may be delayed or inaccurate. Confirm live prices and terms with the airline or booking platform before purchase.",
@@ -1616,9 +1714,16 @@
           notApplicable: "Not applicable",
           providerConfirmed: "Direct carrier confirmed by free source",
           modelScenario: "Connecting model scenario",
+          liveSchedule: "AirLabs near-real-time schedule",
+          recurringSchedule: "Recurring timetable projection",
+          noRealSchedule: "No real schedule · Model scenario",
+          providerDirect: "Provider-confirmed direct routing",
+          modelOneStop: "One-stop model routing",
+          routingUnresolved: "Routing-unresolved model",
           cabinScenario: "Cabin model scenario",
           directLegBasis: "Direct-leg model",
           twoLegBasis: "Two-leg independence scenario",
+          routeOnlyBasis: "O&D route-only model",
           officialProgram: "Official student programme",
           free: "Free",
           eligible: "Eligible",
@@ -1642,7 +1747,7 @@
           noArticles: "No relevant articles",
           articles: "related articles",
           invalidRoute: "Enter two different three-letter IATA airport codes.",
-          invalidDate: "Planned departure must be later than the current time.",
+          invalidDate: "Enter a valid planned departure date.",
           requestFailed: "Comparison failed. Please try again.",
           timeout: "External data timed out. Please try again.",
           offline: "Cannot reach the forecast service. Make sure the API is running.",
@@ -1677,6 +1782,7 @@
 
       var currentLanguage = "zh";
       var activeRanking = "direct_first";
+      var activeCabin = "all";
       var lastData = null;
       var sessionKey = "flight-forecast-session-v1";
 
@@ -1685,23 +1791,22 @@
 
       function pad(value) { return String(value).padStart(2, "0"); }
 
-      function localInputValue(date) {
+      function localDateValue(date) {
         return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" +
-          pad(date.getDate()) + "T" + pad(date.getHours()) + ":" + pad(date.getMinutes());
+          pad(date.getDate());
       }
 
       function setDefaultDeparture() {
         var date = new Date();
         date.setDate(date.getDate() + 7);
-        date.setHours(9, 0, 0, 0);
-        byId("departure-time").value = localInputValue(date);
+        byId("departure-time").value = localDateValue(date);
       }
 
       function formState() {
         return {
           origin: byId("origin").value.trim().toUpperCase(),
           destination: byId("destination").value.trim().toUpperCase(),
-          departure_time: byId("departure-time").value
+          departure_date: byId("departure-time").value
         };
       }
 
@@ -1711,6 +1816,7 @@
             form: formState(),
             language: currentLanguage,
             ranking: activeRanking,
+            cabin: activeCabin,
             comparison: lastData
           }));
         } catch (error) { /* storage may be unavailable or full */ }
@@ -1725,8 +1831,9 @@
           var form = state.form || {};
           if (/^[A-Z]{3}$/.test(String(form.origin || ""))) byId("origin").value = form.origin;
           if (/^[A-Z]{3}$/.test(String(form.destination || ""))) byId("destination").value = form.destination;
-          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(String(form.departure_time || ""))) {
-            byId("departure-time").value = String(form.departure_time).slice(0, 16);
+          var savedDate = String(form.departure_date || form.departure_time || "").slice(0, 10);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(savedDate)) {
+            byId("departure-time").value = savedDate;
           }
           if (state.comparison && typeof state.comparison === "object") lastData = state.comparison;
           return state;
@@ -1739,9 +1846,13 @@
         var state = formState();
         var origin = safeText(data && data.origin, state.origin).toUpperCase();
         var destination = safeText(data && data.destination, state.destination).toUpperCase();
-        var departureTime = safeText(data && data.departure_time, state.departure_time);
+        var departureDate = safeText(data && data.departure_date, state.departure_date).slice(0, 10);
+        var departureTimeBasis = safeText(
+          data && data.departure_time_basis,
+          "origin_local_noon_model_reference"
+        );
         var valid = /^[A-Z]{3}$/.test(origin) && /^[A-Z]{3}$/.test(destination) &&
-          origin !== destination && hasValue(departureTime);
+          origin !== destination && /^\d{4}-\d{2}-\d{2}$/.test(departureDate);
         [["weather-detail-link", "/details/weather"], ["news-detail-link", "/details/news"]].forEach(function (entry) {
           var link = byId(entry[0]);
           if (!valid) {
@@ -1753,7 +1864,8 @@
           var params = new URLSearchParams({
             origin: origin,
             destination: destination,
-            departure_time: departureTime,
+            departure_date: departureDate,
+            departure_time_basis: departureTimeBasis,
             lang: currentLanguage
           });
           link.href = entry[1] + "?" + params.toString();
@@ -1804,9 +1916,15 @@
           not_applicable: "notApplicable",
           provider_confirmed: "providerConfirmed",
           model_scenario: "modelScenario",
+          live_schedule: "liveSchedule",
+          recurring_timetable_projection: "recurringSchedule",
+          provider_direct: "providerDirect",
+          model_one_stop: "modelOneStop",
+          model_route_unresolved: "routingUnresolved",
           catalog_scenario: "cabinScenario",
           direct_leg_model: "directLegBasis",
           two_leg_independence_scenario: "twoLegBasis",
+          route_only_model: "routeOnlyBasis",
           free: "free",
           eligible: "eligible",
           available: "eligible",
@@ -1846,6 +1964,17 @@
         } catch (error) {
           return date.toLocaleString();
         }
+      }
+
+      function formatDepartureDate(value) {
+        var raw = String(value || "").slice(0, 10);
+        var match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+        if (!match) return safeText(value);
+        var date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
+        if (Number.isNaN(date.getTime())) return raw;
+        return new Intl.DateTimeFormat(currentLanguage === "zh" ? "zh-CN" : "en-CA", {
+          year: "numeric", month: "short", day: "numeric"
+        }).format(date);
       }
 
       function formatMoney(value) {
@@ -2125,11 +2254,39 @@
 
       function benefitClass(value) {
         var key = normalizeKey(value);
-        if (["confirmed", "verified", "included", "free", "eligible", "available", "confirmed_free", "confirmed_included", "confirmed_discount", "program_available", "provider_confirmed"].indexOf(key) >= 0) return "good";
+        if (["confirmed", "verified", "included", "free", "eligible", "available", "confirmed_free", "confirmed_included", "confirmed_discount", "program_available", "provider_confirmed", "provider_direct"].indexOf(key) >= 0) return "good";
         if (["unknown", "unavailable", "not_available"].indexOf(key) >= 0) return "caution";
         if (["none", "no", "not_included", "confirmed_paid", "non_refundable", "nonrefundable"].indexOf(key) >= 0) return "risk";
-        if (["model_scenario", "not_applicable"].indexOf(key) >= 0) return "caution";
+        if (["model_scenario", "model_one_stop", "model_route_unresolved", "not_applicable"].indexOf(key) >= 0) return "caution";
         return "";
+      }
+
+      function hasProviderSchedule(offer) {
+        var schedule = normalizeKey(offer && offer.schedule_status);
+        return (schedule === "live_schedule" || schedule === "recurring_timetable_projection") &&
+          hasValue(offer && offer.flight_number) && hasValue(offer && offer.scheduled_departure_local) &&
+          hasValue(offer && offer.scheduled_arrival_local);
+      }
+
+      function formatScheduleLocal(value) {
+        var match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(String(value || ""));
+        if (!match) return safeText(value);
+        var date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]));
+        if (Number.isNaN(date.getTime())) return safeText(value);
+        return new Intl.DateTimeFormat(currentLanguage === "zh" ? "zh-CN" : "en-CA", {
+          month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
+        }).format(date);
+      }
+
+      function routeDisplay(offer) {
+        var routing = normalizeKey(offer && offer.routing_status);
+        if (routing === "model_route_unresolved") return t("routingUnresolved");
+        if (routing === "provider_direct") return t("direct");
+        if (routing === "model_one_stop") return "1 " + t("stop");
+        var stops = asNumber(offer && offer.stops);
+        if (stops === null) return t("routingUnresolved");
+        stops = Math.max(0, Math.round(stops));
+        return stops === 0 ? t("direct") : stops + " " + t(stops === 1 ? "stop" : "stops");
       }
 
       function renderOffer(offer) {
@@ -2142,17 +2299,23 @@
         airlineCode.textContent = safeText(offer.airline_code);
         airline.appendChild(airlineCode);
         appendStrong(airline, safeText(offer.airline_name, offer.airline_code));
-        if (hasValue(offer.id)) appendSubvalue(airline, "ID " + offer.id);
+        if (hasProviderSchedule(offer)) appendSubvalue(airline, safeText(offer.flight_number));
+        else appendSubvalue(airline, t("noRealSchedule"));
 
         var cabin = cell(row, "", "cabin");
         appendTinyBadge(cabin, localizeStatus(offer.cabin), "");
         appendSubvalue(cabin, localizeStatus(offer.cabin_status));
 
         var route = cell(row, "", "route");
-        var stops = Math.max(0, Math.round(asNumber(offer.stops) || 0));
-        appendStrong(route, stops === 0 ? t("direct") : stops + " " + t(stops === 1 ? "stop" : "stops"));
+        appendStrong(route, routeDisplay(offer));
         var offerDuration = asNumber(offer.duration_minutes);
         if (offerDuration !== null) appendSubvalue(route, Math.round(offerDuration) + " " + t("minute"));
+        if (hasProviderSchedule(offer)) {
+          appendSubvalue(route, formatScheduleLocal(offer.scheduled_departure_local) + " → " +
+            formatScheduleLocal(offer.scheduled_arrival_local));
+        } else {
+          appendSubvalue(route, t("noRealSchedule"));
+        }
 
         var price = cell(row, "price-cell", "estimatedPrice");
         appendStrong(price, formatMoney(offer.estimated_price_usd));
@@ -2203,26 +2366,90 @@
         appendSubvalue(eligibility, t("verification") + ": " + safeText(verification, t("unknown")));
 
         var routeStatus = cell(row, "", "routeStatus");
-        appendTinyBadge(routeStatus, localizeStatus(offer.route_status), benefitClass(offer.route_status));
+        var routingStatus = offer.routing_status || offer.route_status;
+        appendTinyBadge(routeStatus, localizeStatus(routingStatus), benefitClass(routingStatus));
+        appendSubvalue(routeStatus, hasProviderSchedule(offer) ? localizeStatus(offer.schedule_status) : t("noRealSchedule"));
+
+        var actions = cell(row, "", "details");
+        var detailLink = document.createElement("a");
+        detailLink.className = "offer-detail-link";
+        detailLink.href = offerDetailUrl(offer);
+        detailLink.textContent = t("viewDetails");
+        detailLink.setAttribute("aria-label", t("offerDetails") + ": " +
+          safeText(offer.airline_name, offer.airline_code) + ", " + localizeStatus(offer.cabin));
+        detailLink.addEventListener("click", saveSessionState);
+        var arrow = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        arrow.setAttribute("viewBox", "0 0 24 24");
+        arrow.setAttribute("fill", "none");
+        arrow.setAttribute("stroke", "currentColor");
+        arrow.setAttribute("stroke-width", "2");
+        arrow.setAttribute("aria-hidden", "true");
+        var arrowPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        arrowPath.setAttribute("d", "m9 18 6-6-6-6");
+        arrow.appendChild(arrowPath);
+        detailLink.appendChild(arrow);
+        actions.appendChild(detailLink);
         return row;
       }
 
-      function activeOffers(data) {
-        var offers = Array.isArray(data.offers) ? data.offers : [];
+      function offerDetailUrl(offer) {
+        var state = formState();
+        var data = lastData || {};
+        var departureDate = safeText(data.departure_date, state.departure_date).slice(0, 10);
+        var params = new URLSearchParams({
+          origin: safeText(data.origin, state.origin).toUpperCase(),
+          destination: safeText(data.destination, state.destination).toUpperCase(),
+          departure_date: departureDate,
+          offer_id: safeText(offer && offer.id, ""),
+          lang: currentLanguage
+        });
+        return "/details/offer?" + params.toString();
+      }
+
+      function rankedOffers(data, ranking) {
+        var offers = Array.isArray(data && data.offers) ? data.offers : [];
         var byIdentifier = new Map();
         offers.forEach(function (offer) {
           if (offer && hasValue(offer.id)) byIdentifier.set(String(offer.id), offer);
         });
-        var rankings = data.rankings || {};
-        var identifiers = Array.isArray(rankings[activeRanking]) ? rankings[activeRanking] : [];
+        var rankings = data && data.rankings || {};
+        var identifiers = Array.isArray(rankings[ranking]) ? rankings[ranking] : [];
         return identifiers.map(function (identifier) {
           return byIdentifier.get(String(identifier));
         }).filter(Boolean);
       }
 
+      function activeOffers(data) {
+        var offers = rankedOffers(data, activeRanking);
+        if (activeRanking === "direct_first" && activeCabin !== "all") {
+          offers = offers.filter(function (offer) { return normalizeKey(offer.cabin) === activeCabin; });
+        }
+        return offers;
+      }
+
+      function updateCabinFilter(data) {
+        var filter = byId("cabin-filter");
+        filter.hidden = activeRanking !== "direct_first";
+        if (filter.hidden) return;
+        var available = new Set(rankedOffers(data, "direct_first").map(function (offer) {
+          return normalizeKey(offer.cabin);
+        }));
+        document.querySelectorAll(".cabin-tab").forEach(function (tab) {
+          var cabin = tab.dataset.cabin;
+          tab.hidden = cabin !== "all" && !available.has(cabin);
+        });
+        if (activeCabin !== "all" && !available.has(activeCabin)) activeCabin = "all";
+        document.querySelectorAll(".cabin-tab").forEach(function (tab) {
+          var selected = tab.dataset.cabin === activeCabin;
+          tab.setAttribute("aria-selected", String(selected));
+          tab.tabIndex = selected ? 0 : -1;
+        });
+      }
+
       function renderOffers(data) {
         var body = byId("offer-rows");
         body.replaceChildren();
+        updateCabinFilter(data);
         var offers = activeOffers(data);
         offers.forEach(function (offer) { body.appendChild(renderOffer(offer)); });
         byId("empty-state").classList.toggle("visible", offers.length === 0);
@@ -2254,13 +2481,9 @@
           Math.round(distance).toLocaleString(currentLanguage === "zh" ? "zh-CN" : "en-US") + " " + t("kilometer");
         var duration = asNumber(data.duration_minutes);
         byId("route-duration").textContent = duration === null ? "—" : Math.round(duration) + " " + t("minute");
-        var resolvedDeparture = data.departure_time || byId("departure-time").value;
-        var resolvedTimezone = hasValue(data.departure_timezone) ? data.departure_timezone : null;
-        byId("route-departure").textContent = formatDate(
-          resolvedDeparture,
-          true,
-          resolvedTimezone
-        ) + (resolvedTimezone ? " (" + resolvedTimezone + ")" : "");
+        var resolvedDeparture = data.departure_date || byId("departure-time").value ||
+          String(data.departure_time || "").slice(0, 10);
+        byId("route-departure").textContent = formatDepartureDate(resolvedDeparture);
         byId("generated-time").textContent = formatDate(data.generated_at);
 
         renderContext("weather", context.weather);
@@ -2294,6 +2517,19 @@
         saveSessionState();
       }
 
+      function selectCabin(cabin, focus) {
+        var allowed = ["all", "economy", "premium_economy", "business", "first"];
+        activeCabin = allowed.indexOf(cabin) >= 0 ? cabin : "all";
+        document.querySelectorAll(".cabin-tab").forEach(function (tab) {
+          var selected = tab.dataset.cabin === activeCabin;
+          tab.setAttribute("aria-selected", String(selected));
+          tab.tabIndex = selected ? 0 : -1;
+          if (selected && focus) tab.focus();
+        });
+        if (lastData) renderOffers(lastData);
+        saveSessionState();
+      }
+
       byId("compare-form").addEventListener("submit", async function (event) {
         event.preventDefault();
         var form = event.currentTarget;
@@ -2301,12 +2537,12 @@
 
         var origin = byId("origin").value.trim().toUpperCase();
         var destination = byId("destination").value.trim().toUpperCase();
-        var departure = new Date(byId("departure-time").value);
+        var departureDate = byId("departure-time").value;
         if (!/^[A-Z]{3}$/.test(origin) || !/^[A-Z]{3}$/.test(destination) || origin === destination) {
           setMessage("error", t("invalidRoute"));
           return;
         }
-        if (Number.isNaN(departure.getTime())) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(departureDate)) {
           setMessage("error", t("invalidDate"));
           return;
         }
@@ -2316,7 +2552,7 @@
           var data = await requestComparison({
             origin: origin,
             destination: destination,
-            departure_time: byId("departure-time").value
+            departure_date: departureDate
           });
           if (!data || !data.rankings || !data.offers) throw new Error(t("responseMissing"));
           lastData = data;
@@ -2369,9 +2605,26 @@
         });
       });
 
+      document.querySelectorAll(".cabin-tab").forEach(function (tab) {
+        tab.addEventListener("click", function () { selectCabin(tab.dataset.cabin, false); });
+        tab.addEventListener("keydown", function (event) {
+          var tabs = Array.from(document.querySelectorAll(".cabin-tab:not([hidden])"));
+          var index = tabs.indexOf(event.currentTarget);
+          if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+            event.preventDefault();
+            selectCabin(tabs[(index + 1) % tabs.length].dataset.cabin, true);
+          } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+            event.preventDefault();
+            selectCabin(tabs[(index - 1 + tabs.length) % tabs.length].dataset.cabin, true);
+          }
+        });
+      });
+
       setDefaultDeparture();
       var restoredState = restoreSessionState();
       var restoredRanking = restoredState && ["direct_first", "lowest_price", "student_first"].indexOf(restoredState.ranking) >= 0 ? restoredState.ranking : "direct_first";
+      var restoredCabin = restoredState && ["all", "economy", "premium_economy", "business", "first"].indexOf(restoredState.cabin) >= 0 ? restoredState.cabin : "all";
+      activeCabin = restoredCabin;
       selectRanking(restoredRanking, false);
       var storedLanguage = "zh";
       try { storedLanguage = window.localStorage.getItem("flight-forecast-language") || (restoredState && restoredState.language) || "zh"; } catch (error) { /* use default */ }

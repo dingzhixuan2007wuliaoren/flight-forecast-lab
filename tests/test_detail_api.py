@@ -588,6 +588,7 @@ def test_detail_api_returns_typed_fallbacks(
     assert weather_payload["origin_weather"]["current"] is None
     assert weather_payload["destination_weather"]["timezone"] == "America/Los_Angeles"
     assert weather_payload["estimated_arrival_time"]
+    assert weather_payload["departure_time_basis"] == "legacy_input"
 
     assert news.status_code == 200
     news_payload = news.json()
@@ -595,6 +596,58 @@ def test_detail_api_returns_typed_fallbacks(
     assert news_payload["articles"] == []
     assert news_payload["model_effect"] == 0
     assert news_payload["departure_attenuation_factor"] == 0.1
+    assert news_payload["departure_time_basis"] == "legacy_input"
+
+
+def test_date_only_detail_refresh_recomputes_expired_same_day_reference(
+    monkeypatch,
+    trained_model_dir: Path,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    origin_zone = ZoneInfo("America/Toronto")
+    clock = {
+        "now": datetime(2026, 7, 14, 20, 0, tzinfo=origin_zone).astimezone(UTC)
+    }
+    service = PredictionService(
+        trained_model_dir,
+        now_provider=lambda: clock["now"],
+    )
+    monkeypatch.setattr(api_module, "get_service", lambda: service)
+    client = TestClient(app)
+    request = {
+        "origin": "YYZ",
+        "destination": "LHR",
+        "departure_date": "2026-07-14",
+    }
+
+    first_weather = client.post("/v1/context/weather-detail", json=request)
+    first_news = client.post("/v1/context/news-detail", json=request)
+    assert first_weather.status_code == 200
+    assert first_news.status_code == 200
+    first_weather_payload = first_weather.json()
+    first_news_payload = first_news.json()
+    assert (
+        first_weather_payload["departure_time_basis"]
+        == "origin_local_remaining_day_model_reference"
+    )
+    assert (
+        first_news_payload["departure_time_basis"]
+        == "origin_local_remaining_day_model_reference"
+    )
+    first_reference = datetime.fromisoformat(first_weather_payload["departure_time"])
+    assert first_reference.astimezone(UTC) == clock["now"] + timedelta(minutes=30)
+
+    clock["now"] += timedelta(hours=1)
+    refreshed_weather = client.post("/v1/context/weather-detail", json=request)
+    refreshed_news = client.post("/v1/context/news-detail", json=request)
+
+    assert refreshed_weather.status_code == 200
+    assert refreshed_news.status_code == 200
+    refreshed_reference = datetime.fromisoformat(
+        refreshed_weather.json()["departure_time"]
+    )
+    assert refreshed_reference.astimezone(UTC) == clock["now"] + timedelta(minutes=30)
+    assert refreshed_reference > first_reference
 
 
 def test_second_level_pages_are_served() -> None:
@@ -607,3 +660,13 @@ def test_second_level_pages_are_served() -> None:
     assert news_page.status_code == 200
     assert "text/html" in weather_page.headers["content-type"]
     assert "text/html" in news_page.headers["content-type"]
+    assert "departure_date" in weather_page.text
+    assert "departure_time_basis" in weather_page.text
+    assert "不是航班计划" in weather_page.text
+    assert "departure_date" in news_page.text
+    assert "departure_time_basis" in news_page.text
+    assert "不是航班计划" in news_page.text
+
+    dashboard = client.get("/").text
+    assert "departure_date: departureDate" in dashboard
+    assert "departure_time_basis: departureTimeBasis" in dashboard

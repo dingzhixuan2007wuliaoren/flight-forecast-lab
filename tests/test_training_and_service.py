@@ -82,7 +82,7 @@ def _student_offer(
         airline_code=airline,
         airline_name=airline,
         cabin="economy",
-        stops=0,
+        stops=None,
         duration_minutes=120,
         estimated_price_usd=price,
         interval_80_low_usd=max(0, price - 10),
@@ -98,8 +98,9 @@ def _student_offer(
         student_verification_zh="测试",
         student_verification_en="test",
         route_status="model_scenario",
+        routing_status="model_route_unresolved",
         cabin_status="catalog_scenario",
-        punctuality_basis="direct_leg_model",
+        punctuality_basis="route_only_model",
     )
 
 
@@ -156,12 +157,36 @@ def test_confirmed_direct_carriers_precede_connecting_scenarios(
     scenarios = [offer for offer in result.offers if offer.route_status == "model_scenario"]
     assert {offer.airline_code for offer in confirmed} == {"AC", "BA"}
     assert all(offer.stops == 0 for offer in confirmed)
-    assert all(offer.stops == 1 for offer in scenarios)
+    connecting_scenarios = [offer for offer in scenarios if offer.stops == 1]
+    unresolved_scenarios = [offer for offer in scenarios if offer.stops is None]
+    assert connecting_scenarios
+    assert unresolved_scenarios
+    assert all(
+        service._model_hub(offer.airline_code, "YYZ", "LHR") is None
+        for offer in unresolved_scenarios
+    )
     assert all(offer.duration_minutes == result.duration_minutes for offer in confirmed)
-    assert all(offer.duration_minutes == result.duration_minutes + 90 for offer in scenarios)
+    assert all(
+        offer.duration_minutes > result.duration_minutes + 90
+        for offer in connecting_scenarios
+    )
+    assert all(
+        offer.duration_minutes == result.duration_minutes for offer in unresolved_scenarios
+    )
+    aa_offer = next(offer for offer in connecting_scenarios if offer.airline_code == "AA")
+    assert aa_offer.duration_minutes == (
+        service._route("YYZ", "DFW").duration_minutes
+        + 90
+        + service._route("DFW", "LHR").duration_minutes
+    )
     assert all(offer.punctuality_basis == "direct_leg_model" for offer in confirmed)
     assert all(
-        offer.punctuality_basis == "two_leg_independence_scenario" for offer in scenarios
+        offer.punctuality_basis == "two_leg_independence_scenario"
+        for offer in connecting_scenarios
+    )
+    assert all(
+        offer.punctuality_basis == "route_only_model"
+        for offer in unresolved_scenarios
     )
     offers_by_id = {offer.id: offer for offer in result.offers}
     ranked = [offers_by_id[offer_id] for offer_id in result.rankings.direct_first]

@@ -13,13 +13,15 @@ from flight_forecaster.schemas import (
     ComparisonResponse,
     ContextDetailRequest,
     NewsDetailResponse,
+    OfferDetailRequest,
+    OfferDetailResponse,
     OnTimePrediction,
     OnTimeRequest,
     PricePrediction,
     PriceRequest,
     WeatherDetailResponse,
 )
-from flight_forecaster.service import PredictionService
+from flight_forecaster.service import OfferNotFoundError, PredictionService
 from flight_forecaster.training import ARTIFACT_FILENAME
 
 app = FastAPI(
@@ -63,6 +65,11 @@ def news_details_page() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "news.html")
 
 
+@app.get("/details/offer", include_in_schema=False)
+def offer_details_page() -> FileResponse:
+    return FileResponse(Path(__file__).parent / "static" / "offer.html")
+
+
 @app.get("/health")
 def health() -> dict[str, str | bool]:
     artifact_exists = (model_dir() / ARTIFACT_FILENAME).exists()
@@ -102,6 +109,16 @@ def predict_ontime(request: OnTimeRequest) -> OnTimePrediction:
 def compare_flights(request: ComparisonRequest) -> ComparisonResponse:
     try:
         return _service_or_503().compare(request)
+    except RouteLookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/offer-detail", response_model=OfferDetailResponse)
+def offer_detail(request: OfferDetailRequest) -> OfferDetailResponse:
+    try:
+        return _service_or_503().offer_detail(request)
+    except OfferNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RouteLookupError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

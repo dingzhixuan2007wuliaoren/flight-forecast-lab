@@ -11,11 +11,23 @@ substituted for a live bookable fare.
 | Weather | Open-Meteo current/forecast plus NOAA METAR/TAF | Clearly labelled synthetic month/latitude prior | `live`, `forecast`, or `proxy` |
 | Airport operations | FAA NAS Status for authoritative current US events; optional AirLabs schedule samples elsewhere | ADSB.lol current aircraft-density proxy, plus a clearly labelled training/synthetic target-time prior | `live` or `proxy` |
 | Disruption news | No-key GDELT DOC 2.0 articles from the recent seven-day window, ordered `DateDesc`; official GAL rolling RSS if DOC fails | Route cache no older than six hours with reduced influence, otherwise a neutral value with no articles | `live`, `historical`, or `neutral` |
-| Route airlines | AirLabs route records when a key is configured | Global connecting model-scenario catalog | `provider_confirmed` or `model_scenario` |
+| Offer schedules/routes | AirLabs near-real-time `schedules`, then recurring `routes`, when a free key is configured | Model-only direct/connecting legs with no fabricated flight number or clock time | `live_schedule`, `recurring_timetable_projection`, or `model_scenario` |
 
 The service catches provider timeouts, malformed payloads, quota exhaustion, and empty results.
 It then returns a labelled fallback rather than failing the whole prediction. Set
 `EXTERNAL_CONTEXT_ENABLED=0` for deterministic offline development.
+
+To enable the optional free AirLabs integration, create a free provider key and set it in the same
+shell that starts the server:
+
+```powershell
+$env:AIRLABS_API_KEY="your-free-key"
+python -m flight_forecaster serve --model-dir artifacts/demo
+```
+
+The application reads the process environment and does not automatically load `.env`. Never put
+the key in source code, commit it, embed it in a browser URL, or expose it to the client. No key is
+a supported mode: the service returns explicitly labelled model/proxy fallbacks.
 
 Within two hours of departure, the service uses fresh Open-Meteo current model conditions and
 can blend NOAA METAR airport observations with TAF. From two to 30 hours it blends the
@@ -65,17 +77,45 @@ cancellation rate, airport throughput measurement, or official ground-stop feed.
 departures the target signal uses the labelled prior. The demo has no validated historical airport
 aggregate, so a hand-built prior must not be presented as authoritative historical performance.
 
-The dashboard sends a timezone-free wall time. The service resolves the origin airport from its
-coordinates, determines the IANA timezone offline, handles daylight-saving offsets, and returns
-both the normalized timestamp and timezone. API clients may alternatively send an aware ISO 8601
-timestamp, which is treated as an absolute instant.
+The comparison dashboard sends `departure_date`, not a flight clock time. The date cannot be before
+today in the origin IANA timezone and cannot be more than 370 local calendar days ahead. A future
+date uses origin-local noon as the model/context reference. For today, noon is retained when it is
+more than 30 minutes after generation; otherwise the service advances 30 minutes on the UTC timeline
+and converts that instant back to the origin timezone. A next-day result is rejected with 422. The
+response labels these cases `origin_local_noon_model_reference` or
+`origin_local_remaining_day_model_reference`. Neither timestamp is an actual flight departure. A
+real flight number or clock time appears only when a complete provider schedule/timetable row passes
+route, date, timezone, duration, status, and future-departure validation.
 
-AirLabs route matches are treated as confirmed direct carriers. Every other catalog carrier is
-kept as a one-stop model scenario so “direct first” never labels an unconfirmed route as direct.
-Cabins always remain `catalog_scenario`, because the route source does not confirm cabin inventory.
-For a one-stop scenario the displayed duration adds a 90-minute connection and the itinerary
-on-time probability is the direct-leg probability squared. The response labels this assumption as
-`two_leg_independence_scenario`; it is not a claim about a real connection or transfer airport.
+AirLabs `schedules` is a near-real-time feed whose free horizon is roughly the next several hours;
+only complete future departures with a scheduled or unrecognized status remain selectable.
+Cancelled, departed, active, landed, and past live identities override matching recurring rows
+before filtering, so a routes projection cannot revive them. AirLabs `routes` is a recurring
+weekday timetable, so a match projected onto the selected date is labelled
+`recurring_timetable_projection`, not a live or guaranteed operation. Both require
+`AIRLABS_API_KEY` and are constrained by free quota, row limits, field completeness, and route
+coverage. Live schedule terminal values remain provider estimates, not confirmed day-of-operation
+assignments. Possible terminals and last-used aircraft from a recurring row are not returned as
+facts about the selected date. `schedule_observed_at` is the fetch time for a live schedule but the
+provider route-record `updated` time for a recurring projection; it is not one uniform freshness
+clock.
+
+Each schedules/routes request is capped at 50 rows. If either endpoint reports `request.has_more`
+or returns 50 rows, comparison and offer-detail responses set `schedule_sample_truncated=true` and
+`schedule_sample_limit=50`; their bilingual warning/notice states that the real flight list may be
+incomplete. `false` means no truncation signal was observed from endpoints actually queried; it does
+not prove complete coverage when an endpoint was skipped, unavailable, quota-limited, or outside its
+time window. The free integration does not attempt pagination.
+
+Routing uses an explicit three-state contract. `provider_direct` has `stops=0` and ranks first;
+`model_one_stop` has `stops=1`, uses only a distinct airline-specific mapped hub, and ranks next;
+`model_route_unresolved` has `stops=null` and ranks last. An unresolved offer uses O&D model
+distance/duration references internally but does not claim that the airline flies direct or via a
+connection. Its detail itinerary is `route_unresolved` with `legs=[]`. Cabins always remain
+`catalog_scenario`, because neither schedules nor routes confirms bookable cabin inventory. A
+one-stop fallback contains two model legs plus a 90-minute layover assumption and retains the
+explicit two-independent-leg on-time scenario (`p²`). No fallback invents a flight number,
+departure/arrival time, segment, or unrelated transfer airport.
 
 ## News feature
 
@@ -119,16 +159,30 @@ This is deliberately conservative:
 - the synthetic training relationship is an engineering demonstration, not validated causal
   evidence that news raises a particular fare or delay probability.
 
-## Second-level weather and news pages
+## Second-level offer, weather, and news pages
+
+Every comparison offer links to `GET /details/offer`. The page calls `POST /v1/offer-detail` with
+the route, `departure_date`, and opaque `offer_id`. Its response repeats the selected offer and
+adds a direct, one-stop, or unresolved itinerary. Complete near-real-time schedules use
+`airlabs_live_schedule`; recurring route rows projected onto the requested weekday use
+`airlabs_recurring_timetable_projection`; otherwise determined legs are `model_duration_only`.
+The unresolved case has no legs and exposes only O&D model reference totals; a determined
+connection exposes its two segment estimates and 90-minute layover assumption. Flight numbers and
+clock times stay null. The offer's cabin remains
+`catalog_scenario` in all three cases.
 
 The dashboard creates same-tab, shareable URLs for `GET /details/weather` and
 `GET /details/news` after a successful comparison. Query parameters contain `origin`,
-`destination`, `departure_time`, and `lang`. Before navigation, the dashboard stores the form,
-active ranking, language, and latest comparison in `sessionStorage`; using Back restores that
-session state when the browser still has it.
+`destination`, canonical `departure_date`, `departure_time_basis`, and `lang`. Before navigation,
+the dashboard stores the form, active ranking, language, and latest comparison in `sessionStorage`;
+using Back restores that session state when the browser still has it. Each detail-page refresh sends
+the date, not the previous fixed reference instant, so the API recomputes a safe noon or remaining-day
+reference from that request's `generated_at`. Legacy clients may instead send only
+`departure_time`; responses identify that path with `departure_time_basis=legacy_input`.
 
-The weather page calls `POST /v1/context/weather-detail`. It shows both the origin at planned
-departure and destination at route-model-estimated arrival, including current Open-Meteo model
+The weather page calls `POST /v1/context/weather-detail`. It shows both the origin at the
+date-derived model/weather reference and destination at route-model-estimated arrival reference,
+explicitly stating that neither is a flight schedule. It includes current Open-Meteo model
 conditions, the nearest target-hour forecast, a ±12-hour hourly window (up to 25 points), weather
 risk components, provider validity/fallback metadata, and available NOAA METAR/TAF raw reports with
 conservative bilingual explanations. Separate `aviation_metadata` explains an empty report list
@@ -177,6 +231,7 @@ usually differ, later criteria most often act as tie-breakers.
 - [Open-Meteo free API terms and attribution](https://open-meteo.com/en/terms)
 - [FAA NAS Status](https://nasstatus.faa.gov/)
 - [AirLabs schedules API](https://airlabs.co/docs/schedules)
+- [AirLabs routes API](https://airlabs.co/docs/routes)
 - [ADSB.lol public API](https://www.adsb.lol/docs/open-data/api/)
 - [GDELT DOC 2.0 API](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/)
 - [GDELT Global Article List RSS](https://blog.gdeltproject.org/announcing-the-gdelt-article-list-rss-feed/)
