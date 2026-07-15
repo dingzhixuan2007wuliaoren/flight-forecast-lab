@@ -6,6 +6,7 @@ __pycache__/
 .pytest_tmp*/
 .codex-pytest-*/
 .ruff_cache/
+runtime/
 .coverage
 htmlcov/
 .env

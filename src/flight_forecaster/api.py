@@ -73,14 +73,28 @@ def offer_details_page() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, str | bool]:
     artifact_exists = (model_dir() / ARTIFACT_FILENAME).exists()
+    service: PredictionService | None = None
     if artifact_exists:
         try:
-            get_service()
+            service = get_service()
         except (FileNotFoundError, ValueError):
-            return {"status": "model_not_ready", "model_ready": False}
+            return {
+                "status": "model_not_ready",
+                "model_ready": False,
+                "fare_provider_configured": False,
+                "fare_provider_environment": "disabled",
+            }
     return {
         "status": "ok" if artifact_exists else "model_not_trained",
         "model_ready": artifact_exists,
+        "fare_provider_configured": bool(
+            service is not None and service.flight_offer_provider.configured
+        ),
+        "fare_provider_environment": (
+            service.flight_offer_provider.environment
+            if service is not None
+            else "disabled"
+        ),
     }
 
 

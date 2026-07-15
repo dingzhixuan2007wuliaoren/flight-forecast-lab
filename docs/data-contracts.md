@@ -118,25 +118,33 @@ else:
 ### 响应结构
 
 - `context.weather`、`context.operations`、`context.news`：自动获取的三个上下文信号，均含 `[0, 1]` 数值、来源、获取时间、双语摘要和明确状态；新闻还可含最多五篇去重后的来源文章。`context.operations` 顶层是实际进入目标起飞时刻模型的信号，不能与嵌套的查询时刻 `current_snapshot` 混为一谈。
-- `offers`：逐航司、逐支持舱位的模型估价、80% 区间、行程时长、准点概率、风险等级、行李/学生/改签/退票状态及学生验证说明；每个 offer 都有稳定的 `id`，可传入 `/v1/offer-detail`。`cabin_status=catalog_scenario` 明确表示舱位来自比较目录而非实时报价或库存确认。
-- `rankings.direct_first`、`rankings.lowest_price`、`rankings.student_first`：引用 `offers[].id` 的完整排序。
-- `departure_date`：用户选择的日期；`departure_time` / `departure_timezone`：服务生成的出发机场当地带偏移参考时刻和 IANA 时区。`departure_time_basis=origin_local_noon_model_reference` 表示当地正午参考；`origin_local_remaining_day_model_reference` 表示同日生成时刻后 30 分钟参考。两者仅用于模型、天气与新闻上下文，不是真实航班计划。`schedule_sample_limit=50` 是免费查询行数上限；`schedule_sample_truncated=true` 表示至少一个 AirLabs 端点报告仍有更多行或已返回到上限，真实航班列表可能不完整。`false` 只表示实际查询到的端点未观察到截断信号；端点被跳过、不可用、配额受限或覆盖不足时，仍不能推断航班清单完整。`warnings` 为包含这些限制的中英文说明；`model_version` 为本次比较所用模型版本。
+- `offers`：严格模式下，只接收 SerpApi Google Flights 初始搜索后又通过 `booking_token` 购票选项验证的来源结果。每项必须是完整连续的一至四段行程，二次响应中的 `selected_flights` 与原候选完全一致，并包含真实航班号、完整当地/UTC 时刻、provider 确认的单一舱位，以及大于零的一位成人单程 USD 价格。`schedule_status=priced_offer`、`schedule_source=serpapi_google_flights_booking`、`cabin_status=provider_confirmed` 与 `bookability_status=booking_option_verified` 是进入主列表的必要证据；未知航司也只有在该报价完整通过验证时才可进入。每个 offer 都有稳定 `id`，可传入 `/v1/offer-detail`。单次最多保留 6 个已验证 offer，不是所有航司或全球航班的全量清单。AirLabs 时刻、周期投影、航司目录扩展、路线级提示和纯模型航班均不得进入。
+- `offers[].live_fare`：Google Flights 来源结果快照，固定为 `status=booking_option_confirmed`、`provider_code=serpapi_google_flights`、`environment=production`、`currency=USD`、`price_basis=one_way_per_adult`、`traveler_count=1`、`booking_verified=true` 与 `availability_status=booking_option_verified`；`taxes_included=null` 表示当前免费响应不能可靠证明税费是否已包含。它还包含销售方、HTTPS 打开路径、`booking_url_kind`、provider offer ID、`provider_cache_hit`、`provider_cache_age_seconds` 和 `verified_at`。`verified_at` 来自 SerpApi `search_metadata.created_at`，表示 provider 结果生成时间而不是本次 API 响应时间；缓存年龄是当前响应相对该时间的整数秒，允许处理/时钟容差的范围为 0–3900。`provider_cache_hit` 是本地缓存命中或 provider 状态/时间启发式得到的布尔值，不精确证明由哪一层缓存复用。`direct_get` 表示可打开 Google 的销售方跳转；`google_flights_itinerary` 表示销售方动作需要 POST，因此公开链接只打开 provider 返回的 Google Flights 结果页。官方在此只保证 `google_flights_url`，不能把页面写成“已选行程”或销售方直链。它与 `estimated_price_usd`、80% 模型区间及详情页 `price_curve` 相互独立；后者都不是实时报价或真实价格历史。验证后的报价仍只是来源结果快照，不保证航空公司或销售方最终结账页的库存、规则、税费或价格。
+- `rankings.direct_first`、`rankings.lowest_price`、`rankings.student_first`：只引用本次最多 6 个 `offers[].id`；价格排序使用确认的 `live_fare.total_amount`，不使用模型估价冒充实时价格；严格结果为空时三组均为空。
+- `availability_mode=strict_bookable_only`；有已确认报价时 `result_status=verified_offers_found`，否则根据原因返回 `no_verified_offer`、`fare_provider_not_configured`、`fare_provider_test_rejected`、`fare_provider_authentication_failed`、`fare_provider_rate_limited`、`fare_provider_budget_not_configured`、`fare_provider_budget_exhausted` 或 `fare_provider_unavailable`。`strict_mode_notice` 以中英双语说明 production 报价、覆盖与模型边界。
+- `fare_search_metadata`：给出 `status`、provider、`production|disabled` 环境、本次响应观测时间、已搜索舱位、本地严格缓存命中和单一 provider 结算周期额度使用情况。活动 provider 固定为 `serpapi_google_flights`；`search_call_count` 表示最多 4 次初始 Google Flights 舱位搜索，兼容字段 `pricing_call_count` 在此 provider 下表示最多 6 次 `booking_token` 候选验证，`call_count` 为两者总和且不超过 10。`monthly_call_limit` 是共用硬上限；名称为兼容字段，实际周期以账户 `plan_renewal_date` 划分而不是自然月。`monthly_calls_used` 是本地保守预留的尝试数，不是 provider 成功计费数；provider 缓存请求即使官方免费也会本地预留。缺少 key、额度耗尽或二次验证失败时 `offers` 为空。单个报价的 provider 缓存信息见 `live_fare.provider_cache_*`，不能用 metadata 的本地缓存命中代替。
+- `timetable_references[]`：AirLabs `schedules`/`routes` 返回且通过时刻字段校验的参考行。每项只含航司、航班号、完整时刻、来源时间、`bookability_status=unverified` 和双语排除原因；没有 offer ID、舱位、价格或详情入口，也不参与排名。即使 live schedule 与所选日期匹配，也不能替代 SerpApi Google Flights 购票选项验证。
+- `departure_date`：用户选择的日期；`departure_time` / `departure_timezone`：服务生成的出发机场当地带偏移参考时刻和 IANA 时区。`departure_time_basis=origin_local_noon_model_reference` 表示当地正午参考；`origin_local_remaining_day_model_reference` 表示同日生成时刻后 30 分钟参考。两者仅用于模型、天气与新闻上下文，不是真实航班计划。`schedule_sample_limit=50` 是 AirLabs 参考查询行数上限；`schedule_sample_truncated=true` 只表示至少一个 AirLabs 端点报告仍有更多参考行或已返回到上限，不代表 SerpApi 报价覆盖是否完整。`false` 也只表示实际查询到的 AirLabs 端点未观察到截断信号。`warnings` 为包含这些限制的中英文说明；`model_version` 为本次比较所用模型版本。
 
-上下文状态只允许 `live`、`forecast`、`proxy`、`historical`、`neutral` 或 `unavailable`。`routing_status=provider_direct` 表示提供方确认直达路由，此时 `stops=0`；`model_one_stop` 表示使用该航司不同于起终点的映射枢纽，此时 `stops=1`；`model_route_unresolved` 表示无法诚实确定直达或中转，此时 `stops=null`，不能称为直飞，详情也不得生成航段。`direct_first` 按上述顺序排序，将 unresolved 放在最后。比较始终保留全球目录中的所有航司；提供方返回的其他航司也会追加到结果中。
+上下文状态只允许 `live`、`forecast`、`proxy`、`historical`、`neutral` 或 `unavailable`。严格主列表中的 `routing_status=provider_direct` 表示一段且 `stops=0`；`provider_itinerary` 表示二至四段且 `stops=1..3`。`segments[]` 必须按顺序连续，下一段起点等于上一段终点且下一段起飞晚于上一段抵达。旧的 `model_one_stop` 与 `model_route_unresolved` 值仍保留在 schema 供兼容读取，但严格模式不再生成对应 offer。三组排序只引用严格 offers；全球航司目录和 `route_airlines` 不再自动生成候选航班。
 
 每个 offer 的航班计划证据使用以下字段：
 
 | 字段 | 语义 |
 | --- | --- |
-| `schedule_status` | `live_schedule`、`recurring_timetable_projection` 或 `model_scenario` |
-| `schedule_source` | `airlabs_schedules`、`airlabs_routes` 或 `model_fallback` |
-| `routing_status` / `stops` | `provider_direct/0`、`model_one_stop/1` 或 `model_route_unresolved/null`；模型内部可用零经停特征计算 unresolved 的 O&D 参考，但公开响应不声称直飞 |
-| `flight_number` | 仅完整 provider 行可返回；模型回退必须为 `null` |
-| `scheduled_departure_local` / `scheduled_arrival_local` | provider 提供并通过时区/先后顺序校验的当地钟点；模型回退为 `null` |
-| `scheduled_departure_utc` / `scheduled_arrival_utc` | 对应的 UTC 绝对时刻；模型回退为 `null` |
-| `provider_flight_status` / `schedule_observed_at` | 可选状态与来源时间；`live_schedule` 的 observed time 是本次抓取时间，`recurring_timetable_projection` 则是 provider route record 的 `updated` 时间，不得统一解释为实时查询观测 |
+| `schedule_status` | 主列表固定为 `priced_offer`；`live_schedule`、`recurring_timetable_projection` 与 `model_scenario` 仅为参考/兼容语义 |
+| `schedule_source` | 主列表固定为 `serpapi_google_flights_booking`；AirLabs 参考使用 `airlabs_schedules`/`airlabs_routes` |
+| `routing_status` / `stops` | `provider_direct/0` 或 `provider_itinerary/1..3`；模型内部参考不得公开声称为真实航段 |
+| `flight_number` | 摘要使用第一航段真实航班号；完整行程见最多四项 `segments[]` |
+| `scheduled_departure_local` / `scheduled_arrival_local` | 第一段出发与最后一段抵达的当地钟点，必须通过机场 IANA 时区、日期和先后顺序校验 |
+| `scheduled_departure_utc` / `scheduled_arrival_utc` | 对应第一段出发与最后一段抵达的 UTC 绝对时刻 |
+| `provider_flight_status` / `schedule_observed_at` | 主列表状态为 `booking_option_verified`，来源时间是 `booking_token` 购票选项验证时间；AirLabs 参考的 observed time 仍按 schedules 抓取时间或 routes record `updated` 解释 |
 
-AirLabs `schedules` 是临近当前时刻的近实时航班计划，只有完整、未来起飞且状态为 scheduled 或未识别状态的行才可标为 `live_schedule`。取消、已起飞、active、landed、departed 或其他明确非未来可选状态的 live identity 会先覆盖相同的 routes 投影，再整体过滤，禁止周期投影将其“复活”。AirLabs `routes` 表达按星期重复的周期时刻表；匹配所选日期后仍必须标为 `recurring_timetable_projection`，不能称为已确认执行的实时航班，且可能航站楼及 last-used 机型不得作为该日期事实返回。两个端点都需要免费 `AIRLABS_API_KEY`，并受免费层时间窗口、配额、每次最多 50 行和全球覆盖限制；任一端点的 `request.has_more` 为真或返回行数达到 50 时，响应将 `schedule_sample_truncated` 标为真。本演示为控制免费配额和调用量不继续分页。
+严格报价链首先按四种请求舱位调用 SerpApi Google Flights 单程搜索，并设置 `deep_search=true`、`show_hidden=true`。只保留带 `booking_token` 的有界候选；最多 6 个候选优先保持航司多样性，再以价格填充剩余位置，随后逐个使用 token 查询购票选项。单次比较因此最多 4 次舱位搜索加 6 次验证，共 10 次 provider 查询。只有二次返回的 `selected_flights` 与原候选逐段一致，并仍满足精确 O&D、出发日期、未来起飞、连续一至四段、每段真实航班号和完整时刻、全程同一请求舱位、一位成人单程 USD 正数价格，且至少一个购票选项具有销售方、匹配航班号和安全的 HTTPS 打开路径，结果才可进入主列表。销售方动作要求 POST 时，系统只公开 provider 返回的 Google Flights 结果页 URL，并通过 `booking_url_kind` 明确区分，不伪造普通直链或“已选行程”。两个扩展搜索参数仍不能保证所有航司、航班、舱位、销售方或私有票价的全量覆盖。
+
+SerpApi Free 目前包含每个 `plan_renewal_date` 结算周期 250 次成功搜索及每小时 50 次请求；初始搜索和 `booking_token` 查询共用额度。最坏路径每次比较 10 次，约等于每小时 5 次全新完整比较，其他请求会进一步减少。服务使用持久化单一计数和 `SERPAPI_MONTHLY_LIMIT` 在本地 hard limit 前保守预留所有尝试；字段名保留 monthly 兼容性，但周期不是自然月。即使 provider 缓存请求按官方规则免费，本地也预留，所以 `monthly_calls_used` 可能高于 provider 计费用量并提前停止。省略上限时默认 250，大于 250 被钳制为 250，非法或非正值也不会解除上限。未配置 key、额度耗尽、认证失败、HTTP 限流、provider 不可用、无结果或字段验证失败都返回带 `fare_search_metadata` 的结构化空 `offers`，不得启用 AirLabs 或模型补位。免费额度、覆盖、字段和条款可能变化；缺少某航司、舱位、航线、销售方或日期时必须如实为空，不能伪造航班号、精确时刻、舱位或价格来“补全”列表。
+
+AirLabs `schedules` 与 `routes` 在严格比较中仅用于 `timetable_references` 和机场运行上下文。取消、已起飞、active、landed、departed 或其他明确非未来状态的 live identity 会先覆盖相同 routes 投影，禁止周期投影将其“复活”。两个端点仍需要可选的 `AIRLABS_API_KEY`，并受免费层时间窗口、配额、每次最多 50 行和全球覆盖限制；任一端点的 `request.has_more` 为真或返回行数达到 50 时，响应将 `schedule_sample_truncated` 标为真。本演示为控制免费配额和调用量不继续分页。AirLabs 不提供座位库存或实时报价，因此其任何行都保持 `bookability_status=unverified`。
 
 `context.operations` 与可选的 `context.operations.current_snapshot` 使用以下解释字段：
 
@@ -167,11 +175,11 @@ AirLabs `schedules` 是临近当前时刻的近实时航班计划，只有完整
 
 GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败时可使用官方 GAL 滚动 RSS。成功新闻按航线新鲜缓存 15 分钟。实时来源失败时，不超过 6 小时的成功缓存可标为 `historical` 并降低模型影响；没有缓存时必须返回 `neutral`、值 0 和空文章列表。`context.news.observed_at` 表示该新闻上下文快照的获取时间，而不是某篇文章的发布时间。
 
-`provider_direct` 使用 `punctuality_basis=direct_leg_model`。`model_one_stop` 使用 `two_leg_independence_scenario`：总时长由两个经该航司示例枢纽分别估算的航段时长加 90 分钟模型转机组成，其行程准点率按两个同概率、相互独立航段同时准点的保守场景计算，即 `p_itinerary = p_leg²`。无法确定路由时使用 `model_route_unresolved` 与 `route_only_model`；距离和时长仅为 O&D 模型参考，不生成航段、航班号、精确钟点或无关枢纽。
+严格模式生成的一段 offer 为 `provider_direct`、`stops=0` 和 `punctuality_basis=direct_leg_model`；二至四段 offer 为 `provider_itinerary`、`stops=1..3` 和 `punctuality_basis=multi_leg_independence_model`。`model_one_stop`、`model_route_unresolved`、`two_leg_independence_scenario` 与 `route_only_model` 仅作为旧响应兼容枚举保留，当前严格比较不生成这些模型航班。
 
-政策状态采用严格证据语义。`unknown` 不等于“不包含”；公开学生计划只标为 `program_available`，不能当成当前航线、日期和舱位已经获得实际学生折扣。只有报价级证据才可使用 `confirmed_free`、`confirmed_included` 或 `confirmed_discount`。
+政策状态采用严格证据语义。`unknown` 不等于“不包含”；普通 Google Flights 免费查询不能验证当前行程是否获得实际学生专属折扣，因此 UI 显示 `unknown`，排序不加分。公开学生计划只标为 `program_available`，也不能当成当前航线、日期和舱位已经获得实际学生折扣。只有独立的报价级证据才可使用 `confirmed_free`、`confirmed_included` 或 `confirmed_discount`；当前 SerpApi 链没有这类学生折扣证据。
 
-学生优先排序依次比较：最低模型价格、免费托运行李、已确认实际学生折扣、免费改签/退票、年龄与身份验证门槛。`program_available` 本身不满足“实际折扣”条件，只在最后一级使用其公开年龄和验证信息。由于价格是第一排序键，后续条件主要用于同价时打破平局。
+学生优先排序依次比较：最低 `live_fare.total_amount`、免费托运行李、已确认实际学生折扣、免费改签/退票、年龄与身份验证门槛。`program_available` 本身不满足“实际折扣”条件，只在最后一级使用其公开年龄和验证信息。没有独立证据的条件保持 `unknown`，评分为中性，不因缺失而加分。模型估价与价格曲线不代替 live fare 参与最低价格判断；后续条件主要用于同价时打破平局。
 
 ## Offer 详情 API
 
@@ -185,16 +193,17 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 | `destination` | string | 是 | 与比较请求相同的三位机场代码 |
 | `departure_date` | date | 是 | 与比较请求相同的出发日期 |
 | `offer_id` | string | 是 | 比较响应中 `offers[].id` 的不透明稳定标识；客户端不得自行拼接或修改 |
+| `force_refresh` | boolean | 否 | 默认 `false`，初次详情加载复用 5 分钟严格缓存；只有用户点击“刷新并重新查询”时传 `true`，强制重新执行最多 10 次 provider 查询 |
 
-响应中的 `offer` 沿用比较响应的价格、准点、政策、舱位和 schedule 字段；`itinerary` 提供：
+响应中的 `offer` 沿用比较响应的 live fare、模型估价、准点、政策、舱位和 schedule 字段。详情初载 `force_refresh=false` 优先复用 5 分钟严格缓存；`force_refresh=true` 才重新执行 Google Flights 搜索和 `booking_token` 购票选项验证。两种路径都只接受仍存在于当前严格结果中的 offer，已过期、旧周期/模型或无法重新确认的 offer ID 返回 404。前端请求超时为 90 秒。`itinerary` 提供：
 
-- `kind=direct|one_stop|route_unresolved`、`time_basis=provider_schedule|model_duration_only`、总距离与总时长；
-- `legs[]` 中每个已确定航段的起终点、日期上下文、距离、时长和 `data_basis`；`route_unresolved` 必须返回空列表，避免把 O&D 参考虚称为航段；
-- 完整 provider 行可额外给出航班号和当地/UTC 钟点；仅 live schedules 的航站楼字段可返回，语义仍是 provider-estimated terminal，不是当天已确认航站楼。Routes 的 possible terminals 与 last-used aircraft 不返回；
-- 模型中转使用 `layover_minutes=90` 与 `layover_status=model_assumption`。没有适用 provider 数据时，所有航班号和钟点保持 `null`，航段 `data_basis=model_duration_only`；
-- `schedule_status` / `schedule_source` / `schedule_observed_at`、`schedule_sample_truncated` / `schedule_sample_limit`、双语 `fallback_reason` 和 `notice` 明确说明证据边界；触及免费 50 行上限时，详情同样提示列表可能不完整。
+- `kind=direct|one_stop|multi_stop`、`time_basis=provider_schedule`、总距离与总时长；兼容 schema 可保留 `route_unresolved|model_duration_only`，但严格详情不生成它们；
+- `legs[]` 为一至四项 `booking_token` 购票选项已验证航段，每段包含起终点、营销/承运航司、航班号、当地/UTC 时刻、距离、时长、确认舱位，以及 provider 返回时可用的 booking class、fare basis/brand、托运行李和航站楼/机型字段；`data_basis=serpapi_booking_confirmed`；
+- `layovers[]` 最多三项，列出中转机场和由相邻已确认时刻计算的停留分钟数；`layover_status=provider_confirmed`。直飞没有中转项；
+- `schedule_status` / `schedule_source` / `schedule_observed_at`、`fare_search_metadata`、双语 `fallback_reason` 和 `notice` 明确说明报价时间、调用状态和证据边界；AirLabs 的 `schedule_sample_*` 只描述旁侧参考样本，不改变该报价的确认状态。
+- `price_curve`：`status=model_projection`、`basis=synthetic_demo_model`、`currency=USD`、起止日期、生成时间、`historical_prices_available=false`、是否超出主要 180 天训练提前期，以及最多 371 个逐日点。每点含 `quote_date`、带时区 `quote_time`、距离起飞天数、模型估价和 80% 区间；第一点与详情当前估价使用相同生成时刻和特征，最后一点必须严格早于起飞。曲线是一次请求中改变模拟查询日期得到的模型轨迹，不是历史或未来真实报价。
 
-`airlabs_live_schedule` 只用于完整、日期匹配、尚未起飞且状态可用的 AirLabs schedules 行；`airlabs_recurring_timetable_projection` 表示把 routes 的周期时刻表投影到所选日期，不保证实际执行。无 key、无覆盖、额度耗尽、超时、空结果或字段不完整都回退到 `model_duration_only`，绝不补造航班号或精确钟点。无论 schedule 来源如何，舱位仍保持 `catalog_scenario`。
+`serpapi_booking_confirmed` 只用于通过初始 Google Flights 搜索和 `booking_token` 二次验证的航段。AirLabs 的 `airlabs_live_schedule` 与 `airlabs_recurring_timetable_projection` 只能出现在参考语义中。无 SerpApi key、无覆盖、本地额度耗尽、认证失败、限流、超时、空结果或字段不完整都返回结构化空结果，绝不补造航班号、精确钟点、舱位、报价或模型航班。保留 offer 的舱位为 `provider_confirmed`，购买状态为时点性的 `booking_option_verified`；HTTPS 打开路径由 provider 证据产生，并用 `booking_url_kind` 标明是否为直接 GET 跳转，但这不等于出票或最终结账价格保证。
 
 ## 上下文详情 API
 
@@ -226,15 +235,15 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 | --- | --- |
 | `GET /health` | 进程与模型加载健康状态；不代表模型仍然准确 |
 | `GET /v1/model-info` | 模型版本、训练来源、时间和可用任务信息 |
-| `POST /v1/compare` | 用三个输入生成多航司、多舱位结果与三类完整排序 |
+| `POST /v1/compare` | 用三个输入生成最多 6 个已验证 offer 及三类有界排序；不表示全球全量 |
 | `GET /details/offer` | 每个比较 offer 的中英双语航班/模型行程详情页面 |
-| `POST /v1/offer-detail` | 按 `offer_id` 返回 provider schedule 或明确标记的模型航段详情 |
+| `POST /v1/offer-detail` | 按 `offer_id` 返回再次通过购票选项验证的 provider schedule；无法验证时返回结构化失败 |
 | `GET /details/weather` | 中英双语天气详情页面；查询参数由主页生成 |
 | `GET /details/news` | 中英双语新闻详情页面；查询参数由主页生成 |
 | `POST /v1/context/weather-detail` | 出发与到达机场的当前/目标天气、趋势和 METAR/TAF 详情 |
 | `POST /v1/context/news-detail` | 最近七日最多 20 篇中断新闻及文章级风险解释 |
 
-健康响应不得暴露本地绝对路径、密钥或原始训练记录。模型信息应能让调用方识别是否误用了 `synthetic` 演示模型。
+健康响应不得暴露本地绝对路径、密钥或原始训练记录。SerpApi key 不得进入浏览器/前端、仓库或应用日志；服务端只按官方要求把它放在发往 `https://serpapi.com` 的 HTTPS 查询参数中，完整外部请求 URL 不得记录。模型信息应能让调用方识别是否误用了 `synthetic` 演示模型。
 
 ## 派生特征规则
 

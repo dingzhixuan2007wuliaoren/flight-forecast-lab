@@ -2,9 +2,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from flight_forecaster.api import app, get_service
+from flight_forecaster.schemas import ComparisonResponse
 
 
 def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
@@ -17,12 +20,18 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert health.json()["model_ready"] is True
     dashboard = client.get("/").text
     assert "Flight Forecast Lab" in dashboard
+    assert 'id="strict-mode-notice"' in dashboard
+    assert 'id="timetable-reference-section"' in dashboard
     assert 'name="distance_km"' not in dashboard
     assert 'name="duration_minutes"' not in dashboard
     assert 'name="quote_time"' not in dashboard
     assert 'name="weather_severity_forecast"' not in dashboard
     assert 'name="origin_congestion_index"' not in dashboard
     assert 'name="departure_date"' in dashboard
+    offer_page = client.get("/details/offer").text
+    assert 'id="price-curve"' in offer_page
+    assert 'id="curve-chart"' in offer_page
+    assert "historical_prices_available" in offer_page
     assert "fare_estimation" in client.get("/v1/model-info").json()["available_tasks"]
     assert (
         "global_airline_cabin_comparison"
@@ -115,7 +124,7 @@ def test_unsupported_airport_is_rejected(monkeypatch, trained_model_dir: Path) -
     assert "暂不支持机场" in response.json()["detail"]
 
 
-def test_global_comparison_has_all_rankings_and_labelled_fallbacks(
+def test_strict_comparison_returns_structured_empty_result_without_fare_provider(
     monkeypatch, trained_model_dir: Path
 ) -> None:
     monkeypatch.setenv("MODEL_DIR", str(trained_model_dir))
@@ -132,55 +141,34 @@ def test_global_comparison_has_all_rankings_and_labelled_fallbacks(
     assert response.status_code == 200
     payload = response.json()
     assert payload["distance_km"] > 5_000
-    assert len({offer["airline_code"] for offer in payload["offers"]}) == 60
-    offer_ids = {offer["id"] for offer in payload["offers"]}
-    assert set(payload["rankings"]["direct_first"]) == offer_ids
-    assert set(payload["rankings"]["lowest_price"]) == offer_ids
-    assert set(payload["rankings"]["student_first"]) == offer_ids
+    assert payload["availability_mode"] == "strict_bookable_only"
+    assert payload["result_status"] == "fare_provider_not_configured"
+    assert payload["offers"] == []
+    assert payload["rankings"] == {
+        "direct_first": [],
+        "lowest_price": [],
+        "student_first": [],
+    }
+    assert payload["timetable_references"] == []
+    assert "Google Flights" in payload["strict_mode_notice"]["zh"]
+    assert "booking-token" in payload["strict_mode_notice"]["en"]
+    assert payload["fare_search_metadata"]["status"] == "not_configured"
     assert payload["context"]["weather"]["status"] == "proxy"
     assert payload["context"]["operations"]["status"] == "proxy"
     assert payload["context"]["news"]["status"] == "neutral"
     assert payload["context"]["news"]["articles"] == []
-    assert any(offer["student_status"] == "program_available" for offer in payload["offers"])
-    assert all(offer["route_status"] == "model_scenario" for offer in payload["offers"])
-    assert {offer["stops"] for offer in payload["offers"]} == {None, 1}
-    assert all(offer["cabin_status"] == "catalog_scenario" for offer in payload["offers"])
-    assert all(
-        offer["duration_minutes"] > payload["duration_minutes"] + 90
-        for offer in payload["offers"]
-        if offer["stops"] == 1
-    )
-    assert all(
-        offer["duration_minutes"] == payload["duration_minutes"]
-        for offer in payload["offers"]
-        if offer["stops"] is None
-    )
-    assert all(
-        offer["punctuality_basis"]
-        == ("two_leg_independence_scenario" if offer["stops"] == 1 else "route_only_model")
-        for offer in payload["offers"]
-    )
     assert payload["departure_timezone"] == "America/Toronto"
     assert payload["departure_date"] == departure
     assert payload["departure_time_basis"] == "origin_local_noon_model_reference"
-
-    aa_offer = next(offer for offer in payload["offers"] if offer["airline_code"] == "AA")
-    detail = client.post(
-        "/v1/offer-detail",
-        json={
-            "origin": "YYZ",
-            "destination": "LHR",
-            "departure_date": departure,
-            "offer_id": aa_offer["id"],
-        },
-    )
-    assert detail.status_code == 200
-    itinerary = detail.json()["itinerary"]
-    assert itinerary["kind"] == "one_stop"
-    assert itinerary["layover_minutes"] == 90
-    assert itinerary["total_duration_minutes"] == (
-        sum(leg["duration_minutes"] for leg in itinerary["legs"]) + 90
-    )
+    assert ComparisonResponse.model_validate(payload).fare_search_metadata is not None
+    missing_metadata = dict(payload)
+    missing_metadata["fare_search_metadata"] = None
+    with pytest.raises(ValidationError, match="requires fare-search metadata"):
+        ComparisonResponse.model_validate(missing_metadata)
+    mismatched_status = dict(payload)
+    mismatched_status["result_status"] = "fare_provider_rate_limited"
+    with pytest.raises(ValidationError, match="must agree"):
+        ComparisonResponse.model_validate(mismatched_status)
     missing = client.post(
         "/v1/offer-detail",
         json={

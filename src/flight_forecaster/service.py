@@ -4,7 +4,7 @@ import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
@@ -16,7 +16,13 @@ import numpy as np
 import pandas as pd
 from timezonefinder import TimezoneFinder
 
-from flight_forecaster.catalog import AirlineProfile, comparison_airlines, get_airline_profile
+from flight_forecaster.availability import (
+    ConfirmedFlightOffer,
+    FlightOfferSearchResult,
+    FlightOfferSegment,
+    flight_offer_provider_from_env,
+)
+from flight_forecaster.catalog import AirlineProfile, get_airline_profile
 from flight_forecaster.context import (
     AIRLABS_FREE_SAMPLE_LIMIT,
     ContextProvider,
@@ -32,7 +38,7 @@ from flight_forecaster.route_info import (
     RouteLookupError,
     estimate_route,
 )
-from flight_forecaster.schedules import FlightSchedule, ScheduleProvider
+from flight_forecaster.schedules import ScheduleProvider
 from flight_forecaster.schemas import (
     BilingualText,
     BilingualWarning,
@@ -42,7 +48,10 @@ from flight_forecaster.schemas import (
     ComparisonResponse,
     ContextDetailRequest,
     ContextSignal,
+    FareSearchMetadata,
+    ItineraryLayover,
     ItineraryLeg,
+    LiveFare,
     NewsArticle,
     NewsDetailResponse,
     NewsSignal,
@@ -56,8 +65,12 @@ from flight_forecaster.schemas import (
     OperationsSignal,
     OperationsSnapshot,
     PredictionContextResponse,
+    PriceForecastCurve,
+    PriceForecastPoint,
     PricePrediction,
     PriceRequest,
+    ProviderOfferSegment,
+    TimetableReference,
     WeatherDetailResponse,
 )
 from flight_forecaster.training import ARTIFACT_FILENAME, SCHEMA_VERSION
@@ -80,12 +93,9 @@ def _local_time_features(value: datetime) -> dict[str, int]:
 class _GenericAirlineProfile:
     code: str
     name: str
-    supported_cabins: tuple[str, ...] = (
-        "economy",
-        "premium_economy",
-        "business",
-        "first",
-    )
+    # Unknown airlines must never be expanded into invented premium cabins.
+    # Strict comparison excludes them until the curated cabin catalogue knows them.
+    supported_cabins: tuple[str, ...] = ("economy",)
     baggage_status: str = "unknown"
     student_status: str = "unknown"
     change_status: str = "unknown"
@@ -112,8 +122,8 @@ class _OfferScenario:
     departure_time: datetime
     duration_minutes: int
     distance_km: float
-    schedule: FlightSchedule | None = None
-    hub: str | None = None
+    confirmed_offer: ConfirmedFlightOffer
+    provider_segments: tuple[ProviderOfferSegment, ...]
 
 
 # Deterministic primary hubs are used only to explain a modelled one-stop scenario.
@@ -192,6 +202,7 @@ class PredictionService:
         airport_resolver: AirportResolver | None = None,
         detail_provider: DetailProvider | None = None,
         schedule_provider: ScheduleProvider | None = None,
+        flight_offer_provider: Any | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.model_dir = Path(model_dir)
@@ -215,10 +226,20 @@ class PredictionService:
             client=self.context_provider.client,
             enabled=self.context_provider.external_context_enabled,
         )
+        self.flight_offer_provider = (
+            flight_offer_provider
+            if flight_offer_provider is not None
+            else flight_offer_provider_from_env(
+                self.model_dir.parent / "runtime" / "serpapi-usage.sqlite3"
+            )
+        )
         self._now_provider = now_provider or (lambda: datetime.now(UTC))
         if airport_resolver is not None:
             self.airport_resolver = airport_resolver
-        elif self.context_provider.external_context_enabled:
+        elif (
+            self.context_provider.external_context_enabled
+            or self.flight_offer_provider.configured
+        ):
             self.airport_resolver = OurAirportsResolver()
         else:
             self.airport_resolver = None
@@ -380,13 +401,8 @@ class PredictionService:
         airline: str,
         cabin: str,
         stops: int | None,
-        schedule: FlightSchedule | None,
+        fare_identity: str,
     ) -> str:
-        schedule_identity = (
-            f"{schedule.flight_number}|{schedule.departure_utc.isoformat()}"
-            if schedule is not None
-            else "model"
-        )
         canonical = "|".join(
             (
                 origin,
@@ -395,10 +411,267 @@ class PredictionService:
                 airline,
                 cabin,
                 str(stops),
-                schedule_identity,
+                fare_identity,
             )
         )
         return f"off_{sha256(canonical.encode('utf-8')).hexdigest()[:24]}"
+
+    @staticmethod
+    def _provider_local_time(value: datetime, airport: Airport) -> datetime:
+        """Attach an airport timezone to a provider-local wall-clock time.
+
+        Google Flights returns airport-local segment clocks without UTC offsets.
+        Strict mode resolves them from the airport and rejects DST gaps or ambiguous
+        folds instead of guessing an instant.
+        """
+
+        if value.tzinfo is not None or value.utcoffset() is not None:
+            raise RouteLookupError("provider local time must not include an offset")
+        timezone, _ = PredictionService._airport_timezone(airport)
+        localized = value.replace(tzinfo=timezone, fold=0)
+        round_trip = localized.astimezone(UTC).astimezone(timezone).replace(tzinfo=None)
+        if round_trip != value:
+            raise RouteLookupError("provider local time falls in a DST gap")
+        alternate = value.replace(tzinfo=timezone, fold=1)
+        if alternate.utcoffset() != localized.utcoffset():
+            raise RouteLookupError("provider local time is ambiguous during a DST fold")
+        return localized
+
+    @staticmethod
+    def _full_flight_number(segment: FlightOfferSegment) -> str:
+        raw_number = segment.flight_number.upper()
+        carrier = segment.marketing_airline_code.upper()
+        value = raw_number if raw_number.startswith(carrier) else f"{carrier}{raw_number}"
+        if not (3 <= len(value) <= 12) or not value.isalnum():
+            raise RouteLookupError("provider flight number is invalid")
+        return value
+
+    def _strict_provider_segments(
+        self,
+        offer: ConfirmedFlightOffer,
+        *,
+        origin: str,
+        destination: str,
+        departure_date: date,
+        generated_at: datetime,
+    ) -> tuple[tuple[ProviderOfferSegment, ...], float, int]:
+        if not 1 <= len(offer.segments) <= 4:
+            raise RouteLookupError("strict offers require one to four segments")
+
+        segments: list[ProviderOfferSegment] = []
+        total_distance_km = 0.0
+        for sequence, raw in enumerate(offer.segments, start=1):
+            leg_route = self._route(raw.origin, raw.destination)
+            departure_local = self._provider_local_time(raw.departure_at, leg_route.origin)
+            arrival_local = self._provider_local_time(raw.arrival_at, leg_route.destination)
+            departure_utc = departure_local.astimezone(UTC)
+            arrival_utc = arrival_local.astimezone(UTC)
+            if arrival_utc <= departure_utc:
+                raise RouteLookupError("provider segment arrival is not after departure")
+            duration_minutes = round((arrival_utc - departure_utc).total_seconds() / 60)
+            if duration_minutes <= 0 or duration_minutes > 2_160:
+                raise RouteLookupError("provider segment duration is outside strict limits")
+
+            bag_quantity = raw.checked_bags_quantity
+            bag_weight = raw.checked_bags_weight
+            bag_unit = (
+                raw.checked_bags_weight_unit.upper()
+                if raw.checked_bags_weight_unit is not None
+                else None
+            )
+            if bag_quantity is not None and bag_weight is not None:
+                raise RouteLookupError("provider returned conflicting baggage units")
+            if bag_weight is not None and bag_weight <= 0:
+                bag_quantity, bag_weight, bag_unit = 0, None, None
+            if bag_weight is not None and bag_unit not in {"KG", "LB"}:
+                raise RouteLookupError("provider returned an unsupported baggage unit")
+
+            aircraft = raw.aircraft_icao
+            if aircraft is not None and len(aircraft) > 12:
+                aircraft = None
+            booking_class = raw.booking_class
+            if booking_class is not None and len(booking_class) > 8:
+                raise RouteLookupError("provider booking class is too long")
+            segment = ProviderOfferSegment(
+                sequence=sequence,
+                origin=raw.origin,
+                destination=raw.destination,
+                flight_number=self._full_flight_number(raw),
+                marketing_airline_code=raw.marketing_airline_code,
+                operating_airline_code=raw.operating_airline_code,
+                departure_local=departure_local,
+                arrival_local=arrival_local,
+                departure_utc=departure_utc,
+                arrival_utc=arrival_utc,
+                duration_minutes=duration_minutes,
+                departure_terminal=raw.departure_terminal,
+                arrival_terminal=raw.arrival_terminal,
+                aircraft_icao=aircraft,
+                cabin=raw.cabin,
+                booking_class=booking_class,
+                fare_basis=raw.fare_basis,
+                fare_brand=raw.fare_brand,
+                included_checked_bag_quantity=bag_quantity,
+                included_checked_bag_weight=bag_weight,
+                included_checked_bag_weight_unit=bag_unit,
+            )
+            if segments:
+                previous = segments[-1]
+                if previous.destination != segment.origin:
+                    raise RouteLookupError("provider itinerary is not continuous")
+                if segment.departure_utc <= previous.arrival_utc:
+                    raise RouteLookupError("provider connection is not chronological")
+            segments.append(segment)
+            total_distance_km += leg_route.distance_km
+
+        first = segments[0]
+        last = segments[-1]
+        if (
+            first.origin != origin
+            or last.destination != destination
+            or first.departure_local.date() != departure_date
+            or first.departure_utc <= generated_at
+        ):
+            raise RouteLookupError("provider itinerary does not match the future request")
+        total_duration_minutes = round(
+            (last.arrival_utc - first.departure_utc).total_seconds() / 60
+        )
+        if total_duration_minutes <= 0:
+            raise RouteLookupError("provider itinerary duration is invalid")
+        if offer.cabin != first.cabin or any(
+            segment.cabin != offer.cabin for segment in segments
+        ):
+            raise RouteLookupError("provider itinerary mixes cabin classes")
+        return tuple(segments), round(total_distance_km, 1), total_duration_minutes
+
+    @staticmethod
+    def _baggage_status(segments: tuple[ProviderOfferSegment, ...]) -> str:
+        allowances: list[bool | None] = []
+        for segment in segments:
+            if segment.included_checked_bag_quantity is not None:
+                allowances.append(segment.included_checked_bag_quantity > 0)
+            elif segment.included_checked_bag_weight is not None:
+                allowances.append(segment.included_checked_bag_weight > 0)
+            else:
+                allowances.append(None)
+        if any(value is False for value in allowances):
+            return "not_included"
+        if all(value is True for value in allowances):
+            return "confirmed_included"
+        return "unknown"
+
+    @staticmethod
+    def _change_status(offer: ConfirmedFlightOffer) -> str:
+        if offer.no_restriction_fare is True or offer.no_penalty_fare is True:
+            return "confirmed_free"
+        if offer.no_penalty_fare is False:
+            return "confirmed_paid"
+        return "unknown"
+
+    @staticmethod
+    def _refund_status(offer: ConfirmedFlightOffer) -> str:
+        if offer.refundable_fare is False:
+            return "not_included"
+        if offer.refundable_fare is True and (
+            offer.no_restriction_fare is True or offer.no_penalty_fare is True
+        ):
+            return "confirmed_free"
+        return "unknown"
+
+    @staticmethod
+    def _fare_metadata(result: FlightOfferSearchResult) -> FareSearchMetadata:
+        notices = {
+            "confirmed_offers": BilingualText(
+                zh="报价已通过 Google Flights 搜索及 booking token 购票选项二次验证。",
+                en=(
+                    "Offers passed both the Google Flights search and booking-token "
+                    "booking-option verification."
+                ),
+            ),
+            "no_results": BilingualText(
+                zh="生产报价源没有返回通过严格验证的可售方案。",
+                en="The production fare source returned no strictly verified offer.",
+            ),
+            "not_configured": BilingualText(
+                zh="尚未配置 SerpApi API 密钥；严格模式不会用时刻表补造结果。",
+                en=(
+                    "A SerpApi API key is not configured; strict mode "
+                    "does not substitute timetable projections."
+                ),
+            ),
+            "test_environment_rejected": BilingualText(
+                zh="测试或样例报价已被严格模式拒绝。",
+                en=(
+                    "Test or illustrative fare data is rejected by strict mode."
+                ),
+            ),
+            "authentication_failed": BilingualText(
+                zh="SerpApi 认证失败；未返回未验证航班。",
+                en="SerpApi authentication failed; no unverified flights were returned.",
+            ),
+            "rate_limited": BilingualText(
+                zh="生产报价源当前限流；严格模式返回空结果。",
+                en="The production fare source is rate-limited; strict mode returns no offers.",
+            ),
+            "budget_not_configured": BilingualText(
+                zh="尚未设置本地免费月额度上限；为防止超额计费，本次未调用生产接口。",
+                en=(
+                    "Local monthly free-quota limits are not configured, so the "
+                    "production API was not called to prevent overage charges."
+                ),
+            ),
+            "budget_exhausted": BilingualText(
+                zh="本地免费月额度保护已触发；本次不再调用生产接口。",
+                en=(
+                    "The local monthly free-quota guard is exhausted; no further "
+                    "production calls were made."
+                ),
+            ),
+            "provider_unavailable": BilingualText(
+                zh="生产报价源暂不可用或返回了无效数据；严格模式未降级为虚构结果。",
+                en=(
+                    "The production fare source is unavailable or returned invalid "
+                    "data; strict mode did not fall back to invented offers."
+                ),
+            ),
+        }
+        limits = (
+            result.search_monthly_limit,
+            result.pricing_monthly_limit,
+        )
+        usage = (
+            result.search_monthly_used,
+            result.pricing_monthly_used,
+        )
+        # SerpApi has one shared monthly pool for initial searches and
+        # booking-token follow-ups.  The provider exposes that pool in exactly
+        # one legacy slot; never add the slots and accidentally report 500.
+        monthly_limit = next((value for value in limits if value is not None), None)
+        monthly_used = next((value for value in usage if value is not None), None)
+        return FareSearchMetadata(
+            status=result.status,
+            provider_code=(
+                "none" if result.status == "not_configured" else "serpapi_google_flights"
+            ),
+            environment=(
+                "disabled"
+                if result.status == "not_configured"
+                else ("production" if result.environment == "production" else "test")
+            ),
+            observed_at=result.observed_at,
+            searched_cabins=list(result.searched_cabins),
+            call_count=result.calls_used,
+            search_call_count=result.search_calls_used,
+            pricing_call_count=result.pricing_calls_used,
+            cache_hit=result.cache_hit,
+            monthly_call_limit=monthly_limit,
+            monthly_calls_used=monthly_used,
+            search_monthly_limit=result.search_monthly_limit,
+            search_monthly_used=result.search_monthly_used,
+            pricing_monthly_limit=result.pricing_monthly_limit,
+            pricing_monthly_used=result.pricing_monthly_used,
+            notice=notices[result.status],
+        )
 
     @staticmethod
     def _fallback_reason(code: str | None) -> BilingualText | None:
@@ -674,7 +947,11 @@ class PredictionService:
             age_rank = (program.minimum_age, -(program.maximum_age or 999))
             verification_rank = program.verification_steps
         return (
-            offer.estimated_price_usd,
+            (
+                offer.live_fare.total_amount
+                if offer.live_fare is not None
+                else offer.estimated_price_usd
+            ),
             baggage_rank,
             student_discount_rank,
             flexibility_rank,
@@ -686,13 +963,20 @@ class PredictionService:
 
     @staticmethod
     def _routing_rank(offer: ComparisonOffer) -> int:
-        return {
-            "provider_direct": 0,
-            "model_one_stop": 1,
-            "model_route_unresolved": 2,
-        }[offer.routing_status]
+        if offer.routing_status == "provider_direct":
+            return 0
+        if offer.routing_status == "provider_itinerary":
+            return offer.stops or 1
+        return {"model_one_stop": 4, "model_route_unresolved": 5}[
+            offer.routing_status
+        ]
 
-    def compare(self, request: ComparisonRequest) -> ComparisonResponse:
+    def compare(
+        self,
+        request: ComparisonRequest,
+        *,
+        force_fare_refresh: bool = False,
+    ) -> ComparisonResponse:
         generated_at = self._now_provider()
         if generated_at.tzinfo is None or generated_at.utcoffset() is None:
             raise RouteLookupError("service clock must include a timezone offset")
@@ -718,112 +1002,117 @@ class PredictionService:
             )
         destination_zone, _ = self._airport_timezone(route.destination)
         origin_zone, _ = self._airport_timezone(route.origin)
-        schedule_result = self.schedule_provider.search(
-            request.origin,
-            request.destination,
-            departure_date,
-            origin_timezone=origin_zone,
-            destination_timezone=destination_zone,
-            fetched_at=generated_at,
-        )
-        confirmed_airlines = set(schedule_result.route_airlines)
-        if not confirmed_airlines and (
-            not self.context_provider.airlabs_api_key
-            or not self.context_provider.external_context_enabled
-        ):
-            legacy_confirmed = self.context_provider.route_airlines(
+
+        # These sources are independent. Fetch them together so strict fare
+        # verification does not unnecessarily serialize weather/news/timetable I/O.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="comparison") as pool:
+            schedule_future = pool.submit(
+                self.schedule_provider.search,
                 request.origin,
                 request.destination,
+                departure_date,
+                origin_timezone=origin_zone,
+                destination_timezone=destination_zone,
+                fetched_at=generated_at,
             )
-            if legacy_confirmed:
-                confirmed_airlines.update(legacy_confirmed)
-        context = self._context(route, departure_time)
-
-        profile_codes = {profile.code for profile in comparison_airlines()}
-        if confirmed_airlines:
-            profile_codes.update(confirmed_airlines)
-        profile_codes.update(schedule.airline_code for schedule in schedule_result.schedules)
-
-        profiles: list[AirlineProfile | _GenericAirlineProfile] = []
-        for code in sorted(profile_codes):
-            profiles.append(
-                get_airline_profile(code) or _GenericAirlineProfile(code=code, name=code)
+            context_future = pool.submit(self._context, route, departure_time)
+            fare_future = pool.submit(
+                self.flight_offer_provider.search,
+                request.origin,
+                request.destination,
+                departure_date,
+                fetched_at=generated_at,
+                force_refresh=force_fare_refresh,
             )
+            schedule_result = schedule_future.result()
+            context = context_future.result()
+            fare_result = fare_future.result()
 
-        schedules_by_airline: dict[str, list[FlightSchedule]] = {}
+        timetable_references: list[TimetableReference] = []
         for schedule in schedule_result.schedules:
-            schedules_by_airline.setdefault(schedule.airline_code, []).append(schedule)
+            profile = get_airline_profile(schedule.airline_code)
+            if schedule.schedule_status == "recurring_timetable_projection":
+                reason = BilingualText(
+                    zh=(
+                        "周期时刻表只作为参考，不证明所选日期实际运行、存在座位或可购买。"
+                    ),
+                    en=(
+                        "This recurring timetable is reference-only and does not prove "
+                        "operation, seat inventory, or bookability on the selected date."
+                    ),
+                )
+            else:
+                reason = BilingualText(
+                    zh=(
+                        "日期级时刻只证明提供商返回了航班计划；没有通过 Google Flights "
+                        "购票选项与 HTTPS 预订链接二次验证，因此不进入严格可售列表。"
+                    ),
+                    en=(
+                        "This dated timetable only shows a provider schedule. Without "
+                        "Google Flights booking-option and HTTPS booking-link verification, "
+                        "it cannot enter the strictly bookable list."
+                    ),
+                )
+            timetable_references.append(
+                TimetableReference(
+                    airline_code=schedule.airline_code,
+                    airline_name=(profile.name if profile is not None else schedule.airline_code),
+                    flight_number=schedule.flight_number,
+                    duration_minutes=schedule.duration_minutes,
+                    schedule_status=schedule.schedule_status,
+                    schedule_source=schedule.source,
+                    scheduled_departure_local=schedule.departure_local,
+                    scheduled_arrival_local=schedule.arrival_local,
+                    scheduled_departure_utc=schedule.departure_utc,
+                    scheduled_arrival_utc=schedule.arrival_utc,
+                    schedule_observed_at=schedule.observed_at,
+                    provider_flight_status=schedule.provider_flight_status,
+                    reference_reason=reason,
+                )
+            )
 
         scenarios: list[_OfferScenario] = []
-        for profile in profiles:
-            provider_schedules = schedules_by_airline.get(profile.code, [])
-            if provider_schedules:
-                for schedule in provider_schedules:
-                    for cabin in profile.supported_cabins:
-                        scenarios.append(
-                            _OfferScenario(
-                                profile=profile,
-                                cabin=cabin,
-                                route_status="provider_confirmed",
-                                stops=0,
-                                model_stops=0,
-                                routing_status="provider_direct",
-                                departure_time=schedule.departure_local,
-                                duration_minutes=schedule.duration_minutes,
-                                distance_km=route.distance_km,
-                                schedule=schedule,
-                            )
-                        )
-                continue
-
-            route_confirmed = profile.code in confirmed_airlines
-            hub = (
-                None
-                if route_confirmed
-                else self._model_hub(profile.code, request.origin, request.destination)
-            )
-            if route_confirmed:
-                scenario_stops: int | None = 0
-                model_stops = 0
-                routing_status = "provider_direct"
-            elif hub is not None:
-                scenario_stops = 1
-                model_stops = 1
-                routing_status = "model_one_stop"
-            else:
-                scenario_stops = None
-                model_stops = 0
-                routing_status = "model_route_unresolved"
-            if hub is None:
-                scenario_duration = route.duration_minutes
-                scenario_distance = route.distance_km
-            else:
-                first_leg = self._route(request.origin, hub)
-                second_leg = self._route(hub, request.destination)
-                scenario_duration = (
-                    first_leg.duration_minutes + 90 + second_leg.duration_minutes
-                )
-                scenario_distance = round(
-                    first_leg.distance_km + second_leg.distance_km,
-                    1,
-                )
-            for cabin in profile.supported_cabins:
-                scenarios.append(
-                    _OfferScenario(
-                        profile=profile,
-                        cabin=cabin,
-                        route_status=(
-                            "provider_confirmed" if route_confirmed else "model_scenario"
-                        ),
-                        stops=scenario_stops,
-                        model_stops=model_stops,
-                        routing_status=routing_status,
-                        departure_time=departure_time,
-                        duration_minutes=scenario_duration,
-                        distance_km=scenario_distance,
-                        hub=hub,
+        rejected_priced_offers = 0
+        for confirmed in fare_result.offers:
+            try:
+                provider_segments, total_distance, total_duration = (
+                    self._strict_provider_segments(
+                        confirmed,
+                        origin=request.origin,
+                        destination=request.destination,
+                        departure_date=departure_date,
+                        generated_at=generated_at,
                     )
                 )
+            except (RouteLookupError, ValueError):
+                rejected_priced_offers += 1
+                continue
+            profile = get_airline_profile(confirmed.validating_airline_code)
+            if profile is None:
+                profile = _GenericAirlineProfile(
+                    code=confirmed.validating_airline_code,
+                    name=confirmed.airline_name,
+                    supported_cabins=(confirmed.cabin,),
+                )
+            scenarios.append(
+                _OfferScenario(
+                    profile=profile,
+                    cabin=confirmed.cabin,
+                    route_status="provider_confirmed",
+                    stops=len(provider_segments) - 1,
+                    model_stops=len(provider_segments) - 1,
+                    routing_status=(
+                        "provider_direct"
+                        if len(provider_segments) == 1
+                        else "provider_itinerary"
+                    ),
+                    departure_time=provider_segments[0].departure_local,
+                    duration_minutes=total_duration,
+                    distance_km=total_distance,
+                    confirmed_offer=confirmed,
+                    provider_segments=provider_segments,
+                )
+            )
 
         scenario_rows = [
             {
@@ -842,35 +1131,39 @@ class PredictionService:
             for scenario in scenarios
         ]
 
-        price_features = build_price_features(pd.DataFrame(scenario_rows))
-        estimates = np.maximum(
-            0.0,
-            np.expm1(self.bundle["price_model"].predict(price_features)),
-        )
+        if scenario_rows:
+            price_features = build_price_features(pd.DataFrame(scenario_rows))
+            estimates = np.maximum(
+                0.0,
+                np.expm1(self.bundle["price_model"].predict(price_features)),
+            )
+        else:
+            estimates = np.asarray([], dtype=float)
         half_width = float(self.bundle["price_interval_half_width_usd"])
 
-        ontime_rows = pd.DataFrame(
-            [
-                {
-                    "origin": request.origin,
-                    "destination": request.destination,
-                    "airline": scenario.profile.code,
-                    "scheduled_departure": scenario.departure_time,
-                    "distance_km": scenario.distance_km,
-                    "weather_severity_forecast": context.weather.value,
-                    "origin_congestion_index": context.operations.value,
-                    "news_disruption_index": context.news.value,
-                    **_local_time_features(scenario.departure_time),
-                }
-                for scenario in scenarios
-            ]
-        )
-        ontime_features = build_ontime_features(ontime_rows)
-        probabilities = np.clip(
-            self.bundle["ontime_model"].predict_proba(ontime_features)[:, 1],
-            0.0,
-            1.0,
-        )
+        ontime_rows = [
+            {
+                "origin": request.origin,
+                "destination": request.destination,
+                "airline": scenario.profile.code,
+                "scheduled_departure": scenario.departure_time,
+                "distance_km": scenario.distance_km,
+                "weather_severity_forecast": context.weather.value,
+                "origin_congestion_index": context.operations.value,
+                "news_disruption_index": context.news.value,
+                **_local_time_features(scenario.departure_time),
+            }
+            for scenario in scenarios
+        ]
+        if ontime_rows:
+            ontime_features = build_ontime_features(pd.DataFrame(ontime_rows))
+            probabilities = np.clip(
+                self.bundle["ontime_model"].predict_proba(ontime_features)[:, 1],
+                0.0,
+                1.0,
+            )
+        else:
+            probabilities = np.asarray([], dtype=float)
         offers: list[ComparisonOffer] = []
         for scenario, raw_estimate, raw_probability in zip(
             scenarios,
@@ -880,8 +1173,28 @@ class PredictionService:
         ):
             profile = scenario.profile
             estimate = round(float(raw_estimate), 2)
-            probability = round(float(raw_probability) ** (scenario.model_stops + 1), 4)
-            schedule = scenario.schedule
+            probability = round(float(raw_probability) ** len(scenario.provider_segments), 4)
+            confirmed = scenario.confirmed_offer
+            first_segment = scenario.provider_segments[0]
+            last_segment = scenario.provider_segments[-1]
+            seats = confirmed.number_of_bookable_seats
+            live_fare = LiveFare(
+                provider_name=confirmed.provider_name,
+                provider_offer_id=confirmed.provider_offer_id,
+                verified_at=confirmed.verified_at,
+                total_amount=confirmed.total_amount_usd,
+                cabin_summary=confirmed.cabin,
+                provider_cache_hit=confirmed.provider_cache_hit,
+                provider_cache_age_seconds=confirmed.provider_cache_age_seconds,
+                booking_verified=confirmed.booking_verified,
+                booking_provider=confirmed.booking_provider,
+                booking_url=confirmed.booking_url,
+                booking_url_kind=confirmed.booking_url_kind,
+                seats_remaining=(min(seats, 9) if seats is not None else None),
+                seat_count_capped=bool(seats is not None and seats >= 9),
+                last_ticketing_date=confirmed.last_ticketing_date,
+                source_url="https://serpapi.com/google-flights-api",
+            )
             offers.append(
                 ComparisonOffer(
                     id=self._offer_id(
@@ -891,7 +1204,7 @@ class PredictionService:
                         airline=profile.code,
                         cabin=scenario.cabin,
                         stops=scenario.stops,
-                        schedule=schedule,
+                        fare_identity=confirmed.fingerprint,
                     ),
                     airline_code=profile.code,
                     airline_name=profile.name,
@@ -903,10 +1216,10 @@ class PredictionService:
                     interval_80_high_usd=round(float(raw_estimate + half_width), 2),
                     on_time_probability=probability,
                     risk_level=self._risk_level(probability),
-                    baggage_status=profile.baggage_status,
+                    baggage_status=self._baggage_status(scenario.provider_segments),
                     student_status=profile.student_status,
-                    change_status=profile.change_status,
-                    refund_status=profile.refund_status,
+                    change_status=self._change_status(confirmed),
+                    refund_status=self._refund_status(confirmed),
                     student_age_limit_zh=profile.student_age_limit_zh,
                     student_age_limit_en=profile.student_age_limit_en,
                     student_verification_zh=profile.student_verification_zh,
@@ -914,47 +1227,31 @@ class PredictionService:
                     student_program_url=profile.student_program_url,
                     route_status=scenario.route_status,
                     routing_status=scenario.routing_status,
-                    cabin_status="catalog_scenario",
+                    cabin_status="provider_confirmed",
                     punctuality_basis=(
                         "direct_leg_model"
                         if scenario.routing_status == "provider_direct"
-                        else (
-                            "two_leg_independence_scenario"
-                            if scenario.routing_status == "model_one_stop"
-                            else "route_only_model"
-                        )
+                        else "multi_leg_independence_model"
                     ),
-                    schedule_status=(schedule.schedule_status if schedule else "model_scenario"),
-                    schedule_source=(schedule.source if schedule else "model_fallback"),
-                    flight_number=(schedule.flight_number if schedule else None),
-                    scheduled_departure_local=(
-                        schedule.departure_local if schedule else None
-                    ),
-                    scheduled_arrival_local=(schedule.arrival_local if schedule else None),
-                    scheduled_departure_utc=(schedule.departure_utc if schedule else None),
-                    scheduled_arrival_utc=(schedule.arrival_utc if schedule else None),
-                    provider_flight_status=(
-                        schedule.provider_flight_status if schedule else None
-                    ),
-                    schedule_observed_at=(schedule.observed_at if schedule else None),
-                    departure_terminal=(
-                        schedule.departure_terminal
-                        if schedule is not None
-                        and schedule.schedule_status == "live_schedule"
-                        else None
-                    ),
-                    arrival_terminal=(
-                        schedule.arrival_terminal
-                        if schedule is not None
-                        and schedule.schedule_status == "live_schedule"
-                        else None
-                    ),
+                    schedule_status="priced_offer",
+                    schedule_source="serpapi_google_flights_booking",
+                    flight_number=first_segment.flight_number,
+                    scheduled_departure_local=first_segment.departure_local,
+                    scheduled_arrival_local=last_segment.arrival_local,
+                    scheduled_departure_utc=first_segment.departure_utc,
+                    scheduled_arrival_utc=last_segment.arrival_utc,
+                    provider_flight_status="booking_option_verified",
+                    schedule_observed_at=confirmed.verified_at,
+                    departure_terminal=first_segment.departure_terminal,
+                    arrival_terminal=last_segment.arrival_terminal,
                     aircraft_icao=(
-                        schedule.aircraft_icao
-                        if schedule is not None
-                        and schedule.schedule_status == "live_schedule"
+                        first_segment.aircraft_icao
+                        if scenario.routing_status == "provider_direct"
                         else None
                     ),
+                    bookability_status="booking_option_verified",
+                    live_fare=live_fare,
+                    segments=list(scenario.provider_segments),
                 )
             )
 
@@ -962,7 +1259,7 @@ class PredictionService:
             offers,
             key=lambda offer: (
                 self._routing_rank(offer),
-                offer.estimated_price_usd,
+                offer.live_fare.total_amount,
                 -offer.on_time_probability,
                 offer.airline_code,
                 offer.cabin,
@@ -971,7 +1268,7 @@ class PredictionService:
         cheapest = sorted(
             offers,
             key=lambda offer: (
-                offer.estimated_price_usd,
+                offer.live_fare.total_amount,
                 self._routing_rank(offer),
                 -offer.on_time_probability,
                 offer.airline_code,
@@ -994,11 +1291,36 @@ class PredictionService:
         }.get(departure_time_basis, ("", ""))
         truncation_warning = (
             (
-                "免费查询最多返回 50 行，真实航班列表可能不完整。",
-                "Free queries return at most 50 rows, so the actual flight list may be "
-                "incomplete.",
+                "AirLabs 参考区每次最多返回 50 行，因此参考时刻可能不完整。",
+                "The AirLabs reference section returns at most 50 rows per query and "
+                "may be incomplete.",
             )
             if schedule_result.sample_truncated
+            else ("", "")
+        )
+
+        fare_metadata = self._fare_metadata(fare_result)
+        result_status = {
+            "confirmed_offers": (
+                "verified_offers_found" if offers else "no_verified_offer"
+            ),
+            "no_results": "no_verified_offer",
+            "not_configured": "fare_provider_not_configured",
+            "test_environment_rejected": "fare_provider_test_rejected",
+            "authentication_failed": "fare_provider_authentication_failed",
+            "rate_limited": "fare_provider_rate_limited",
+            "budget_not_configured": "fare_provider_budget_not_configured",
+            "budget_exhausted": "fare_provider_budget_exhausted",
+            "provider_unavailable": "fare_provider_unavailable",
+        }[fare_result.status]
+        rejected_warning = (
+            (
+                f" 另有 {rejected_priced_offers} 个生产报价因机场时区、连续航段或字段"
+                "完整性未通过本地严格验证而被排除。",
+                f" {rejected_priced_offers} additional production-priced offer(s) failed "
+                "local strict validation for airport timezones, continuity, or completeness.",
+            )
+            if rejected_priced_offers
             else ("", "")
         )
 
@@ -1019,25 +1341,182 @@ class PredictionService:
                 lowest_price=[offer.id for offer in cheapest],
                 student_first=[offer.id for offer in student],
             ),
+            availability_mode="strict_bookable_only",
+            result_status=result_status,
+            strict_mode_notice=BilingualText(
+                zh=(
+                    "严格可售模式仅显示经 Google Flights 搜索及 booking token 购票选项"
+                    "二次验证的报价。"
+                    "测试数据、AirLabs 时刻、周期投影和纯模型航班都不能进入主列表。"
+                ),
+                en=(
+                    "Strict bookable mode shows only offers that pass both a Google Flights "
+                    "search and booking-token booking-option verification. Test data, AirLabs "
+                    "timetables, recurring projections, and model-only flights cannot enter "
+                    "the main list."
+                ),
+            ),
+            fare_search_metadata=fare_metadata,
+            timetable_references=timetable_references,
             schedule_sample_truncated=schedule_result.sample_truncated,
             schedule_sample_limit=AIRLABS_FREE_SAMPLE_LIMIT,
             warnings=BilingualWarning(
                 zh=(
-                    "所有价格与准点率均来自合成演示模型，价格不是实时可售票价；未由免费数据源确认的"
-                    "航司、舱位、行李、学生优惠和退改规则均明确标为场景或未知。"
+                    "主价格是查询时经 Google Flights 购票选项验证的一位成人单程 USD "
+                    "报价；模型估价、80% 区间、价格曲线和准点率仍是合成演示模型结果。"
+                    "搜索结果和购票价格可能随时变化，航空公司最终结账页才是最终价格；"
+                    "系统不会为覆盖缺口补造航班。"
                     f" {reference_warning[0]}"
                     f" {truncation_warning[0]}"
+                    f"{rejected_warning[0]}"
                 ),
                 en=(
-                    "All prices and on-time probabilities come from synthetic-demo models; "
-                    "prices are not live bookable fares. "
-                    "Airlines, cabins, baggage, student benefits, and fare rules not confirmed "
-                    "by a free source are explicitly labelled as scenarios or unknown."
+                    "The primary price is a one-way, one-adult USD result whose booking option "
+                    "was verified through Google Flights at query time. The model estimate, 80% "
+                    "interval, price curve, and on-time probability remain synthetic-demo model "
+                    "outputs. Search results and booking prices can change at any time; the "
+                    "airline checkout is authoritative. The system does not invent flights to "
+                    "fill coverage gaps."
                     f" {reference_warning[1]}"
                     f" {truncation_warning[1]}"
+                    f"{rejected_warning[1]}"
                 ),
             ),
             model_version=self.model_version,
+        )
+
+    def _price_curve_for_offer(
+        self,
+        *,
+        comparison: ComparisonResponse,
+        offer: ComparisonOffer,
+        route: RouteEstimate,
+    ) -> PriceForecastCurve:
+        """Project the model once per origin-local day until scheduled departure.
+
+        These points are generated together from the demo model by varying only
+        quote time. They are deliberately not described as observed fare history.
+        """
+
+        if offer.scheduled_departure_local is None:
+            raise OfferNotFoundError("strict offer no longer has a complete departure time")
+        departure = offer.scheduled_departure_local
+        departure_utc = departure.astimezone(UTC)
+        generated_at = comparison.generated_at.astimezone(UTC)
+        if generated_at >= departure_utc:
+            raise OfferNotFoundError("strict offer has already departed")
+
+        origin_zone, _ = self._airport_timezone(route.origin)
+        start_date = generated_at.astimezone(origin_zone).date()
+        requested_end_date = departure.astimezone(origin_zone).date()
+        quote_times: list[datetime] = []
+        quote_dates: list[date] = []
+        day_count = (requested_end_date - start_date).days
+        for offset in range(day_count + 1):
+            target_date = start_date + timedelta(days=offset)
+            if offset == 0:
+                candidate = generated_at
+            else:
+                candidate = datetime.combine(target_date, time(12), tzinfo=origin_zone)
+                latest = departure_utc - timedelta(minutes=1)
+                if candidate.astimezone(UTC) > latest:
+                    candidate = latest
+            candidate_utc = candidate.astimezone(UTC)
+            candidate_date = candidate_utc.astimezone(origin_zone).date()
+            # A departure exactly at local midnight has no pre-departure instant on
+            # that local date. End at the latest honest date instead of relabelling it.
+            if candidate_date != target_date or candidate_utc >= departure_utc:
+                continue
+            if quote_times and candidate_utc <= quote_times[-1].astimezone(UTC):
+                continue
+            quote_dates.append(candidate_date)
+            quote_times.append(candidate)
+
+        if not quote_times:
+            raise OfferNotFoundError("no pre-departure quote instant is available")
+
+        curve_distance_km = route.distance_km
+        if offer.segments:
+            curve_distance_km = round(
+                sum(
+                    self._route(segment.origin, segment.destination).distance_km
+                    for segment in offer.segments
+                ),
+                1,
+            )
+
+        rows = pd.DataFrame(
+            [
+                {
+                    "origin": comparison.origin,
+                    "destination": comparison.destination,
+                    "airline": offer.airline_code,
+                    "cabin": offer.cabin,
+                    "stops": offer.stops or 0,
+                    "quote_time": quote_time,
+                    "departure_time": departure,
+                    "distance_km": curve_distance_km,
+                    "duration_minutes": offer.duration_minutes,
+                    "news_disruption_index": comparison.context.news.value,
+                    **_local_time_features(departure),
+                }
+                for quote_time in quote_times
+            ]
+        )
+        features = build_price_features(rows)
+        estimates = np.maximum(
+            0.0,
+            np.expm1(self.bundle["price_model"].predict(features)),
+        )
+        half_width = float(self.bundle["price_interval_half_width_usd"])
+        points = [
+            PriceForecastPoint(
+                quote_date=quote_date,
+                quote_time=quote_time,
+                days_until_departure=round(
+                    (departure_utc - quote_time.astimezone(UTC)).total_seconds()
+                    / 86_400.0,
+                    4,
+                ),
+                estimated_price_usd=round(float(estimate), 2),
+                interval_80_low_usd=round(max(0.0, float(estimate) - half_width), 2),
+                interval_80_high_usd=round(float(estimate) + half_width, 2),
+            )
+            for quote_date, quote_time, estimate in zip(
+                quote_dates,
+                quote_times,
+                estimates,
+                strict=True,
+            )
+        ]
+        extrapolated = any(point.days_until_departure > 180.0 for point in points)
+        return PriceForecastCurve(
+            start_date=points[0].quote_date,
+            end_date=points[-1].quote_date,
+            generated_at=generated_at,
+            extrapolated_beyond_training_horizon=extrapolated,
+            points=points,
+            notice=BilingualText(
+                zh=(
+                    "曲线中的全部点由当前一次请求使用同一合成演示模型生成，"
+                    "仅改变模拟查询日期；它不是已采集的历史票价、实时票价或可购买报价。"
+                    + (
+                        " 部分点超过模型主要的 180 天训练提前期，属于外推。"
+                        if extrapolated
+                        else ""
+                    )
+                ),
+                en=(
+                    "Every point is generated in this request by the same synthetic-demo "
+                    "model while varying only the simulated quote date; this is not collected "
+                    "fare history, a live fare, or a bookable quote."
+                    + (
+                        " Some points extend beyond the model's main 180-day training horizon."
+                        if extrapolated
+                        else ""
+                    )
+                ),
+            ),
         )
 
     def offer_detail(self, request: OfferDetailRequest) -> OfferDetailResponse:
@@ -1046,7 +1525,8 @@ class PredictionService:
                 origin=request.origin,
                 destination=request.destination,
                 departure_date=request.departure_date,
-            )
+            ),
+            force_fare_refresh=request.force_refresh,
         )
         offer = next(
             (candidate for candidate in comparison.offers if candidate.id == request.offer_id),
@@ -1059,119 +1539,89 @@ class PredictionService:
             )
 
         route = self._route(request.origin, request.destination)
-        if offer.schedule_status != "model_scenario":
-            required_times = (
-                offer.scheduled_departure_local,
-                offer.scheduled_arrival_local,
-                offer.scheduled_departure_utc,
-                offer.scheduled_arrival_utc,
-            )
-            if offer.flight_number is None or any(value is None for value in required_times):
-                raise OfferNotFoundError("provider schedule is no longer complete")
-            data_basis = (
-                "airlabs_live_schedule"
-                if offer.schedule_status == "live_schedule"
-                else "airlabs_recurring_timetable_projection"
-            )
-            legs = [
+        if (
+            offer.schedule_status != "priced_offer"
+            or offer.bookability_status != "booking_option_verified"
+            or offer.live_fare is None
+            or not offer.live_fare.booking_verified
+            or not offer.segments
+        ):
+            raise OfferNotFoundError("strict offer no longer has a verified booking option")
+
+        legs: list[ItineraryLeg] = []
+        total_distance_km = 0.0
+        for segment in offer.segments:
+            leg_route = self._route(segment.origin, segment.destination)
+            total_distance_km += leg_route.distance_km
+            legs.append(
                 ItineraryLeg(
-                    sequence=1,
-                    origin=request.origin,
-                    destination=request.destination,
-                    date_context=request.departure_date,
-                    flight_number=offer.flight_number,
-                    departure_local=offer.scheduled_departure_local,
-                    arrival_local=offer.scheduled_arrival_local,
-                    departure_utc=offer.scheduled_departure_utc,
-                    arrival_utc=offer.scheduled_arrival_utc,
-                    duration_minutes=offer.duration_minutes,
-                    distance_km=route.distance_km,
-                    departure_terminal=offer.departure_terminal,
-                    arrival_terminal=offer.arrival_terminal,
-                    aircraft_icao=offer.aircraft_icao,
-                    data_basis=data_basis,
+                    sequence=segment.sequence,
+                    origin=segment.origin,
+                    destination=segment.destination,
+                    date_context=segment.departure_local.date(),
+                    flight_number=segment.flight_number,
+                    marketing_airline_code=segment.marketing_airline_code,
+                    operating_airline_code=segment.operating_airline_code,
+                    departure_local=segment.departure_local,
+                    arrival_local=segment.arrival_local,
+                    departure_utc=segment.departure_utc,
+                    arrival_utc=segment.arrival_utc,
+                    duration_minutes=segment.duration_minutes,
+                    distance_km=leg_route.distance_km,
+                    departure_terminal=segment.departure_terminal,
+                    arrival_terminal=segment.arrival_terminal,
+                    aircraft_icao=segment.aircraft_icao,
+                    cabin=segment.cabin,
+                    booking_class=segment.booking_class,
+                    fare_basis=segment.fare_basis,
+                    fare_brand=segment.fare_brand,
+                    included_checked_bag_quantity=(
+                        segment.included_checked_bag_quantity
+                    ),
+                    included_checked_bag_weight=segment.included_checked_bag_weight,
+                    included_checked_bag_weight_unit=(
+                        segment.included_checked_bag_weight_unit
+                    ),
+                    data_basis="serpapi_booking_confirmed",
                 )
-            ]
-            itinerary = OfferItinerary(
-                kind="direct",
-                time_basis="provider_schedule",
-                total_duration_minutes=offer.duration_minutes,
-                total_distance_km=route.distance_km,
-                layover_status="not_applicable",
-                legs=legs,
             )
-            fallback_reason = None
-        elif offer.routing_status == "provider_direct":
-            itinerary = OfferItinerary(
-                kind="direct",
-                time_basis="model_duration_only",
-                total_duration_minutes=offer.duration_minutes,
-                total_distance_km=route.distance_km,
-                layover_status="not_applicable",
-                legs=[
-                    ItineraryLeg(
-                        sequence=1,
-                        origin=request.origin,
-                        destination=request.destination,
-                        date_context=request.departure_date,
-                        duration_minutes=offer.duration_minutes,
-                        distance_km=route.distance_km,
-                        data_basis="model_duration_only",
-                    )
-                ],
+
+        layovers: list[ItineraryLayover] = []
+        for sequence, (previous, current) in enumerate(
+            zip(offer.segments, offer.segments[1:], strict=False),
+            start=1,
+        ):
+            duration_minutes = round(
+                (current.departure_utc - previous.arrival_utc).total_seconds() / 60
             )
-            fallback_reason = self._model_offer_fallback(request, offer.airline_code)
-        elif offer.routing_status == "model_route_unresolved":
-            itinerary = OfferItinerary(
-                kind="route_unresolved",
-                time_basis="model_duration_only",
-                total_duration_minutes=offer.duration_minutes,
-                total_distance_km=route.distance_km,
-                layover_status="not_applicable",
-                legs=[],
+            if not 0 <= duration_minutes <= 1_440:
+                raise OfferNotFoundError("provider layover is outside strict limits")
+            layovers.append(
+                ItineraryLayover(
+                    sequence=sequence,
+                    airport=previous.destination,
+                    duration_minutes=duration_minutes,
+                )
             )
-            fallback_reason = self._model_offer_fallback(request, offer.airline_code)
+
+        if len(legs) == 1:
+            itinerary_kind = "direct"
+            layover_status = "not_applicable"
+        elif len(legs) == 2:
+            itinerary_kind = "one_stop"
+            layover_status = "provider_confirmed"
         else:
-            hub = self._model_hub(
-                offer.airline_code,
-                request.origin,
-                request.destination,
-            )
-            if hub is None:
-                raise OfferNotFoundError("model connection hub is no longer available")
-            first_route = self._route(request.origin, hub)
-            second_route = self._route(hub, request.destination)
-            total_leg_distance = first_route.distance_km + second_route.distance_km
-            itinerary = OfferItinerary(
-                kind="one_stop",
-                time_basis="model_duration_only",
-                total_duration_minutes=offer.duration_minutes,
-                total_distance_km=round(total_leg_distance, 1),
-                layover_airport=hub,
-                layover_minutes=90,
-                layover_status="model_assumption",
-                legs=[
-                    ItineraryLeg(
-                        sequence=1,
-                        origin=request.origin,
-                        destination=hub,
-                        date_context=request.departure_date,
-                        duration_minutes=first_route.duration_minutes,
-                        distance_km=first_route.distance_km,
-                        data_basis="model_duration_only",
-                    ),
-                    ItineraryLeg(
-                        sequence=2,
-                        origin=hub,
-                        destination=request.destination,
-                        date_context=request.departure_date,
-                        duration_minutes=second_route.duration_minutes,
-                        distance_km=second_route.distance_km,
-                        data_basis="model_duration_only",
-                    ),
-                ],
-            )
-            fallback_reason = self._model_offer_fallback(request, offer.airline_code)
+            itinerary_kind = "multi_stop"
+            layover_status = "provider_confirmed"
+        itinerary = OfferItinerary(
+            kind=itinerary_kind,
+            time_basis="provider_schedule",
+            total_duration_minutes=offer.duration_minutes,
+            total_distance_km=round(total_distance_km, 1),
+            layover_status=layover_status,
+            legs=legs,
+            layovers=layovers,
+        )
 
         return OfferDetailResponse(
             origin=request.origin,
@@ -1183,25 +1633,36 @@ class PredictionService:
             schedule_observed_at=offer.schedule_observed_at,
             schedule_sample_truncated=comparison.schedule_sample_truncated,
             schedule_sample_limit=comparison.schedule_sample_limit,
-            fallback_reason=fallback_reason,
+            fallback_reason=None,
+            fare_search_metadata=comparison.fare_search_metadata,
             offer=offer,
             itinerary=itinerary,
+            price_curve=self._price_curve_for_offer(
+                comparison=comparison,
+                offer=offer,
+                route=route,
+            ),
             notice=BilingualText(
                 zh=(
-                    "舱位始终是目录场景，并非已确认库存；价格与准点率来自演示模型。"
-                    "只有标为 AirLabs 的航班号和完整时刻来自免费提供商数据。"
+                    "航班号、完整当地/UTC 时刻、舱位和主价格已通过 Google Flights "
+                    "booking token 购票选项验证。页面提供当次验证得到的 HTTPS 预订链接，"
+                    "但搜索结果及最终结账价格仍可能随时变化；"
+                    "模型估价、价格曲线和准点率仍是演示模型输出，价格曲线不是历史票价。"
                     + (
-                        "免费查询最多返回 50 行，真实航班列表可能不完整。"
+                        " AirLabs 参考时刻区最多返回 50 行，可能不完整。"
                         if comparison.schedule_sample_truncated
                         else ""
                     )
                 ),
                 en=(
-                    "Cabin is always a catalog scenario, not confirmed inventory; price "
-                    "and on-time probability come from demo models. Only flight numbers "
-                    "and complete times labelled AirLabs come from the free provider."
+                    "Flight numbers, complete local/UTC times, cabin, and the primary fare "
+                    "passed Google Flights booking-token option verification. The page exposes "
+                    "the HTTPS booking link returned by that verification, but search results "
+                    "and the final checkout price can still change at any time. The model "
+                    "estimate, price curve, and on-time probability remain demo-model outputs; "
+                    "the curve is not observed fare history."
                     + (
-                        " Free queries return at most 50 rows, so the actual flight list "
+                        " The AirLabs timetable reference section is capped at 50 rows and "
                         "may be incomplete."
                         if comparison.schedule_sample_truncated
                         else ""

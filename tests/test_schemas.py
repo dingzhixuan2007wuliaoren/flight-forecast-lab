@@ -4,11 +4,101 @@ import pytest
 from pydantic import ValidationError
 
 from flight_forecaster.schemas import (
+    ComparisonOffer,
     ComparisonRequest,
     ContextDetailRequest,
+    FareSearchMetadata,
+    LiveFare,
+    OfferDetailRequest,
     OnTimeRequest,
     PriceRequest,
 )
+
+
+def _confirmed_offer_payload() -> dict[str, object]:
+    segments = [
+        {
+            "sequence": 1,
+            "origin": "YYZ",
+            "destination": "YUL",
+            "flight_number": "AC400",
+            "marketing_airline_code": "AC",
+            "operating_airline_code": "AC",
+            "departure_local": "2026-08-15T08:00:00-04:00",
+            "arrival_local": "2026-08-15T09:15:00-04:00",
+            "departure_utc": "2026-08-15T12:00:00Z",
+            "arrival_utc": "2026-08-15T13:15:00Z",
+            "duration_minutes": 75,
+            "cabin": "economy",
+            "booking_class": "K",
+            "included_checked_bag_quantity": 1,
+        },
+        {
+            "sequence": 2,
+            "origin": "YUL",
+            "destination": "LHR",
+            "flight_number": "AC864",
+            "marketing_airline_code": "AC",
+            "operating_airline_code": "AC",
+            "departure_local": "2026-08-15T11:00:00-04:00",
+            "arrival_local": "2026-08-15T22:50:00+01:00",
+            "departure_utc": "2026-08-15T15:00:00Z",
+            "arrival_utc": "2026-08-15T21:50:00Z",
+            "duration_minutes": 410,
+            "cabin": "economy",
+            "booking_class": "K",
+            "included_checked_bag_quantity": 1,
+        },
+    ]
+    return {
+        "id": "off_0123456789abcdef01234567",
+        "airline_code": "AC",
+        "airline_name": "Air Canada",
+        "cabin": "economy",
+        "stops": 1,
+        "duration_minutes": 590,
+        "estimated_price_usd": 510.0,
+        "interval_80_low_usd": 510.0,
+        "interval_80_high_usd": 510.0,
+        "on_time_probability": 0.78,
+        "risk_level": "medium",
+        "baggage_status": "confirmed_included",
+        "student_status": "unknown",
+        "change_status": "unknown",
+        "refund_status": "unknown",
+        "student_age_limit_zh": "未知",
+        "student_age_limit_en": "Unknown",
+        "student_verification_zh": "未知",
+        "student_verification_en": "Unknown",
+        "route_status": "provider_confirmed",
+        "routing_status": "provider_itinerary",
+        "cabin_status": "provider_confirmed",
+        "punctuality_basis": "multi_leg_independence_model",
+        "schedule_status": "priced_offer",
+        "schedule_source": "serpapi_google_flights_booking",
+        "flight_number": "AC400",
+        "scheduled_departure_local": "2026-08-15T08:00:00-04:00",
+        "scheduled_arrival_local": "2026-08-15T22:50:00+01:00",
+        "scheduled_departure_utc": "2026-08-15T12:00:00Z",
+        "scheduled_arrival_utc": "2026-08-15T21:50:00Z",
+        "schedule_observed_at": "2026-07-15T12:00:00Z",
+        "bookability_status": "booking_option_verified",
+        "live_fare": {
+            "provider_name": "SerpApi Google Flights",
+            "provider_offer_id": "serpapi-offer-1",
+            "verified_at": "2026-07-15T12:00:00Z",
+            "total_amount": 510.0,
+            "cabin_summary": "economy",
+            "provider_cache_hit": False,
+            "provider_cache_age_seconds": 0,
+            "seats_remaining": 4,
+            "booking_provider": "Air Canada",
+            "booking_url": "https://www.google.com/travel/flights/booking/example",
+            "booking_url_kind": "direct_get",
+            "source_url": "https://serpapi.com/google-flights-api",
+        },
+        "segments": segments,
+    }
 
 
 def test_price_request_rejects_naive_datetimes() -> None:
@@ -137,3 +227,127 @@ def test_context_detail_request_accepts_date_or_legacy_time_but_not_both() -> No
             departure_date=selected_date,
             departure_time=datetime(2026, 8, 15, 9, 30),
         )
+
+
+def test_confirmed_offer_requires_all_provider_evidence() -> None:
+    offer = ComparisonOffer.model_validate(_confirmed_offer_payload())
+    assert offer.bookability_status == "booking_option_verified"
+    assert len(offer.segments) == 2
+    assert offer.live_fare is not None
+    assert offer.live_fare.taxes_included is None
+    assert offer.live_fare.provider_cache_hit is False
+    assert offer.live_fare.provider_cache_age_seconds == 0
+
+    invalid_cache_age = _confirmed_offer_payload()
+    invalid_fare = invalid_cache_age["live_fare"]
+    assert isinstance(invalid_fare, dict)
+    invalid_fare["provider_cache_age_seconds"] = -1
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        ComparisonOffer.model_validate(invalid_cache_age)
+
+    stale_cache = _confirmed_offer_payload()
+    stale_fare = stale_cache["live_fare"]
+    assert isinstance(stale_fare, dict)
+    stale_fare["provider_cache_age_seconds"] = 3_901
+    with pytest.raises(ValidationError, match="less than or equal to 3900"):
+        ComparisonOffer.model_validate(stale_cache)
+
+    missing_fare = _confirmed_offer_payload()
+    missing_fare.pop("live_fare")
+    with pytest.raises(ValidationError, match="verified booking options"):
+        ComparisonOffer.model_validate(missing_fare)
+
+
+def test_production_live_fare_rejects_test_environment() -> None:
+    payload = _confirmed_offer_payload()["live_fare"]
+    assert isinstance(payload, dict)
+    payload["environment"] = "test"
+    with pytest.raises(ValidationError, match="production"):
+        LiveFare.model_validate(payload)
+
+    metadata = FareSearchMetadata.model_validate(
+        {
+            "status": "test_environment_rejected",
+            "provider_code": "serpapi_google_flights",
+            "environment": "test",
+            "observed_at": "2026-07-15T12:00:00Z",
+            "searched_cabins": ["economy"],
+            "notice": {"zh": "测试环境被拒绝", "en": "Test environment rejected"},
+        }
+    )
+    assert metadata.status == "test_environment_rejected"
+
+
+def test_offer_detail_request_defaults_to_cached_result_and_accepts_refresh() -> None:
+    base = {
+        "origin": "YYZ",
+        "destination": "LHR",
+        "departure_date": "2026-08-15",
+        "offer_id": "off_0123456789abcdef01234567",
+    }
+    assert OfferDetailRequest.model_validate(base).force_refresh is False
+    assert (
+        OfferDetailRequest.model_validate({**base, "force_refresh": True}).force_refresh
+        is True
+    )
+
+
+def test_serpapi_metadata_requires_one_shared_quota_no_higher_than_250() -> None:
+    base = {
+        "status": "no_results",
+        "provider_code": "serpapi_google_flights",
+        "environment": "production",
+        "observed_at": "2026-07-15T12:00:00Z",
+        "searched_cabins": ["economy"],
+        "call_count": 2,
+        "search_call_count": 1,
+        "pricing_call_count": 1,
+        "monthly_call_limit": 250,
+        "monthly_calls_used": 2,
+        "search_monthly_limit": 250,
+        "search_monthly_used": 2,
+        "notice": {"zh": "无结果", "en": "No results"},
+    }
+    metadata = FareSearchMetadata.model_validate(base)
+    assert metadata.monthly_call_limit == 250
+
+    split = dict(base)
+    split.update(
+        {
+            "pricing_monthly_limit": 250,
+            "pricing_monthly_used": 1,
+            "search_monthly_used": 1,
+        }
+    )
+    with pytest.raises(ValidationError, match="one shared monthly quota"):
+        FareSearchMetadata.model_validate(split)
+
+    over_limit = dict(base)
+    over_limit.update({"monthly_call_limit": 251, "search_monthly_limit": 251})
+    with pytest.raises(ValidationError, match="cannot exceed 250"):
+        FareSearchMetadata.model_validate(over_limit)
+
+    inconsistent_calls = dict(base)
+    inconsistent_calls["call_count"] = 3
+    with pytest.raises(ValidationError, match="must equal"):
+        FareSearchMetadata.model_validate(inconsistent_calls)
+
+
+def test_confirmed_offer_rejects_mixed_cabins() -> None:
+    payload = _confirmed_offer_payload()
+    segments = payload["segments"]
+    assert isinstance(segments, list)
+    assert isinstance(segments[1], dict)
+    segments[1]["cabin"] = "business"
+    with pytest.raises(ValidationError, match="must use one cabin"):
+        ComparisonOffer.model_validate(payload)
+
+
+def test_confirmed_offer_rejects_discontinuous_segments() -> None:
+    payload = _confirmed_offer_payload()
+    segments = payload["segments"]
+    assert isinstance(segments, list)
+    assert isinstance(segments[1], dict)
+    segments[1]["origin"] = "CDG"
+    with pytest.raises(ValidationError, match="continuous route"):
+        ComparisonOffer.model_validate(payload)

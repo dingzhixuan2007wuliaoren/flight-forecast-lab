@@ -38,11 +38,13 @@ ScheduleStatus = Literal[
     "live_schedule",
     "recurring_timetable_projection",
     "model_scenario",
+    "priced_offer",
 ]
 ScheduleSource = Literal[
     "airlabs_schedules",
     "airlabs_routes",
     "model_fallback",
+    "serpapi_google_flights_booking",
 ]
 DepartureTimeBasis = Literal[
     "origin_local_noon_model_reference",
@@ -62,6 +64,17 @@ def _require_timezone(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("must include a timezone offset, for example 2026-08-15T14:00:00-04:00")
     return value
+
+
+def _validate_checked_bag_fields(
+    quantity: int | None,
+    weight: float | None,
+    unit: str | None,
+) -> None:
+    if (weight is None) != (unit is None):
+        raise ValueError("checked-bag weight and unit must be provided together")
+    if quantity is not None and weight is not None:
+        raise ValueError("checked-bag allowance must use quantity or weight, not both")
 
 
 class PriceRequest(BaseModel):
@@ -407,6 +420,216 @@ class NewsDetailResponse(BaseModel):
     indexed_time_notice: BilingualText
 
 
+class ProviderOfferSegment(BaseModel):
+    """One provider-priced segment with internally consistent local and UTC times."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int = Field(ge=1, le=4)
+    origin: str = Field(min_length=3, max_length=3)
+    destination: str = Field(min_length=3, max_length=3)
+    flight_number: str = Field(pattern=r"^[A-Z0-9]{3,12}$")
+    marketing_airline_code: str = Field(min_length=2, max_length=3)
+    operating_airline_code: str | None = Field(default=None, min_length=2, max_length=3)
+    departure_local: datetime
+    arrival_local: datetime
+    departure_utc: datetime
+    arrival_utc: datetime
+    duration_minutes: int = Field(gt=0, le=2_160)
+    departure_terminal: str | None = Field(default=None, max_length=40)
+    arrival_terminal: str | None = Field(default=None, max_length=40)
+    aircraft_icao: str | None = Field(default=None, max_length=12)
+    cabin: Cabin
+    booking_class: str | None = Field(default=None, max_length=8, pattern=r"^[A-Z0-9]+$")
+    fare_basis: str | None = Field(default=None, max_length=64)
+    fare_brand: str | None = Field(default=None, max_length=120)
+    included_checked_bag_quantity: int | None = Field(default=None, ge=0, le=9)
+    included_checked_bag_weight: float | None = Field(
+        default=None,
+        gt=0.0,
+        allow_inf_nan=False,
+    )
+    included_checked_bag_weight_unit: Literal["KG", "LB"] | None = None
+
+    @field_validator("origin", "destination")
+    @classmethod
+    def validate_airport_code(cls, value: str) -> str:
+        return _normalise_code(value, min_length=3, max_length=3)
+
+    @field_validator("marketing_airline_code", "operating_airline_code")
+    @classmethod
+    def validate_airline_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalise_code(value, min_length=2, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_segment(self) -> ProviderOfferSegment:
+        if self.origin == self.destination:
+            raise ValueError("segment origin and destination must differ")
+        for value in (
+            self.departure_local,
+            self.arrival_local,
+            self.departure_utc,
+            self.arrival_utc,
+        ):
+            _require_timezone(value)
+        if self.departure_utc.utcoffset() != timedelta(0) or (
+            self.arrival_utc.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("segment UTC fields must use a zero UTC offset")
+        if self.arrival_utc <= self.departure_utc:
+            raise ValueError("segment arrival must be after departure")
+        elapsed_minutes = round(
+            (self.arrival_utc - self.departure_utc).total_seconds() / 60
+        )
+        if abs(elapsed_minutes - self.duration_minutes) > 15:
+            raise ValueError("segment duration must match its UTC timestamps")
+        if abs(
+            (
+                self.departure_local.astimezone(UTC) - self.departure_utc
+            ).total_seconds()
+        ) > 120 or abs(
+            (self.arrival_local.astimezone(UTC) - self.arrival_utc).total_seconds()
+        ) > 120:
+            raise ValueError("segment local and UTC fields must describe the same instants")
+        _validate_checked_bag_fields(
+            self.included_checked_bag_quantity,
+            self.included_checked_bag_weight,
+            self.included_checked_bag_weight_unit,
+        )
+        return self
+
+
+class LiveFare(BaseModel):
+    """A live Google Flights fare with a separately verified booking option."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["booking_option_confirmed"] = "booking_option_confirmed"
+    provider_code: Literal["serpapi_google_flights"] = "serpapi_google_flights"
+    provider_name: str = Field(min_length=1, max_length=255)
+    provider_offer_id: str = Field(min_length=1, max_length=512)
+    environment: Literal["production"] = "production"
+    verified_at: datetime
+    expires_at: datetime | None = None
+    total_amount: float = Field(gt=0.0, allow_inf_nan=False)
+    currency: Literal["USD"] = "USD"
+    taxes_included: bool | None = None
+    provider_cache_hit: bool = Field(strict=True)
+    provider_cache_age_seconds: int = Field(ge=0, le=3_900, strict=True)
+    price_basis: Literal["one_way_per_adult"] = "one_way_per_adult"
+    traveler_count: Literal[1] = 1
+    cabin_summary: Cabin
+    mixed_cabin: Literal[False] = False
+    availability_status: Literal["booking_option_verified"] = "booking_option_verified"
+    booking_verified: Literal[True] = True
+    booking_provider: str = Field(min_length=1, max_length=255)
+    booking_url: str = Field(max_length=2_048, pattern=r"^https://")
+    booking_url_kind: Literal["direct_get", "google_flights_itinerary"]
+    seats_remaining: int | None = Field(default=None, ge=1, le=9)
+    seat_count_capped: bool = False
+    last_ticketing_date: date | None = None
+    source_url: str = Field(max_length=2_048, pattern=r"^https://")
+
+    @model_validator(mode="after")
+    def validate_fare(self) -> LiveFare:
+        _require_timezone(self.verified_at)
+        if self.expires_at is not None:
+            _require_timezone(self.expires_at)
+            if self.expires_at <= self.verified_at:
+                raise ValueError("fare expiry must be after verification")
+        if self.seat_count_capped and self.seats_remaining != 9:
+            raise ValueError("a capped seat count must report exactly 9 seats")
+        if (
+            self.last_ticketing_date is not None
+            and self.last_ticketing_date < self.verified_at.date()
+        ):
+            raise ValueError("last ticketing date cannot precede fare verification")
+        return self
+
+
+class FareSearchMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[
+        "confirmed_offers",
+        "no_results",
+        "not_configured",
+        "test_environment_rejected",
+        "authentication_failed",
+        "rate_limited",
+        "budget_not_configured",
+        "budget_exhausted",
+        "provider_unavailable",
+    ]
+    provider_code: Literal["serpapi_google_flights", "none"]
+    environment: Literal["production", "test", "disabled"]
+    observed_at: datetime
+    searched_cabins: list[Cabin] = Field(default_factory=list, max_length=4)
+    call_count: int = Field(default=0, ge=0)
+    search_call_count: int = Field(default=0, ge=0)
+    pricing_call_count: int = Field(default=0, ge=0)
+    cache_hit: bool = False
+    monthly_call_limit: int | None = Field(default=None, ge=0)
+    monthly_calls_used: int | None = Field(default=None, ge=0)
+    search_monthly_limit: int | None = Field(default=None, ge=0)
+    search_monthly_used: int | None = Field(default=None, ge=0)
+    pricing_monthly_limit: int | None = Field(default=None, ge=0)
+    pricing_monthly_used: int | None = Field(default=None, ge=0)
+    notice: BilingualText
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> FareSearchMetadata:
+        _require_timezone(self.observed_at)
+        if len(self.searched_cabins) != len(set(self.searched_cabins)):
+            raise ValueError("searched cabins must be unique")
+        if self.call_count != self.search_call_count + self.pricing_call_count:
+            raise ValueError("total call count must equal search plus booking-validation calls")
+        if self.monthly_calls_used is not None and self.monthly_call_limit is None:
+            raise ValueError("monthly usage requires a monthly call limit")
+        if self.search_monthly_used is not None and self.search_monthly_limit is None:
+            raise ValueError("search usage requires a search monthly limit")
+        if self.pricing_monthly_used is not None and self.pricing_monthly_limit is None:
+            raise ValueError("pricing usage requires a pricing monthly limit")
+        individual_limits = [
+            value
+            for value in (self.search_monthly_limit, self.pricing_monthly_limit)
+            if value is not None
+        ]
+        individual_usage = [
+            value
+            for value in (self.search_monthly_used, self.pricing_monthly_used)
+            if value is not None
+        ]
+        if len(individual_limits) > 1 or len(individual_usage) > 1:
+            raise ValueError("SerpApi must expose one shared monthly quota, not split quotas")
+        if self.monthly_call_limit is not None:
+            if self.monthly_call_limit > 250:
+                raise ValueError("SerpApi local monthly hard limit cannot exceed 250")
+            if not individual_limits or self.monthly_call_limit != individual_limits[0]:
+                raise ValueError("monthly limit must equal the single shared quota")
+        elif individual_limits:
+            raise ValueError("the shared quota requires a monthly total limit")
+        if self.monthly_calls_used is not None:
+            if not individual_usage or self.monthly_calls_used != individual_usage[0]:
+                raise ValueError("monthly usage must equal the single shared usage counter")
+        elif individual_usage:
+            raise ValueError("the shared usage counter requires monthly total usage")
+        if self.status == "not_configured":
+            if self.provider_code != "none" or self.environment != "disabled":
+                raise ValueError("an unconfigured provider must be disabled and use code none")
+        elif self.provider_code != "serpapi_google_flights":
+            raise ValueError("configured fare-search results must identify SerpApi Google Flights")
+        if self.status == "test_environment_rejected" and self.environment != "test":
+            raise ValueError("test-environment rejection requires environment test")
+        if self.status in {"confirmed_offers", "no_results"} and (
+            self.environment != "production"
+        ):
+            raise ValueError("live fare-search results require the production environment")
+        return self
+
+
 class ComparisonOffer(BaseModel):
     id: str
     airline_code: str
@@ -431,12 +654,14 @@ class ComparisonOffer(BaseModel):
     route_status: Literal["provider_confirmed", "model_scenario"]
     routing_status: Literal[
         "provider_direct",
+        "provider_itinerary",
         "model_one_stop",
         "model_route_unresolved",
     ]
-    cabin_status: Literal["catalog_scenario"]
+    cabin_status: Literal["catalog_scenario", "provider_confirmed"]
     punctuality_basis: Literal[
         "direct_leg_model",
+        "multi_leg_independence_model",
         "two_leg_independence_scenario",
         "route_only_model",
     ]
@@ -452,28 +677,78 @@ class ComparisonOffer(BaseModel):
     departure_terminal: str | None = Field(default=None, max_length=40)
     arrival_terminal: str | None = Field(default=None, max_length=40)
     aircraft_icao: str | None = Field(default=None, max_length=12)
+    bookability_status: Literal["unverified", "booking_option_verified"] = "unverified"
+    live_fare: LiveFare | None = None
+    segments: list[ProviderOfferSegment] = Field(default_factory=list, max_length=4)
 
     @model_validator(mode="after")
     def validate_schedule_claims(self) -> ComparisonOffer:
-        expected_routing = {
-            "provider_direct": ("provider_confirmed", 0, "direct_leg_model"),
-            "model_one_stop": (
-                "model_scenario",
-                1,
-                "two_leg_independence_scenario",
-            ),
-            "model_route_unresolved": (
-                "model_scenario",
-                None,
-                "route_only_model",
-            ),
-        }[self.routing_status]
-        if (
-            self.route_status,
-            self.stops,
-            self.punctuality_basis,
-        ) != expected_routing:
-            raise ValueError("routing status, stops, route status, and basis must agree")
+        if self.routing_status == "provider_itinerary":
+            if (
+                self.route_status != "provider_confirmed"
+                or self.stops not in {1, 2, 3}
+                or self.punctuality_basis != "multi_leg_independence_model"
+            ):
+                raise ValueError(
+                    "provider itineraries require one to three stops and the multi-leg basis"
+                )
+        else:
+            expected_routing = {
+                "provider_direct": ("provider_confirmed", 0, "direct_leg_model"),
+                "model_one_stop": (
+                    "model_scenario",
+                    1,
+                    "two_leg_independence_scenario",
+                ),
+                "model_route_unresolved": (
+                    "model_scenario",
+                    None,
+                    "route_only_model",
+                ),
+            }[self.routing_status]
+            if (
+                self.route_status,
+                self.stops,
+                self.punctuality_basis,
+            ) != expected_routing:
+                raise ValueError(
+                    "routing status, stops, route status, and basis must agree"
+                )
+
+        if self.bookability_status == "unverified" and self.live_fare is not None:
+            raise ValueError("unverified offers cannot include a live fare")
+        if self.bookability_status == "booking_option_verified":
+            if (
+                self.route_status != "provider_confirmed"
+                or self.routing_status
+                not in {"provider_direct", "provider_itinerary"}
+                or self.schedule_status != "priced_offer"
+                or self.schedule_source != "serpapi_google_flights_booking"
+                or self.cabin_status != "provider_confirmed"
+                or self.live_fare is None
+                or not self.live_fare.booking_verified
+                or not self.segments
+                or self.stops is None
+            ):
+                raise ValueError(
+                    "verified booking options require a provider itinerary, Google Flights "
+                    "schedule, provider-confirmed cabin, live fare, booking evidence, and segments"
+                )
+            if len(self.segments) != self.stops + 1:
+                raise ValueError("segment count must equal stops plus one")
+            if [segment.sequence for segment in self.segments] != list(
+                range(1, len(self.segments) + 1)
+            ):
+                raise ValueError("offer segments must have consecutive sequences")
+            if self.live_fare.cabin_summary != self.cabin or any(
+                segment.cabin != self.cabin for segment in self.segments
+            ):
+                raise ValueError("live fare, offer, and every segment must use one cabin")
+            for previous, current in zip(self.segments, self.segments[1:], strict=False):
+                if previous.destination != current.origin:
+                    raise ValueError("offer segments must form one continuous route")
+                if current.departure_utc <= previous.arrival_utc:
+                    raise ValueError("each segment must depart after the prior segment arrives")
         schedule_values = (
             self.flight_number,
             self.scheduled_departure_local,
@@ -490,6 +765,7 @@ class ComparisonOffer(BaseModel):
         expected_source = {
             "live_schedule": "airlabs_schedules",
             "recurring_timetable_projection": "airlabs_routes",
+            "priced_offer": "serpapi_google_flights_booking",
         }[self.schedule_status]
         if self.schedule_source != expected_source or any(
             value is None for value in schedule_values
@@ -531,6 +807,23 @@ class ComparisonOffer(BaseModel):
             ).total_seconds()
         ) > 120:
             raise ValueError("local and UTC schedule fields must describe the same instants")
+        if self.bookability_status == "booking_option_verified":
+            first_segment = self.segments[0]
+            last_segment = self.segments[-1]
+            assert self.flight_number is not None
+            if self.flight_number != first_segment.flight_number:
+                raise ValueError("summary flight number must match the first segment")
+            summary_and_segment_times = (
+                (self.scheduled_departure_local, first_segment.departure_local),
+                (self.scheduled_departure_utc, first_segment.departure_utc),
+                (self.scheduled_arrival_local, last_segment.arrival_local),
+                (self.scheduled_arrival_utc, last_segment.arrival_utc),
+            )
+            if any(
+                abs((summary - segment).total_seconds()) > 120
+                for summary, segment in summary_and_segment_times
+            ):
+                raise ValueError("summary times must match the first and last segments")
         return self
 
 
@@ -543,6 +836,47 @@ class ComparisonRankings(BaseModel):
 class BilingualWarning(BaseModel):
     zh: str
     en: str
+
+
+class TimetableReference(BaseModel):
+    """A provider timetable row excluded from strict flight comparison."""
+
+    airline_code: str = Field(min_length=2, max_length=3)
+    airline_name: str
+    flight_number: str = Field(pattern=r"^[A-Z0-9]{3,12}$")
+    duration_minutes: int = Field(gt=0)
+    schedule_status: Literal[
+        "live_schedule",
+        "recurring_timetable_projection",
+    ]
+    schedule_source: Literal["airlabs_schedules", "airlabs_routes"]
+    scheduled_departure_local: datetime
+    scheduled_arrival_local: datetime
+    scheduled_departure_utc: datetime
+    scheduled_arrival_utc: datetime
+    schedule_observed_at: datetime | None = None
+    provider_flight_status: str | None = Field(default=None, max_length=40)
+    bookability_status: Literal["unverified"] = "unverified"
+    reference_reason: BilingualText
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> TimetableReference:
+        expected_source = {
+            "live_schedule": "airlabs_schedules",
+            "recurring_timetable_projection": "airlabs_routes",
+        }[self.schedule_status]
+        if self.schedule_source != expected_source:
+            raise ValueError("timetable status and source must agree")
+        for value in (
+            self.scheduled_departure_local,
+            self.scheduled_arrival_local,
+            self.scheduled_departure_utc,
+            self.scheduled_arrival_utc,
+        ):
+            _require_timezone(value)
+        if self.scheduled_arrival_utc <= self.scheduled_departure_utc:
+            raise ValueError("timetable arrival must be after departure")
+        return self
 
 
 class ComparisonResponse(BaseModel):
@@ -558,10 +892,68 @@ class ComparisonResponse(BaseModel):
     context: PredictionContextResponse
     offers: list[ComparisonOffer]
     rankings: ComparisonRankings
+    availability_mode: Literal[
+        "strict_bookable_only",
+        "strict_schedule_only",
+    ] = "strict_bookable_only"
+    result_status: Literal[
+        "verified_offers_found",
+        "no_verified_offer",
+        "fare_provider_not_configured",
+        "fare_provider_test_rejected",
+        "fare_provider_authentication_failed",
+        "fare_provider_rate_limited",
+        "fare_provider_budget_not_configured",
+        "fare_provider_budget_exhausted",
+        "fare_provider_unavailable",
+        "verified_schedules_found",
+        "no_verified_schedule",
+    ]
+    strict_mode_notice: BilingualText
+    fare_search_metadata: FareSearchMetadata | None = None
+    timetable_references: list[TimetableReference] = Field(default_factory=list)
     schedule_sample_truncated: bool
     schedule_sample_limit: Literal[50] = 50
     warnings: BilingualWarning
     model_version: str
+
+    @model_validator(mode="after")
+    def validate_availability_mode(self) -> ComparisonResponse:
+        if self.availability_mode != "strict_bookable_only":
+            return self
+        if self.fare_search_metadata is None:
+            raise ValueError("strict bookable mode requires fare-search metadata")
+        if any(
+            offer.bookability_status != "booking_option_verified" for offer in self.offers
+        ):
+            raise ValueError("strict bookable mode may only return confirmed offers")
+        if self.offers and self.result_status != "verified_offers_found":
+            raise ValueError("strict bookable offers require result status verified_offers_found")
+        if not self.offers and self.result_status == "verified_offers_found":
+            raise ValueError("verified_offers_found requires at least one confirmed offer")
+        if self.result_status in {"verified_schedules_found", "no_verified_schedule"}:
+            raise ValueError("strict bookable mode requires a fare-provider result status")
+        if self.offers and (
+            self.fare_search_metadata.status != "confirmed_offers"
+            or self.fare_search_metadata.environment != "production"
+        ):
+            raise ValueError("confirmed offers require production fare-search metadata")
+        expected_status = {
+            "confirmed_offers": (
+                "verified_offers_found" if self.offers else "no_verified_offer"
+            ),
+            "no_results": "no_verified_offer",
+            "not_configured": "fare_provider_not_configured",
+            "test_environment_rejected": "fare_provider_test_rejected",
+            "authentication_failed": "fare_provider_authentication_failed",
+            "rate_limited": "fare_provider_rate_limited",
+            "budget_not_configured": "fare_provider_budget_not_configured",
+            "budget_exhausted": "fare_provider_budget_exhausted",
+            "provider_unavailable": "fare_provider_unavailable",
+        }[self.fare_search_metadata.status]
+        if self.result_status != expected_status:
+            raise ValueError("result status must agree with fare-search metadata and offers")
+        return self
 
 
 class OfferDetailRequest(BaseModel):
@@ -571,6 +963,7 @@ class OfferDetailRequest(BaseModel):
     destination: str = Field(examples=["LAX"])
     departure_date: date = Field(examples=["2026-08-15"])
     offer_id: str = Field(pattern=r"^off_[a-f0-9]{24}$")
+    force_refresh: bool = False
 
     @field_validator("origin", "destination")
     @classmethod
@@ -590,6 +983,8 @@ class ItineraryLeg(BaseModel):
     destination: str = Field(min_length=3, max_length=3)
     date_context: date
     flight_number: str | None = Field(default=None, pattern=r"^[A-Z0-9]{3,12}$")
+    marketing_airline_code: str | None = Field(default=None, min_length=2, max_length=3)
+    operating_airline_code: str | None = Field(default=None, min_length=2, max_length=3)
     departure_local: datetime | None = None
     arrival_local: datetime | None = None
     departure_utc: datetime | None = None
@@ -599,14 +994,45 @@ class ItineraryLeg(BaseModel):
     departure_terminal: str | None = Field(default=None, max_length=40)
     arrival_terminal: str | None = Field(default=None, max_length=40)
     aircraft_icao: str | None = Field(default=None, max_length=12)
+    cabin: Cabin | None = None
+    booking_class: str | None = Field(default=None, max_length=8, pattern=r"^[A-Z0-9]+$")
+    fare_basis: str | None = Field(default=None, max_length=64)
+    fare_brand: str | None = Field(default=None, max_length=120)
+    included_checked_bag_quantity: int | None = Field(default=None, ge=0, le=9)
+    included_checked_bag_weight: float | None = Field(
+        default=None,
+        gt=0.0,
+        allow_inf_nan=False,
+    )
+    included_checked_bag_weight_unit: Literal["KG", "LB"] | None = None
     data_basis: Literal[
         "airlabs_live_schedule",
         "airlabs_recurring_timetable_projection",
+        "serpapi_booking_confirmed",
         "model_duration_only",
     ]
 
+    @field_validator("origin", "destination")
+    @classmethod
+    def validate_airport_code(cls, value: str) -> str:
+        return _normalise_code(value, min_length=3, max_length=3)
+
+    @field_validator("marketing_airline_code", "operating_airline_code")
+    @classmethod
+    def validate_airline_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalise_code(value, min_length=2, max_length=3)
+
     @model_validator(mode="after")
     def validate_time_basis(self) -> ItineraryLeg:
+        if self.origin == self.destination:
+            raise ValueError("itinerary leg origin and destination must differ")
+        _validate_checked_bag_fields(
+            self.included_checked_bag_quantity,
+            self.included_checked_bag_weight,
+            self.included_checked_bag_weight_unit,
+        )
         times = (
             self.departure_local,
             self.arrival_local,
@@ -619,18 +1045,73 @@ class ItineraryLeg(BaseModel):
             return self
         if self.flight_number is None or any(value is None for value in times):
             raise ValueError("provider legs require a flight number and complete times")
+        assert self.departure_local is not None
+        assert self.arrival_local is not None
+        assert self.departure_utc is not None
+        assert self.arrival_utc is not None
+        for value in times:
+            assert value is not None
+            _require_timezone(value)
+        if self.departure_utc.utcoffset() != timedelta(0) or (
+            self.arrival_utc.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("provider leg UTC fields must use a zero UTC offset")
+        if self.arrival_utc <= self.departure_utc:
+            raise ValueError("provider leg arrival must be after departure")
+        elapsed_minutes = round(
+            (self.arrival_utc - self.departure_utc).total_seconds() / 60
+        )
+        if abs(elapsed_minutes - self.duration_minutes) > 15:
+            raise ValueError("provider leg duration must match its UTC timestamps")
+        if abs(
+            (self.departure_local.astimezone(UTC) - self.departure_utc).total_seconds()
+        ) > 120 or abs(
+            (self.arrival_local.astimezone(UTC) - self.arrival_utc).total_seconds()
+        ) > 120:
+            raise ValueError("provider leg local and UTC fields must describe the same instants")
+        if self.data_basis == "serpapi_booking_confirmed" and (
+            self.marketing_airline_code is None or self.cabin is None
+        ):
+            raise ValueError(
+                "Google Flights booking-verified legs require marketing airline and cabin"
+            )
         return self
 
 
+class ItineraryLayover(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int = Field(ge=1, le=3)
+    airport: str = Field(min_length=3, max_length=3)
+    duration_minutes: int = Field(ge=0, le=1_440)
+
+    @field_validator("airport")
+    @classmethod
+    def validate_airport(cls, value: str) -> str:
+        return _normalise_code(value, min_length=3, max_length=3)
+
+
 class OfferItinerary(BaseModel):
-    kind: Literal["direct", "one_stop", "route_unresolved"]
+    kind: Literal["direct", "one_stop", "multi_stop", "route_unresolved"]
     time_basis: Literal["provider_schedule", "model_duration_only"]
     total_duration_minutes: int = Field(gt=0)
     total_distance_km: float = Field(gt=0.0)
     layover_airport: str | None = Field(default=None, min_length=3, max_length=3)
     layover_minutes: int | None = Field(default=None, ge=0)
-    layover_status: Literal["not_applicable", "model_assumption"]
-    legs: list[ItineraryLeg] = Field(default_factory=list, max_length=2)
+    layover_status: Literal[
+        "not_applicable",
+        "model_assumption",
+        "provider_confirmed",
+    ]
+    legs: list[ItineraryLeg] = Field(default_factory=list, max_length=4)
+    layovers: list[ItineraryLayover] = Field(default_factory=list, max_length=3)
+
+    @field_validator("layover_airport")
+    @classmethod
+    def validate_layover_airport(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalise_code(value, min_length=3, max_length=3)
 
     @model_validator(mode="after")
     def validate_itinerary(self) -> OfferItinerary:
@@ -639,6 +1120,7 @@ class OfferItinerary(BaseModel):
                 len(self.legs) != 1
                 or self.layover_airport is not None
                 or self.layover_minutes is not None
+                or self.layovers
                 or self.layover_status != "not_applicable"
             ):
                 raise ValueError("single-leg itineraries cannot include a layover")
@@ -647,6 +1129,7 @@ class OfferItinerary(BaseModel):
                 self.legs
                 or self.layover_airport is not None
                 or self.layover_minutes is not None
+                or self.layovers
                 or self.layover_status != "not_applicable"
                 or self.time_basis != "model_duration_only"
             ):
@@ -654,15 +1137,66 @@ class OfferItinerary(BaseModel):
                     "unresolved routes must have no legs or layover and use model reference data"
                 )
             return self
+        elif self.kind == "one_stop":
+            if len(self.legs) != 2:
+                raise ValueError("one-stop itineraries require exactly two legs")
+            legacy_layover = (
+                self.layover_airport is not None and self.layover_minutes is not None
+            )
+            provider_layover = len(self.layovers) == 1
+            if legacy_layover == provider_layover:
+                raise ValueError(
+                    "one-stop itineraries require either one provider layover or the legacy layover"
+                )
+            if legacy_layover and self.layover_status != "model_assumption":
+                raise ValueError("legacy one-stop layovers must be model assumptions")
+            if provider_layover and self.layover_status != "provider_confirmed":
+                raise ValueError("provider one-stop layovers must be provider confirmed")
         elif (
-            len(self.legs) != 2
-            or self.layover_airport is None
-            or self.layover_minutes is None
-            or self.layover_status != "model_assumption"
+            len(self.legs) not in {3, 4}
+            or len(self.layovers) != len(self.legs) - 1
+            or self.layover_airport is not None
+            or self.layover_minutes is not None
+            or self.layover_status != "provider_confirmed"
         ):
-            raise ValueError("one-stop model itineraries require two legs and a layover")
+            raise ValueError(
+                "multi-stop itineraries require three or four legs and provider layovers"
+            )
+
+        if [leg.sequence for leg in self.legs] != list(range(1, len(self.legs) + 1)):
+            raise ValueError("itinerary legs must have consecutive sequences")
+        for previous, current in zip(self.legs, self.legs[1:], strict=False):
+            if previous.destination != current.origin:
+                raise ValueError("itinerary legs must form one continuous route")
+
+        if self.layovers:
+            if [layover.sequence for layover in self.layovers] != list(
+                range(1, len(self.layovers) + 1)
+            ):
+                raise ValueError("itinerary layovers must have consecutive sequences")
+            for index, layover in enumerate(self.layovers):
+                previous = self.legs[index]
+                current = self.legs[index + 1]
+                if layover.airport != previous.destination:
+                    raise ValueError("layover airport must match the connecting legs")
+                assert previous.arrival_utc is not None
+                assert current.departure_utc is not None
+                if current.departure_utc <= previous.arrival_utc:
+                    raise ValueError("each connecting leg must depart after arrival")
+                elapsed_layover = round(
+                    (current.departure_utc - previous.arrival_utc).total_seconds() / 60
+                )
+                if abs(elapsed_layover - layover.duration_minutes) > 15:
+                    raise ValueError("layover duration must match provider timestamps")
+        elif self.kind == "one_stop":
+            assert self.layover_airport is not None
+            if self.layover_airport != self.legs[0].destination:
+                raise ValueError("layover airport must match the connecting legs")
+
         expected_duration = sum(leg.duration_minutes for leg in self.legs) + (
-            self.layover_minutes or 0
+            sum(layover.duration_minutes for layover in self.layovers)
+            if self.layovers
+            else (self.layover_minutes or 0)
         )
         if expected_duration != self.total_duration_minutes:
             raise ValueError("itinerary duration must equal its legs plus layover")
@@ -671,6 +1205,58 @@ class OfferItinerary(BaseModel):
         provider_basis = all(leg.data_basis != "model_duration_only" for leg in self.legs)
         if (self.time_basis == "provider_schedule") != provider_basis:
             raise ValueError("itinerary time basis must match every leg")
+        if self.layover_status == "provider_confirmed" and (
+            self.time_basis != "provider_schedule"
+            or any(leg.data_basis != "serpapi_booking_confirmed" for leg in self.legs)
+        ):
+            raise ValueError(
+                "provider-confirmed connections require booking-verified Google Flights legs"
+            )
+        return self
+
+
+class PriceForecastPoint(BaseModel):
+    quote_date: date
+    quote_time: datetime
+    days_until_departure: float = Field(gt=0.0)
+    estimated_price_usd: float = Field(ge=0.0)
+    interval_80_low_usd: float = Field(ge=0.0)
+    interval_80_high_usd: float = Field(ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> PriceForecastPoint:
+        _require_timezone(self.quote_time)
+        if not (
+            self.interval_80_low_usd
+            <= self.estimated_price_usd
+            <= self.interval_80_high_usd
+        ):
+            raise ValueError("price estimate must be inside its 80% interval")
+        return self
+
+
+class PriceForecastCurve(BaseModel):
+    status: Literal["model_projection"] = "model_projection"
+    basis: Literal["synthetic_demo_model"] = "synthetic_demo_model"
+    currency: Literal["USD"] = "USD"
+    start_date: date
+    end_date: date
+    generated_at: datetime
+    historical_prices_available: Literal[False] = False
+    extrapolated_beyond_training_horizon: bool = False
+    points: list[PriceForecastPoint] = Field(min_length=1, max_length=371)
+    notice: BilingualText
+
+    @model_validator(mode="after")
+    def validate_curve(self) -> PriceForecastCurve:
+        _require_timezone(self.generated_at)
+        if self.end_date < self.start_date:
+            raise ValueError("price curve end date cannot precede its start date")
+        quote_dates = [point.quote_date for point in self.points]
+        if quote_dates != sorted(set(quote_dates)):
+            raise ValueError("price curve quote dates must be unique and increasing")
+        if quote_dates[0] != self.start_date or quote_dates[-1] != self.end_date:
+            raise ValueError("price curve points must include the start and end dates")
         return self
 
 
@@ -685,6 +1271,8 @@ class OfferDetailResponse(BaseModel):
     schedule_sample_truncated: bool
     schedule_sample_limit: Literal[50] = 50
     fallback_reason: BilingualText | None = None
+    fare_search_metadata: FareSearchMetadata | None = None
     offer: ComparisonOffer
     itinerary: OfferItinerary
+    price_curve: PriceForecastCurve
     notice: BilingualText

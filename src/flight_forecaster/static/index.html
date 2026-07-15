@@ -830,6 +830,47 @@
 
     .response-warning svg { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px; }
 
+    .strict-mode-notice {
+      display: none;
+      gap: 11px;
+      align-items: flex-start;
+      margin-top: 14px;
+      padding: 14px 16px;
+      color: var(--navy-800);
+      border: 1px solid var(--blue-100);
+      border-radius: 13px;
+      background: var(--blue-50);
+      font-size: 10px;
+      line-height: 1.58;
+    }
+
+    .strict-mode-notice.visible { display: flex; }
+
+    .strict-mode-notice strong {
+      flex: 0 0 auto;
+      color: var(--blue-700);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .rank-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+    .strict-mode-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 8px;
+      color: var(--teal-700);
+      border: 1px solid #b9e7da;
+      border-radius: 999px;
+      background: var(--teal-100);
+      font-size: 8px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
     .rank-toolbar {
       display: flex;
       align-items: flex-end;
@@ -1023,6 +1064,17 @@
       line-height: 1.4;
     }
 
+    .fare-source-link {
+      display: inline-block;
+      margin-top: 5px;
+      color: var(--blue-700);
+      font-size: 9px;
+      font-weight: 720;
+      text-decoration: none;
+    }
+
+    .fare-source-link:hover { text-decoration: underline; }
+
     .tiny-badge {
       display: inline-flex;
       width: fit-content;
@@ -1072,6 +1124,84 @@
     .empty-state svg { width: 34px; height: 34px; margin-bottom: 8px; color: var(--slate-300); }
     .empty-state strong { display: block; margin-bottom: 5px; color: var(--navy-800); font-size: 13px; }
     .empty-state p { max-width: 520px; margin: 0 auto; font-size: 11px; }
+
+    .timetable-reference-section { margin-top: 18px; }
+
+    .timetable-reference-section[hidden] { display: none; }
+
+    .timetable-reference {
+      overflow: hidden;
+      border: 1px solid #ecd8a2;
+      border-radius: var(--radius-md);
+      background: #fffaf0;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .timetable-reference summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 16px 18px;
+      color: var(--navy-800);
+      cursor: pointer;
+      list-style: none;
+    }
+
+    .timetable-reference summary::-webkit-details-marker { display: none; }
+
+    .timetable-reference summary::after {
+      flex: 0 0 auto;
+      color: var(--amber-700);
+      content: "+";
+      font-size: 20px;
+      font-weight: 500;
+      line-height: 1;
+    }
+
+    .timetable-reference[open] summary::after { content: "−"; }
+
+    .reference-summary-copy strong { display: block; font-size: 13px; }
+
+    .reference-summary-copy small {
+      display: block;
+      margin-top: 3px;
+      color: var(--slate-600);
+      font-size: 9px;
+    }
+
+    .reference-count {
+      margin-left: auto;
+      padding: 3px 8px;
+      color: var(--amber-700);
+      border-radius: 999px;
+      background: var(--amber-100);
+      font-size: 9px;
+      font-weight: 780;
+      white-space: nowrap;
+    }
+
+    .reference-warning {
+      margin: 0 18px 14px;
+      padding: 10px 12px;
+      color: #65490d;
+      border: 1px solid #eedba6;
+      border-radius: 10px;
+      background: white;
+      font-size: 10px;
+    }
+
+    .reference-table {
+      min-width: 760px;
+      border-top: 1px solid #ecd8a2;
+      table-layout: auto;
+    }
+
+    .reference-table th { background: #fff6df; }
+
+    .reference-table td { background: rgba(255,255,255,.72); }
+
+    .reference-table .reference-reason { min-width: 240px; }
 
     .initial-state {
       margin-top: 18px;
@@ -1146,6 +1276,7 @@
       .table-scroll { overflow: visible; }
       table, thead, tbody, tr, td { display: block; width: 100%; }
       table { min-width: 0; }
+      .reference-table { min-width: 0; }
       thead { display: none; }
       tbody { display: grid; gap: 12px; padding: 12px; background: var(--slate-50); }
       tbody tr {
@@ -1437,9 +1568,17 @@
           <span id="response-warning-text"></span>
         </aside>
 
+        <aside id="strict-mode-notice" class="strict-mode-notice" aria-live="polite">
+          <strong data-i18n="strictMode">严格模式</strong>
+          <span id="strict-mode-notice-text"></span>
+        </aside>
+
         <div class="rank-toolbar">
           <div class="rank-heading">
-            <h2 data-i18n="offersTitle">航司与舱位比较</h2>
+            <div class="rank-title-line">
+              <h2 data-i18n="offersTitle">严格验证航班</h2>
+              <span class="strict-mode-badge" data-i18n="strictScheduleOnly">仅购票选项已验证</span>
+            </div>
             <p id="ranking-description" data-i18n="directDescription">优先展示直飞，再按价格和准点表现排序。</p>
           </div>
           <div class="tabs" role="tablist" aria-label="Ranking method">
@@ -1463,7 +1602,7 @@
         <div id="offer-panel" class="offer-panel" role="tabpanel" aria-labelledby="tab-direct_first" tabindex="0">
           <div class="table-scroll">
             <table>
-              <caption data-i18n="offersCaption">当前排序下的所有航司与舱位预测结果</caption>
+              <caption data-i18n="offersCaption">严格模式下当前排序的 Google Flights 已验证购票选项</caption>
               <colgroup>
                 <col style="width:11%"><col style="width:7%"><col style="width:7%"><col style="width:11%">
                 <col style="width:9%"><col style="width:8%"><col style="width:8%"><col style="width:7%">
@@ -1474,14 +1613,14 @@
                   <th data-i18n="airline">航司</th>
                   <th data-i18n="cabin">舱位</th>
                   <th data-i18n="route">航程</th>
-                  <th data-i18n="estimatedPrice">模型估价</th>
+                  <th data-i18n="estimatedPrice">当前航班报价</th>
                   <th data-i18n="punctuality">准点率</th>
                   <th data-i18n="baggage">托运行李</th>
                   <th data-i18n="studentOffer">学生优惠</th>
                   <th data-i18n="change">改签</th>
                   <th data-i18n="refund">退票</th>
                   <th data-i18n="eligibility">年龄与验证</th>
-                  <th data-i18n="routeStatus">航线状态</th>
+                  <th data-i18n="routeStatus">购票选项</th>
                   <th data-i18n="details">详情</th>
                 </tr>
               </thead>
@@ -1492,10 +1631,39 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
               <circle cx="11" cy="11" r="7"/><path d="m16 16 4 4M8 11h6"/>
             </svg>
-            <strong data-i18n="emptyTitle">此分类暂无可比较结果</strong>
-            <p data-i18n="emptyBody">免费数据源可能未覆盖该航线或当前排序。请尝试其他分类、日期或机场。</p>
+            <strong id="empty-title" data-i18n="emptyTitle">未找到购票选项已验证的航班</strong>
+            <p id="empty-body" data-i18n="emptyBody">系统不会用未验证航班或模型报价填充主列表。被排除的时刻表记录如有返回，将仅在下方作为参考。</p>
           </div>
         </div>
+
+        <section id="timetable-reference-section" class="timetable-reference-section" hidden>
+          <details id="timetable-reference" class="timetable-reference">
+            <summary>
+              <span class="reference-summary-copy">
+                <strong data-i18n="timetableReferencesTitle">时刻表参考（不参与比较）</strong>
+                <small data-i18n="timetableReferencesHint">仅展示被严格模式排除的来源记录，不生成舱位、价格或详情选项。</small>
+              </span>
+              <span id="timetable-reference-count" class="reference-count">0</span>
+            </summary>
+            <p class="reference-warning" data-i18n="timetableReferencesWarning">所有记录均不参与比较；具体排除原因见最后一列，且没有任何记录可证明库存或可购买。</p>
+            <div class="table-scroll">
+              <table class="reference-table">
+                <caption data-i18n="timetableReferencesCaption">免费来源返回并被严格模式排除的去重时刻表参考</caption>
+                <thead>
+                  <tr>
+                    <th data-i18n="airline">航司</th>
+                    <th data-i18n="flightNumber">航班号</th>
+                    <th data-i18n="scheduledTimes">来源时刻</th>
+                    <th data-i18n="duration">直飞基准时长</th>
+                    <th data-i18n="source">来源</th>
+                    <th data-i18n="referenceReason">参考原因</th>
+                  </tr>
+                </thead>
+                <tbody id="timetable-reference-rows"></tbody>
+              </table>
+            </div>
+          </details>
+        </section>
       </section>
     </main>
 
@@ -1523,7 +1691,7 @@
           pointTwo: "实时数据失败时透明回退",
           pointThree: "绝不把预测冒充实时票价",
           searchTitle: "比较一条航线",
-          searchHint: "全球机场使用三字 IATA 代码，例如 YYZ、JFK、LHR。",
+          searchHint: "可输入全球机场的三字 IATA 代码，例如 YYZ、JFK、LHR；返回结果受 Google Flights 覆盖和单次最多 10 次 provider 查询限制，并非全球全量清单。",
           autoContext: "自动补全外部信号",
           origin: "出发机场",
           destination: "到达机场",
@@ -1531,12 +1699,12 @@
           compare: "开始比较",
           comparing: "正在比较",
           autoNote: "无需输入距离、飞行时长、天气、机场拥堵、航司或舱位；系统将自动推算并展开比较。",
-          integrityNotice: "数据诚信提示：页面中的价格和准点率都来自合成演示模型，价格不是可购买报价。行李、学生优惠和退改信息只有在数据源明确确认时才标记为已确认；缺失信息显示为“未知”，不会被虚构或默认加分。",
+          integrityNotice: "数据诚信提示：主价格来自 SerpApi 返回的 Google Flights 查询结果，并且只有购票选项及安全打开路径都通过验证的航班才会展示；若销售方要求 POST，链接只打开 Google Flights 结果页，而不是冒充销售方直链。来源缓存最长约 1 小时并会显示缓存年龄，税费是否包含未知，价格仍可能随时变化。模型价格曲线、80% 区间和准点率均为合成演示模型预测。缺失权益显示为“未知”，不会被虚构或默认加分。",
           initialState: "输入航线和出发日期后，比较结果会显示在这里。",
           distance: "航线距离",
           duration: "直飞基准时长",
           plannedTime: "计划出发日期",
-          generatedAt: "结果生成时间",
+          generatedAt: "本次查询响应时间",
           contextTitle: "预测上下文",
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
           weather: "实时 / 预测航空天气",
@@ -1546,32 +1714,88 @@
           news: "近实时航空中断新闻",
           newsSemantics: "文章时间为 GDELT 观察 / 索引时间，不一定是媒体发布时间；标题保留来源语言。",
           viewDetails: "查看详情",
-          offersTitle: "航司与舱位比较",
+          offersTitle: "严格验证航班",
+          strictMode: "严格模式",
+          strictScheduleOnly: "仅购票选项已验证",
+          strictModeDefaultNotice: "主列表只显示 SerpApi 返回且通过购票选项验证的 Google Flights 结果。每次比较最多进行 4 次舱位搜索和 6 次候选验证，候选优先保持航司多样性；已启用 deep_search 与 show_hidden，但仍不代表所有航司、航班或销售方的全量结果。来源缓存最长约 1 小时。",
           directFirst: "直飞优先",
           lowestPrice: "低价优先",
           studentFirst: "学生友好优先",
           cabinBranch: "按舱位筛选",
           allCabins: "全部舱位",
-          directDescription: "依次展示提供商确认直达航路、航司枢纽一站式模型，以及置后的航路未解析 O&D 参考。",
-          priceDescription: "按模型估算价格从低到高展示。",
-          studentDescription: "严格按最低价格、免费托运行李、已确认学生折扣、免费退改、年龄与验证条件依次比较。",
-          offersCaption: "当前排序下的所有航司与舱位预测结果",
+          directDescription: "仅在 Google Flights 购票选项已验证的结果中优先展示直飞，并可按来源返回的舱位筛选。",
+          priceDescription: "仅在购票选项已验证的结果中按来源结果价格从低到高展示。",
+          studentDescription: "仅在最多 6 个已验证结果中，依次按来源结果价格、免费托运行李、实际学生折扣、免费退改、年龄与验证条件比较；普通 Google Flights 免费查询不能验证实际学生专属折扣，因此该项显示未知且不加分。",
+          offersCaption: "严格模式下最多 6 个 Google Flights 已验证购票选项；不是所有航司或航班的全量清单",
           airline: "航司",
           cabin: "舱位",
           route: "航程",
-          estimatedPrice: "模型估价",
+          estimatedPrice: "当前航班报价",
           punctuality: "准点率",
           baggage: "托运行李",
           studentOffer: "学生优惠",
           change: "改签",
           refund: "退票",
           eligibility: "年龄与验证",
-          routeStatus: "航线状态",
+          routeStatus: "购票选项",
           details: "详情",
           offerDetails: "查看此选项详情",
-          emptyTitle: "此分类暂无可比较结果",
-          emptyBody: "免费数据源可能未覆盖该航线或当前排序。请尝试其他分类、日期或机场。",
-          footerNote: "结果仅用于决策参考。模型估价、准点概率、天气、机场运行与新闻信号都可能存在延迟或误差；预订前请以航司或出票平台的实时条款为准。",
+          emptyTitle: "未找到购票选项已验证的航班",
+          emptyBody: "系统不会用未验证航班或模型报价填充主列表。被排除的时刻表记录如有返回，将仅在下方作为参考。",
+          emptyCategoryTitle: "此分类暂无购票选项已验证的航班",
+          emptyCategoryBody: "请切换舱位或排序方式查看其他已验证结果。",
+          fareNotConfiguredTitle: "尚未配置真实报价服务",
+          fareNotConfiguredBody: "请配置 SERPAPI_API_KEY 后重试；系统不会显示未验证替代结果。",
+          fareTestRejectedTitle: "非正式来源结果不进入严格模式",
+          fareTestRejectedBody: "严格模式只接受 SerpApi 返回且包含已验证 HTTPS 购票选项的 Google Flights 结果。",
+          fareBudgetNotConfiguredTitle: "尚未配置报价预算",
+          fareBudgetNotConfiguredBody: "请先配置生产报价查询预算；系统没有执行可能产生费用的查询。",
+          fareBudgetExhaustedTitle: "本期报价预算已用完",
+          fareBudgetExhaustedBody: "当前没有执行新的真实报价查询，请稍后或在预算恢复后重试。",
+          fareRateLimitedTitle: "报价服务请求过于频繁",
+          fareRateLimitedBody: "SerpApi 暂时限制了请求，请稍后重试；系统不会使用旧报价冒充当前报价。",
+          fareAuthTitle: "报价服务身份验证失败",
+          fareAuthBody: "请检查 SERPAPI_API_KEY，修复前不会显示购票选项。",
+          fareProviderUnavailableTitle: "报价服务暂时不可用",
+          fareProviderUnavailableBody: "无法验证当前价格与余位，请稍后重试。下方时刻表仅供参考。",
+          fareNoResultsTitle: "未找到当前可售报价",
+          fareNoResultsBody: "Google Flights 没有返回同时满足完整航班信息和购票选项验证的结果；系统不会生成替代航班。",
+          timetableReferencesTitle: "时刻表参考（不参与比较）",
+          timetableReferencesHint: "仅展示被严格模式排除的来源记录，不生成舱位、价格或详情选项。",
+          timetableReferencesWarning: "所有记录均不参与比较；具体排除原因见最后一列，且没有任何记录可证明库存或可购买。",
+          timetableReferencesCaption: "免费来源返回并被严格模式排除的去重时刻表参考",
+          timetableReferenceCount: "{count} 条参考",
+          flightNumber: "航班号",
+          scheduledTimes: "来源时刻",
+          referenceReason: "参考原因",
+          providerUpdated: "来源更新时间",
+          bookability: "可售状态",
+          unverifiedBookability: "未验证",
+          confirmedAvailable: "购票选项已验证",
+          priceConfirmed: "购票选项已验证",
+          bookingOptionVerified: "购票选项已验证",
+          liveFare: "来源结果航班报价",
+          modelReference: "模型价格预测（非实时报价）",
+          fareSource: "报价来源",
+          verifiedAt: "来源结果生成时间",
+          providerCacheHit: "已识别缓存复用",
+          providerCacheMiss: "未识别缓存复用",
+          providerCacheAge: "缓存年龄 {age}",
+          studentDiscountUnavailable: "普通 Google Flights 免费查询无法验证实际学生专属折扣；未知不加分。",
+          production: "生产环境",
+          availability: "余位",
+          seatsNotProvided: "有可售报价，余位数量未提供",
+          seatsRemaining: "剩余 {count} 个可预订座位",
+          seatsCapped: "{count} 个或更多可预订座位（提供商计数上限）",
+          lastTicketingDate: "最后出票日期",
+          lastTicketingNotProvided: "最后出票日期：提供商未返回",
+          providerEvidence: "打开已验证购票路径",
+          directBookingLink: "打开销售方购票跳转",
+          googleFlightsItineraryLink: "打开 Google Flights 结果页",
+          bookingWith: "购票渠道",
+          googleFlightsProvider: "SerpApi · Google Flights",
+          flightSequence: "航班",
+          footerNote: "Google Flights 报价和购票路径仅代表页面所示来源结果时间，来源缓存最长约 1 小时且税费是否包含未知；当销售方跳转要求 POST 时，本页链接只打开 Google Flights 结果页。模型价格曲线、80% 区间、准点概率、天气、机场运行与新闻信号也可能存在误差。付款前请在购票平台重新核实最终价格、税费与条款。",
           weatherAttribution: "天气数据：",
           newsAttribution: "近实时新闻数据：",
           live: "实时",
@@ -1591,16 +1815,17 @@
           programAvailable: "有学生计划（需验证）",
           notIncluded: "不包含",
           notApplicable: "不适用",
-          providerConfirmed: "免费来源确认直飞航司",
+          providerConfirmed: "日期级计划来源确认",
           modelScenario: "中转模型场景",
           liveSchedule: "AirLabs 近实时航班计划",
           recurringSchedule: "周期时刻表投影",
           noRealSchedule: "无真实时刻 · 模型场景",
-          providerDirect: "提供商确认直达航路",
+          providerDirect: "日期级计划直达航路",
           modelOneStop: "一站式模型航路",
           routingUnresolved: "航路未解析模型",
           cabinScenario: "舱位模型场景",
           directLegBasis: "直飞单航段模型",
+          multiLegBasis: "多航段独立概率模型",
           twoLegBasis: "两航段独立假设场景",
           routeOnlyBasis: "仅 O&D 航路模型",
           officialProgram: "官方学生计划",
@@ -1644,7 +1869,7 @@
           pointTwo: "Transparent fallback when live data fails",
           pointThree: "Predictions are never presented as live fares",
           searchTitle: "Compare a route",
-          searchHint: "Use three-letter IATA codes for airports worldwide, such as YYZ, JFK, or LHR.",
+          searchHint: "Use worldwide three-letter IATA airport codes such as YYZ, JFK, or LHR. Results are bounded by Google Flights coverage and at most 10 provider searches per comparison; they are not a complete global list.",
           autoContext: "External signals filled automatically",
           origin: "Origin airport",
           destination: "Destination airport",
@@ -1652,12 +1877,12 @@
           compare: "Compare flights",
           comparing: "Comparing",
           autoNote: "No distance, duration, weather, congestion, airline, or cabin input is needed; the system derives and compares them automatically.",
-          integrityNotice: "Data integrity notice: prices and on-time probabilities come from synthetic-demo models; prices are not bookable quotes. Baggage, student, change, and refund benefits are marked confirmed only when explicitly supported by a source. Missing facts remain “Unknown” and are never invented or awarded points.",
+          integrityNotice: "Data integrity notice: the primary fare comes from a SerpApi Google Flights result, and a flight appears only when its booking option and safe opening path were verified. If the seller requires POST, the link opens a Google Flights results page instead of pretending to be a direct seller link. Provider cache can be up to about one hour old and its age is shown; whether taxes are included is unknown, and fares can still change. The price curve, 80% interval, and on-time probability remain synthetic-demo model forecasts. Missing benefits stay Unknown and are never invented or scored.",
           initialState: "Enter a route and departure date to see comparisons here.",
           distance: "Route distance",
           duration: "Direct baseline duration",
           plannedTime: "Planned departure date",
-          generatedAt: "Results generated",
+          generatedAt: "This response generated",
           contextTitle: "Forecast context",
           contextHint: "Every card shows its data status, source, and observation time.",
           weather: "Live / forecast aviation weather",
@@ -1667,32 +1892,88 @@
           news: "Near-real-time aviation disruption news",
           newsSemantics: "Article times are GDELT observed/indexed times, not necessarily publisher timestamps; headlines remain in their source language.",
           viewDetails: "View details",
-          offersTitle: "Airline and cabin comparison",
+          offersTitle: "Strictly verified flights",
+          strictMode: "Strict mode",
+          strictScheduleOnly: "Verified booking options only",
+          strictModeDefaultNotice: "The main list contains only SerpApi Google Flights results that pass booking-option verification. Each comparison makes at most four cabin searches plus six candidate validations, with candidate selection favouring airline diversity. deep_search and show_hidden are enabled, but the result is still not a complete list of every airline, flight, or seller. Provider cache can be up to about one hour old.",
           directFirst: "Direct first",
           lowestPrice: "Lowest price",
           studentFirst: "Student friendly",
           cabinBranch: "Filter by cabin",
           allCabins: "All cabins",
-          directDescription: "Shows provider-confirmed direct routing, then airline-hub one-stop models, with routing-unresolved O&D references last.",
-          priceDescription: "Sorted from lowest to highest model-estimated price.",
-          studentDescription: "Compared in strict order: lowest price, free checked bag, confirmed student discount, free changes/refunds, then age and verification requirements.",
-          offersCaption: "All airline and cabin predictions in the active ranking",
+          directDescription: "Prioritizes direct routing only among Google Flights results with a verified booking option, with filtering by the source-provided cabin.",
+          priceDescription: "Sorts only results with a verified booking option by provider-result fare, lowest first.",
+          studentDescription: "Compares at most six verified results by provider-result fare, free checked baggage, actual student discounts, free changes/refunds, then age and verification. Ordinary free Google Flights queries cannot verify an actual student-only discount, so it stays Unknown and adds no score.",
+          offersCaption: "Up to six verified Google Flights booking options in the active strict-mode ranking; not a complete airline or flight list",
           airline: "Airline",
           cabin: "Cabin",
           route: "Route",
-          estimatedPrice: "Model estimate",
+          estimatedPrice: "Current flight fare",
           punctuality: "On-time",
           baggage: "Checked bag",
           studentOffer: "Student benefit",
           change: "Change",
           refund: "Refund",
           eligibility: "Age & verification",
-          routeStatus: "Route status",
+          routeStatus: "Booking option",
           details: "Details",
           offerDetails: "View this option's details",
-          emptyTitle: "No comparable results in this category",
-          emptyBody: "The free data sources may not cover this route or ranking. Try another category, date, or airport.",
-          footerNote: "Results are decision support only. Model prices, punctuality, weather, airport operations, and news signals may be delayed or inaccurate. Confirm live prices and terms with the airline or booking platform before purchase.",
+          emptyTitle: "No flight with a verified booking option found",
+          emptyBody: "Unverified flights and model fares are never substituted into the main list. Excluded timetable records, if any, appear below as reference only.",
+          emptyCategoryTitle: "No verified booking option in this category",
+          emptyCategoryBody: "Choose another cabin or ranking to view other verified results.",
+          fareNotConfiguredTitle: "Provider fare service is not configured",
+          fareNotConfiguredBody: "Configure SERPAPI_API_KEY and try again; no unverified substitute results are shown.",
+          fareTestRejectedTitle: "Unofficial-source results are excluded",
+          fareTestRejectedBody: "Strict mode accepts only SerpApi Google Flights results with a verified HTTPS booking option.",
+          fareBudgetNotConfiguredTitle: "Fare-query budget is not configured",
+          fareBudgetNotConfiguredBody: "Configure a production quote-query budget first; no potentially billable query was made.",
+          fareBudgetExhaustedTitle: "Fare-query budget is exhausted",
+          fareBudgetExhaustedBody: "No new live-fare query was made. Try again later or after the budget resets.",
+          fareRateLimitedTitle: "Fare service is rate limited",
+          fareRateLimitedBody: "SerpApi is temporarily limiting requests. Try again later; stale quotes are not presented as current.",
+          fareAuthTitle: "Fare service authentication failed",
+          fareAuthBody: "Check SERPAPI_API_KEY; no booking option is shown until authentication succeeds.",
+          fareProviderUnavailableTitle: "Fare provider is temporarily unavailable",
+          fareProviderUnavailableBody: "Current price and availability could not be verified. Try again later; timetable rows below are reference only.",
+          fareNoResultsTitle: "No currently bookable fare found",
+          fareNoResultsBody: "Google Flights returned no result that passed both complete-flight and booking-option verification; no substitute flight was generated.",
+          timetableReferencesTitle: "Timetable reference (excluded from comparison)",
+          timetableReferencesHint: "Source records excluded by strict mode; no cabin, price, or detail options are generated.",
+          timetableReferencesWarning: "Every row is excluded from comparison; see the final column for the specific reason. No row proves inventory or bookability.",
+          timetableReferencesCaption: "Deduplicated provider timetable records excluded by strict mode",
+          timetableReferenceCount: "{count} references",
+          flightNumber: "Flight number",
+          scheduledTimes: "Provider times",
+          referenceReason: "Reference reason",
+          providerUpdated: "Provider updated",
+          bookability: "Bookability",
+          unverifiedBookability: "Unverified",
+          confirmedAvailable: "Booking option verified",
+          priceConfirmed: "Booking option verified",
+          bookingOptionVerified: "Booking option verified",
+          liveFare: "Query-time flight fare",
+          modelReference: "Model price forecast (not a live fare)",
+          fareSource: "Fare source",
+          verifiedAt: "Provider result time",
+          providerCacheHit: "Cache reuse detected",
+          providerCacheMiss: "No cache reuse detected",
+          providerCacheAge: "Cache age {age}",
+          studentDiscountUnavailable: "Ordinary free Google Flights queries cannot verify an actual student-only discount; Unknown adds no score.",
+          production: "Production",
+          availability: "Availability",
+          seatsNotProvided: "Fare available; seat count not provided",
+          seatsRemaining: "{count} bookable seats remaining",
+          seatsCapped: "{count} or more bookable seats (provider count cap)",
+          lastTicketingDate: "Last ticketing date",
+          lastTicketingNotProvided: "Last ticketing date: not returned by provider",
+          providerEvidence: "Open verified booking path",
+          directBookingLink: "Open seller booking redirect",
+          googleFlightsItineraryLink: "Open Google Flights results page",
+          bookingWith: "Booking channel",
+          googleFlightsProvider: "SerpApi · Google Flights",
+          flightSequence: "Flights",
+          footerNote: "The Google Flights fare and booking path reflect only the displayed provider result time, may use provider cache up to about one hour old, and do not confirm whether taxes are included. When the seller redirect requires POST, this page links only to a Google Flights results page. The model price curve, 80% interval, punctuality, weather, airport operations, and news signals may also be inaccurate. Recheck the final price, taxes, and terms on the booking platform before payment.",
           weatherAttribution: "Weather data:",
           newsAttribution: "Near-real-time news data:",
           live: "Live",
@@ -1712,16 +1993,17 @@
           programAvailable: "Student programme available (verify)",
           notIncluded: "Not included",
           notApplicable: "Not applicable",
-          providerConfirmed: "Direct carrier confirmed by free source",
+          providerConfirmed: "Dated schedule confirmed by source",
           modelScenario: "Connecting model scenario",
           liveSchedule: "AirLabs near-real-time schedule",
           recurringSchedule: "Recurring timetable projection",
           noRealSchedule: "No real schedule · Model scenario",
-          providerDirect: "Provider-confirmed direct routing",
+          providerDirect: "Dated-schedule direct routing",
           modelOneStop: "One-stop model routing",
           routingUnresolved: "Routing-unresolved model",
           cabinScenario: "Cabin model scenario",
           directLegBasis: "Direct-leg model",
+          multiLegBasis: "Multi-leg independence model",
           twoLegBasis: "Two-leg independence scenario",
           routeOnlyBasis: "O&D route-only model",
           officialProgram: "Official student programme",
@@ -1887,6 +2169,16 @@
         return hasValue(value) ? String(value) : (fallback || "—");
       }
 
+      function localizedText(value, fallback) {
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          var primary = currentLanguage === "zh" ? value.zh : value.en;
+          var secondary = currentLanguage === "zh" ? value.en : value.zh;
+          if (hasValue(primary)) return String(primary);
+          if (hasValue(secondary)) return String(secondary);
+        }
+        return hasValue(value) ? String(value) : (fallback || "");
+      }
+
       function normalizeKey(value) {
         return String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
       }
@@ -1904,6 +2196,7 @@
           unknown: "unknown",
           not_available: "unavailable",
           unavailable: "unavailable",
+          unverified: "unverifiedBookability",
           confirmed: "confirmed",
           verified: "confirmed",
           included: "included",
@@ -1918,11 +2211,18 @@
           model_scenario: "modelScenario",
           live_schedule: "liveSchedule",
           recurring_timetable_projection: "recurringSchedule",
+          priced_offer: "priceConfirmed",
+          booking_option_confirmed: "bookingOptionVerified",
+          booking_option_verified: "bookingOptionVerified",
+          serpapi_google_flights_booking: "googleFlightsProvider",
+          serpapi_google_flights: "googleFlightsProvider",
+          production: "production",
           provider_direct: "providerDirect",
           model_one_stop: "modelOneStop",
           model_route_unresolved: "routingUnresolved",
           catalog_scenario: "cabinScenario",
           direct_leg_model: "directLegBasis",
+          multi_leg_independence_model: "multiLegBasis",
           two_leg_independence_scenario: "twoLegBasis",
           route_only_model: "routeOnlyBasis",
           free: "free",
@@ -1966,6 +2266,23 @@
         }
       }
 
+      function formatCacheAge(value) {
+        var seconds = asNumber(value);
+        if (seconds === null || seconds < 0) return "—";
+        seconds = Math.round(seconds);
+        if (seconds >= 3600) {
+          return (seconds / 3600).toLocaleString(currentLanguage === "zh" ? "zh-CN" : "en-US", { maximumFractionDigits: 1 }) +
+            (currentLanguage === "zh" ? " 小时" : " hr");
+        }
+        if (seconds >= 60) return Math.floor(seconds / 60) + (currentLanguage === "zh" ? " 分钟" : " min");
+        return seconds + (currentLanguage === "zh" ? " 秒" : " sec");
+      }
+
+      function providerCacheLabel(fare) {
+        var state = fare && fare.provider_cache_hit === true ? t("providerCacheHit") : t("providerCacheMiss");
+        return state + " · " + t("providerCacheAge").replace("{age}", formatCacheAge(fare && fare.provider_cache_age_seconds));
+      }
+
       function formatDepartureDate(value) {
         var raw = String(value || "").slice(0, 10);
         var match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
@@ -1977,15 +2294,18 @@
         }).format(date);
       }
 
-      function formatMoney(value) {
+      function formatCurrency(value, currency, maximumFractionDigits) {
         var amount = asNumber(value);
         if (amount === null) return "—";
+        var code = /^[A-Z]{3}$/.test(String(currency || "").toUpperCase()) ? String(currency).toUpperCase() : "USD";
         return new Intl.NumberFormat(currentLanguage === "zh" ? "zh-CN" : "en-US", {
           style: "currency",
-          currency: "USD",
-          maximumFractionDigits: 0
+          currency: code,
+          maximumFractionDigits: maximumFractionDigits === undefined ? 2 : maximumFractionDigits
         }).format(amount);
       }
+
+      function formatMoney(value) { return formatCurrency(value, "USD", 0); }
 
       function formatProbability(value) {
         var number = asNumber(value);
@@ -2066,7 +2386,7 @@
 
       async function requestComparison(payload) {
         var controller = new AbortController();
-        var timeout = window.setTimeout(function () { controller.abort(); }, 25000);
+        var timeout = window.setTimeout(function () { controller.abort(); }, 90000);
         try {
           var response = await fetch("/v1/compare", {
             method: "POST",
@@ -2254,18 +2574,81 @@
 
       function benefitClass(value) {
         var key = normalizeKey(value);
-        if (["confirmed", "verified", "included", "free", "eligible", "available", "confirmed_free", "confirmed_included", "confirmed_discount", "program_available", "provider_confirmed", "provider_direct"].indexOf(key) >= 0) return "good";
-        if (["unknown", "unavailable", "not_available"].indexOf(key) >= 0) return "caution";
+        if (["confirmed", "verified", "included", "free", "eligible", "available", "confirmed_free", "confirmed_included", "confirmed_discount", "program_available", "live_schedule", "priced_offer", "booking_option_confirmed", "booking_option_verified", "provider_confirmed"].indexOf(key) >= 0) return "good";
+        if (["unknown", "unavailable", "not_available", "unverified", "recurring_timetable_projection", "provider_direct"].indexOf(key) >= 0) return "caution";
         if (["none", "no", "not_included", "confirmed_paid", "non_refundable", "nonrefundable"].indexOf(key) >= 0) return "risk";
         if (["model_scenario", "model_one_stop", "model_route_unresolved", "not_applicable"].indexOf(key) >= 0) return "caution";
         return "";
       }
 
-      function hasProviderSchedule(offer) {
-        var schedule = normalizeKey(offer && offer.schedule_status);
-        return (schedule === "live_schedule" || schedule === "recurring_timetable_projection") &&
-          hasValue(offer && offer.flight_number) && hasValue(offer && offer.scheduled_departure_local) &&
-          hasValue(offer && offer.scheduled_arrival_local);
+      function fareFor(offer) {
+        return offer && offer.live_fare && typeof offer.live_fare === "object" ? offer.live_fare : null;
+      }
+
+      function safeBookingUrl(value) {
+        var href = safeArticleUrl(value);
+        return href && new URL(href).protocol === "https:" ? href : null;
+      }
+
+      function offerSegments(offer) {
+        var fare = fareFor(offer);
+        var segments = Array.isArray(offer && offer.segments) ? offer.segments :
+          (fare && Array.isArray(fare.segments) ? fare.segments : []);
+        return segments.filter(function (segment) { return segment && typeof segment === "object"; }).slice(0, 4);
+      }
+
+      function segmentValue(segment, names) {
+        for (var index = 0; index < names.length; index += 1) {
+          if (hasValue(segment && segment[names[index]])) return segment[names[index]];
+        }
+        return null;
+      }
+
+      function segmentFlightNumber(segment) {
+        var carrier = segmentValue(segment, ["marketing_airline_code", "marketing_carrier_code", "carrier_code", "airline_code", "marketing_carrier"]);
+        var number = segmentValue(segment, ["flight_number", "number"]);
+        if (!hasValue(number)) return "";
+        var raw = String(number).replace(/\s+/g, "").toUpperCase();
+        if (hasValue(carrier) && /^\d/.test(raw)) raw = String(carrier).toUpperCase() + raw;
+        return raw;
+      }
+
+      function segmentDepartureLocal(segment) { return segmentValue(segment, ["departure_local", "scheduled_departure_local"]); }
+      function segmentArrivalLocal(segment) { return segmentValue(segment, ["arrival_local", "scheduled_arrival_local"]); }
+      function segmentDepartureUtc(segment) { return segmentValue(segment, ["departure_utc", "scheduled_departure_utc"]); }
+      function segmentArrivalUtc(segment) { return segmentValue(segment, ["arrival_utc", "scheduled_arrival_utc"]); }
+
+      function hasConfirmedFareOffer(offer) {
+        var fare = fareFor(offer), segments = offerSegments(offer), amount = asNumber(fare && fare.total_amount), seats = fare && fare.seats_remaining, stops = asNumber(offer && offer.stops), providerCacheAge = asNumber(fare && fare.provider_cache_age_seconds);
+        if (normalizeKey(offer && offer.schedule_status) !== "priced_offer" ||
+            normalizeKey(offer && offer.schedule_source) !== "serpapi_google_flights_booking" ||
+            normalizeKey(offer && offer.bookability_status) !== "booking_option_verified" ||
+            normalizeKey(offer && offer.route_status) !== "provider_confirmed" ||
+            ["provider_direct", "provider_itinerary"].indexOf(normalizeKey(offer && offer.routing_status)) < 0 ||
+            normalizeKey(offer && offer.cabin_status) !== "provider_confirmed" ||
+             !fare || normalizeKey(fare.status) !== "booking_option_confirmed" ||
+             normalizeKey(fare.provider_code) !== "serpapi_google_flights" || normalizeKey(fare.environment) !== "production" ||
+             fare.booking_verified !== true || !safeBookingUrl(fare.booking_url) ||
+             ["direct_get", "google_flights_itinerary"].indexOf(normalizeKey(fare.booking_url_kind)) < 0 ||
+             normalizeKey(fare.availability_status) !== "booking_option_verified" ||
+             normalizeKey(fare.price_basis) !== "one_way_per_adult" || asNumber(fare.traveler_count) !== 1 ||
+             fare.mixed_cabin === true || amount === null || amount <= 0 || String(fare.currency || "").toUpperCase() !== "USD" ||
+             typeof fare.provider_cache_hit !== "boolean" || providerCacheAge === null || providerCacheAge < 0 || providerCacheAge > 3900 ||
+             !hasValue(fare.verified_at) || Number.isNaN(new Date(fare.verified_at).getTime()) ||
+             !hasValue(fare.cabin_summary) || !safeArticleUrl(fare.source_url) ||
+             (seats !== null && seats !== undefined && (asNumber(seats) === null || asNumber(seats) < 1 || asNumber(seats) > 9)) ||
+            (fare.seat_count_capped === true && asNumber(seats) !== 9) || !hasValue(offer && offer.stops) ||
+            stops === null || stops !== Math.round(stops) || stops < 0 || stops > 3 || segments.length !== stops + 1 ||
+            normalizeKey(fare.cabin_summary) !== normalizeKey(offer && offer.cabin) ||
+            segments.length < 1 || segments.length > 4) return false;
+        return segments.every(function (segment, index) {
+          return hasValue(segment.origin) && hasValue(segment.destination) && hasValue(segmentFlightNumber(segment)) &&
+            asNumber(segment.sequence) === index + 1 && hasValue(segment.marketing_airline_code) &&
+            normalizeKey(segment.cabin) === normalizeKey(fare.cabin_summary) && asNumber(segment.duration_minutes) > 0 &&
+            hasValue(segmentDepartureLocal(segment)) && hasValue(segmentArrivalLocal(segment)) &&
+            hasValue(segmentDepartureUtc(segment)) && hasValue(segmentArrivalUtc(segment)) &&
+            (index === 0 || segments[index - 1].destination === segment.origin);
+        });
       }
 
       function formatScheduleLocal(value) {
@@ -2279,6 +2662,11 @@
       }
 
       function routeDisplay(offer) {
+        var confirmedSegments = offerSegments(offer);
+        if (confirmedSegments.length) {
+          var confirmedStops = confirmedSegments.length - 1;
+          return confirmedStops === 0 ? t("direct") : confirmedStops + " " + t(confirmedStops === 1 ? "stop" : "stops");
+        }
         var routing = normalizeKey(offer && offer.routing_status);
         if (routing === "model_route_unresolved") return t("routingUnresolved");
         if (routing === "provider_direct") return t("direct");
@@ -2291,6 +2679,7 @@
 
       function renderOffer(offer) {
         var row = document.createElement("tr");
+        var fare = fareFor(offer), segments = offerSegments(offer);
         row.dataset.offerId = safeText(offer.id, "");
 
         var airline = cell(row, "airline-cell", "airline");
@@ -2299,30 +2688,43 @@
         airlineCode.textContent = safeText(offer.airline_code);
         airline.appendChild(airlineCode);
         appendStrong(airline, safeText(offer.airline_name, offer.airline_code));
-        if (hasProviderSchedule(offer)) appendSubvalue(airline, safeText(offer.flight_number));
-        else appendSubvalue(airline, t("noRealSchedule"));
+        appendSubvalue(airline, t("flightSequence") + ": " + segments.map(segmentFlightNumber).join(" · "));
 
         var cabin = cell(row, "", "cabin");
-        appendTinyBadge(cabin, localizeStatus(offer.cabin), "");
+        appendTinyBadge(cabin, localizeStatus(fare.cabin_summary || offer.cabin), "good");
         appendSubvalue(cabin, localizeStatus(offer.cabin_status));
 
         var route = cell(row, "", "route");
         appendStrong(route, routeDisplay(offer));
         var offerDuration = asNumber(offer.duration_minutes);
         if (offerDuration !== null) appendSubvalue(route, Math.round(offerDuration) + " " + t("minute"));
-        if (hasProviderSchedule(offer)) {
-          appendSubvalue(route, formatScheduleLocal(offer.scheduled_departure_local) + " → " +
-            formatScheduleLocal(offer.scheduled_arrival_local));
-        } else {
-          appendSubvalue(route, t("noRealSchedule"));
-        }
+        appendSubvalue(route, formatScheduleLocal(segmentDepartureLocal(segments[0])) + " → " +
+          formatScheduleLocal(segmentArrivalLocal(segments[segments.length - 1])));
 
         var price = cell(row, "price-cell", "estimatedPrice");
-        appendStrong(price, formatMoney(offer.estimated_price_usd));
+        appendStrong(price, formatCurrency(fare.total_amount, fare.currency, 2));
+        appendTinyBadge(price, t("bookingOptionVerified"), "good");
+        appendSubvalue(price, t("fareSource") + ": " + t("googleFlightsProvider"));
+        appendSubvalue(price, t("verifiedAt") + ": " + formatDate(fare.verified_at, true));
+        appendSubvalue(price, providerCacheLabel(fare));
+        price.dataset.providerCacheHit = String(fare.provider_cache_hit);
+        price.dataset.providerCacheAgeSeconds = String(fare.provider_cache_age_seconds);
+        var bookingUrl = safeBookingUrl(fare.booking_url);
+        var bookingLinkLabel = normalizeKey(fare.booking_url_kind) === "direct_get" ?
+          t("directBookingLink") : t("googleFlightsItineraryLink");
+        if (bookingUrl) {
+          var sourceLink = document.createElement("a");
+          sourceLink.className = "fare-source-link";
+          sourceLink.href = bookingUrl;
+          sourceLink.target = "_blank";
+          sourceLink.rel = "noopener noreferrer";
+          sourceLink.textContent = bookingLinkLabel;
+          price.appendChild(sourceLink);
+        }
+        appendSubvalue(price, t("modelReference") + ": " + formatMoney(offer.estimated_price_usd));
         var low = formatMoney(offer.interval_80_low_usd);
         var high = formatMoney(offer.interval_80_high_usd);
         appendSubvalue(price, t("eightyRange") + ": " + low + " – " + high);
-        appendTinyBadge(price, t("estimated"), "caution");
 
         var probability = cell(row, "probability-cell", "punctuality");
         appendStrong(probability, formatProbability(offer.on_time_probability));
@@ -2334,7 +2736,8 @@
         appendTinyBadge(baggage, localizeStatus(offer.baggage_status), benefitClass(offer.baggage_status));
 
         var student = cell(row, "", "studentOffer");
-        appendTinyBadge(student, localizeStatus(offer.student_status), benefitClass(offer.student_status));
+        appendTinyBadge(student, t("unknown"), "caution");
+        appendSubvalue(student, t("studentDiscountUnavailable"));
         if (hasValue(offer.student_program_url)) {
           try {
             var programUrl = new URL(String(offer.student_program_url));
@@ -2366,9 +2769,16 @@
         appendSubvalue(eligibility, t("verification") + ": " + safeText(verification, t("unknown")));
 
         var routeStatus = cell(row, "", "routeStatus");
-        var routingStatus = offer.routing_status || offer.route_status;
-        appendTinyBadge(routeStatus, localizeStatus(routingStatus), benefitClass(routingStatus));
-        appendSubvalue(routeStatus, hasProviderSchedule(offer) ? localizeStatus(offer.schedule_status) : t("noRealSchedule"));
+        appendTinyBadge(routeStatus, t("bookingOptionVerified"), "good");
+        var bookingWith = fare.booking_with || fare.booking_provider;
+        if (hasValue(bookingWith)) appendSubvalue(routeStatus, t("bookingWith") + ": " + safeText(bookingWith));
+        var routeBookingLink = document.createElement("a");
+        routeBookingLink.className = "fare-source-link";
+        routeBookingLink.href = bookingUrl;
+        routeBookingLink.target = "_blank";
+        routeBookingLink.rel = "noopener noreferrer";
+        routeBookingLink.textContent = bookingLinkLabel;
+        routeStatus.appendChild(routeBookingLink);
 
         var actions = cell(row, "", "details");
         var detailLink = document.createElement("a");
@@ -2406,8 +2816,73 @@
         return "/details/offer?" + params.toString();
       }
 
+      function referenceIdentity(reference) {
+        return [
+          normalizeKey(reference && reference.airline_code),
+          normalizeKey(reference && reference.flight_number),
+          String(reference && reference.scheduled_departure_local || ""),
+          String(reference && reference.scheduled_arrival_local || "")
+        ].join("|");
+      }
+
+      function timetableReferences(data) {
+        var seen = new Set();
+        return (Array.isArray(data && data.timetable_references) ? data.timetable_references : []).filter(function (reference) {
+          var status = normalizeKey(reference && reference.schedule_status);
+          if (!reference || (status !== "recurring_timetable_projection" && status !== "live_schedule")) return false;
+          if (!hasValue(reference.flight_number) || !hasValue(reference.scheduled_departure_local) ||
+              !hasValue(reference.scheduled_arrival_local)) return false;
+          var identity = referenceIdentity(reference);
+          if (seen.has(identity)) return false;
+          seen.add(identity);
+          return true;
+        });
+      }
+
+      function renderTimetableReference(reference) {
+        var row = document.createElement("tr");
+        var airline = cell(row, "airline-cell", "airline");
+        var airlineCode = document.createElement("span");
+        airlineCode.className = "airline-code";
+        airlineCode.textContent = safeText(reference.airline_code);
+        airline.appendChild(airlineCode);
+        appendStrong(airline, safeText(reference.airline_name, reference.airline_code));
+
+        var flight = cell(row, "", "flightNumber");
+        appendStrong(flight, safeText(reference.flight_number));
+        appendSubvalue(flight, localizeStatus(reference.schedule_status));
+
+        var times = cell(row, "", "scheduledTimes");
+        appendStrong(times, formatScheduleLocal(reference.scheduled_departure_local));
+        appendSubvalue(times, "→ " + formatScheduleLocal(reference.scheduled_arrival_local));
+
+        var duration = cell(row, "", "duration");
+        var durationMinutes = asNumber(reference.duration_minutes);
+        appendStrong(duration, durationMinutes === null ? "—" : Math.round(durationMinutes) + " " + t("minute"));
+
+        var source = cell(row, "", "source");
+        appendTinyBadge(source, localizeStatus(reference.schedule_source), "caution");
+        if (hasValue(reference.schedule_observed_at)) {
+          appendSubvalue(source, t("providerUpdated") + ": " + formatDate(reference.schedule_observed_at));
+        }
+
+        var reason = cell(row, "reference-reason", "referenceReason");
+        reason.textContent = localizedText(reference.reference_reason, t("timetableReferencesWarning"));
+        return row;
+      }
+
+      function renderTimetableReferences(data) {
+        var references = timetableReferences(data);
+        var section = byId("timetable-reference-section");
+        var body = byId("timetable-reference-rows");
+        body.replaceChildren();
+        references.forEach(function (reference) { body.appendChild(renderTimetableReference(reference)); });
+        byId("timetable-reference-count").textContent = t("timetableReferenceCount").replace("{count}", String(references.length));
+        section.hidden = references.length === 0;
+      }
+
       function rankedOffers(data, ranking) {
-        var offers = Array.isArray(data && data.offers) ? data.offers : [];
+        var offers = (Array.isArray(data && data.offers) ? data.offers : []).filter(hasConfirmedFareOffer);
         var byIdentifier = new Map();
         offers.forEach(function (offer) {
           if (offer && hasValue(offer.id)) byIdentifier.set(String(offer.id), offer);
@@ -2420,19 +2895,24 @@
       }
 
       function activeOffers(data) {
-        var offers = rankedOffers(data, activeRanking);
+        var offers = rankedOffers(data, activeRanking).filter(hasConfirmedFareOffer);
         if (activeRanking === "direct_first" && activeCabin !== "all") {
-          offers = offers.filter(function (offer) { return normalizeKey(offer.cabin) === activeCabin; });
+          offers = offers.filter(function (offer) {
+            var fare = fareFor(offer);
+            return normalizeKey(fare && fare.cabin_summary || offer.cabin) === activeCabin;
+          });
         }
         return offers;
       }
 
       function updateCabinFilter(data) {
         var filter = byId("cabin-filter");
-        filter.hidden = activeRanking !== "direct_first";
+        var directOffers = rankedOffers(data, "direct_first").filter(hasConfirmedFareOffer);
+        filter.hidden = activeRanking !== "direct_first" || directOffers.length === 0;
         if (filter.hidden) return;
-        var available = new Set(rankedOffers(data, "direct_first").map(function (offer) {
-          return normalizeKey(offer.cabin);
+        var available = new Set(directOffers.map(function (offer) {
+          var fare = fareFor(offer);
+          return normalizeKey(fare && fare.cabin_summary || offer.cabin);
         }));
         document.querySelectorAll(".cabin-tab").forEach(function (tab) {
           var cabin = tab.dataset.cabin;
@@ -2453,12 +2933,53 @@
         var offers = activeOffers(data);
         offers.forEach(function (offer) { body.appendChild(renderOffer(offer)); });
         byId("empty-state").classList.toggle("visible", offers.length === 0);
+        renderFareEmptyState(data, offers.length);
         byId("offer-panel").setAttribute("aria-labelledby", "tab-" + activeRanking);
       }
 
+      function renderFareEmptyState(data, visibleOfferCount) {
+        if (visibleOfferCount > 0) return;
+        var allConfirmed = (Array.isArray(data && data.offers) ? data.offers : []).filter(hasConfirmedFareOffer);
+        var titleKey = "fareNoResultsTitle", bodyKey = "fareNoResultsBody";
+        if (allConfirmed.length > 0) {
+          titleKey = "emptyCategoryTitle";
+          bodyKey = "emptyCategoryBody";
+        } else {
+          var metadata = data && data.fare_search_metadata && typeof data.fare_search_metadata === "object" ? data.fare_search_metadata : {};
+          var status = normalizeKey(data && data.result_status) || normalizeKey(metadata.status);
+          var keys = {
+            fare_provider_not_configured: ["fareNotConfiguredTitle", "fareNotConfiguredBody"],
+            fare_provider_test_rejected: ["fareTestRejectedTitle", "fareTestRejectedBody"],
+            fare_provider_budget_not_configured: ["fareBudgetNotConfiguredTitle", "fareBudgetNotConfiguredBody"],
+            fare_provider_budget_exhausted: ["fareBudgetExhaustedTitle", "fareBudgetExhaustedBody"],
+            fare_provider_rate_limited: ["fareRateLimitedTitle", "fareRateLimitedBody"],
+            fare_provider_authentication_failed: ["fareAuthTitle", "fareAuthBody"],
+            fare_provider_unavailable: ["fareProviderUnavailableTitle", "fareProviderUnavailableBody"],
+            no_verified_offer: ["fareNoResultsTitle", "fareNoResultsBody"],
+            not_configured: ["fareNotConfiguredTitle", "fareNotConfiguredBody"],
+            test_rejected: ["fareTestRejectedTitle", "fareTestRejectedBody"],
+            test_environment_rejected: ["fareTestRejectedTitle", "fareTestRejectedBody"],
+            budget_not_configured: ["fareBudgetNotConfiguredTitle", "fareBudgetNotConfiguredBody"],
+            budget_exhausted: ["fareBudgetExhaustedTitle", "fareBudgetExhaustedBody"],
+            rate_limited: ["fareRateLimitedTitle", "fareRateLimitedBody"],
+            auth: ["fareAuthTitle", "fareAuthBody"],
+            auth_failed: ["fareAuthTitle", "fareAuthBody"],
+            authentication_failed: ["fareAuthTitle", "fareAuthBody"],
+            provider_unavailable: ["fareProviderUnavailableTitle", "fareProviderUnavailableBody"],
+            unavailable: ["fareProviderUnavailableTitle", "fareProviderUnavailableBody"],
+            no_results: ["fareNoResultsTitle", "fareNoResultsBody"]
+          };
+          if (keys[status]) {
+            titleKey = keys[status][0];
+            bodyKey = keys[status][1];
+          }
+        }
+        byId("empty-title").textContent = t(titleKey);
+        byId("empty-body").textContent = t(bodyKey);
+      }
+
       function warningText(warnings) {
-        var value = warnings && (currentLanguage === "zh" ? warnings.zh : warnings.en);
-        if (!hasValue(value)) value = warnings && (currentLanguage === "zh" ? warnings.en : warnings.zh);
+        var value = localizedText(warnings, "");
         if (Array.isArray(value)) return value.filter(hasValue).join(" ");
         return safeText(value, "");
       }
@@ -2496,7 +3017,14 @@
         var warning = warningText(data.warnings);
         byId("response-warning-text").textContent = warning;
         byId("response-warning").classList.toggle("visible", Boolean(warning));
+
+        var availabilityMode = normalizeKey(data.availability_mode);
+        var strictMode = availabilityMode === "strict_bookable_only" || availabilityMode === "strict_schedule_only";
+        var strictNotice = localizedText(data.strict_mode_notice, t("strictModeDefaultNotice"));
+        byId("strict-mode-notice-text").textContent = strictNotice;
+        byId("strict-mode-notice").classList.toggle("visible", strictMode || Boolean(strictNotice));
         renderOffers(data);
+        renderTimetableReferences(data);
 
         byId("results").classList.add("visible");
         byId("initial-state").classList.add("hidden");

@@ -7,6 +7,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from flight_forecaster.availability import (
+    Cabin,
+    ConfirmedFlightOffer,
+    FlightOfferSearchResult,
+    FlightOfferSegment,
+)
 from flight_forecaster.context import (
     AIRLABS_FREE_SAMPLE_LIMIT,
     AIRLABS_ROUTES_URL,
@@ -76,6 +82,99 @@ class _StaticScheduleProvider:
 
     def search(self, *args: Any, **kwargs: Any) -> ScheduleSearchResult:
         return self.result
+
+
+class _StaticFareProvider:
+    configured = True
+    environment = "production"
+
+    def __init__(self, result: FlightOfferSearchResult) -> None:
+        self.result = result
+        self.force_refresh_values: list[bool] = []
+
+    def search(self, *args: Any, **kwargs: Any) -> FlightOfferSearchResult:
+        self.force_refresh_values.append(bool(kwargs.get("force_refresh")))
+        return self.result
+
+
+def _confirmed_offer(
+    *,
+    selected_date: date,
+    verified_at: datetime,
+    airline: str = "AC",
+    airline_name: str = "Air Canada",
+    cabin: Cabin = "economy",
+    total: float = 512.34,
+    flight_number: str = "801",
+) -> ConfirmedFlightOffer:
+    return ConfirmedFlightOffer(
+        provider_offer_id=f"priced-{airline}-{flight_number}-{cabin}",
+        validating_airline_code=airline,
+        airline_name=airline_name,
+        cabin=cabin,
+        total_amount_usd=total,
+        base_amount_usd=430.0,
+        last_ticketing_date=selected_date,
+        number_of_bookable_seats=4,
+        seat_count_capped=False,
+        verified_at=verified_at,
+        provider_cache_hit=False,
+        provider_cache_age_seconds=0,
+        booking_provider=airline_name,
+        booking_url=(
+            "https://www.google.com/travel/flights/booking/"
+            f"{airline.lower()}-{flight_number}-{cabin}"
+        ),
+        booking_url_kind="direct_get",
+        booking_verified=True,
+        segments=(
+            FlightOfferSegment(
+                segment_id="1",
+                origin="YYZ",
+                destination="LHR",
+                departure_at=datetime.combine(selected_date, time(9, 0)),
+                arrival_at=datetime.combine(selected_date, time(21, 0)),
+                marketing_airline_code=airline,
+                operating_airline_code=airline,
+                flight_number=flight_number,
+                departure_terminal="1",
+                arrival_terminal="2",
+                aircraft_icao="B789",
+                cabin=cabin,
+                booking_class="Y",
+                fare_basis="YFLEX",
+                fare_brand="FLEX",
+                checked_bags_quantity=1,
+                checked_bags_weight=None,
+                checked_bags_weight_unit=None,
+            ),
+        ),
+        refundable_fare=True,
+        no_penalty_fare=True,
+        no_restriction_fare=None,
+    )
+
+
+def _fare_result(
+    offer: ConfirmedFlightOffer,
+    *,
+    observed_at: datetime,
+) -> FlightOfferSearchResult:
+    return FlightOfferSearchResult(
+        offers=(offer,),
+        status="confirmed_offers",
+        observed_at=observed_at,
+        environment="production",
+        searched_cabins=(offer.cabin,),
+        calls_used=2,
+        cache_hit=False,
+        search_calls_used=1,
+        pricing_calls_used=1,
+        search_monthly_limit=250,
+        pricing_monthly_limit=None,
+        search_monthly_used=2,
+        pricing_monthly_used=None,
+    )
 
 
 class _ConfirmedAirlineProvider(ContextProvider):
@@ -334,7 +433,7 @@ def test_recurring_timetable_filters_weekday_and_resolves_overnight_arrival() ->
     assert schedule.aircraft_icao is None
 
 
-def test_date_only_compare_expands_every_provider_flight_per_catalog_cabin(
+def test_strict_compare_moves_recurring_rows_to_reference_section(
     trained_model_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -389,13 +488,25 @@ def test_date_only_compare_expands_every_provider_flight_per_catalog_cabin(
         )
     )
 
-    ac_offers = [offer for offer in result.offers if offer.airline_code == "AC"]
-    assert len(ac_offers) == 6  # two flights x AC's three catalog cabin scenarios
-    assert len({offer.id for offer in ac_offers}) == 6
-    assert {offer.flight_number for offer in ac_offers} == {"AC801", "AC802"}
-    assert {offer.scheduled_departure_local.hour for offer in ac_offers} == {9, 20}
-    assert all(offer.cabin_status == "catalog_scenario" for offer in ac_offers)
-    assert all(offer.routing_status == "provider_direct" for offer in ac_offers)
+    assert result.offers == []
+    assert result.rankings.direct_first == []
+    assert result.rankings.lowest_price == []
+    assert result.rankings.student_first == []
+    assert result.result_status == "fare_provider_not_configured"
+    assert result.availability_mode == "strict_bookable_only"
+    assert result.fare_search_metadata is not None
+    assert result.fare_search_metadata.status == "not_configured"
+    assert len(result.timetable_references) == 2
+    assert {item.flight_number for item in result.timetable_references} == {
+        "AC801",
+        "AC802",
+    }
+    assert all(
+        item.schedule_status == "recurring_timetable_projection"
+        for item in result.timetable_references
+    )
+    assert all(item.bookability_status == "unverified" for item in result.timetable_references)
+    assert all("不证明" in item.reference_reason.zh for item in result.timetable_references)
     assert result.departure_date == selected_date
     assert result.departure_time.hour == 12
     assert result.departure_time_basis == "origin_local_noon_model_reference"
@@ -404,7 +515,92 @@ def test_date_only_compare_expands_every_provider_flight_per_catalog_cabin(
     assert "最多返回 50 行" in result.warnings.zh
     assert "at most 50 rows" in result.warnings.en
 
-    selected = next(offer for offer in ac_offers if offer.flight_number == "AC801")
+    with pytest.raises(OfferNotFoundError, match="does not exist"):
+        service.offer_detail(
+            OfferDetailRequest(
+                origin="YYZ",
+                destination="LHR",
+                departure_date=selected_date,
+                offer_id="off_000000000000000000000000",
+            )
+        )
+
+
+def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
+    trained_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    generated_at = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    selected_date = date(2026, 7, 16)
+    origin_zone = ZoneInfo("America/Toronto")
+    destination_zone = ZoneInfo("Europe/London")
+    departure = datetime.combine(selected_date, time(9, 0), tzinfo=origin_zone)
+    arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(
+        destination_zone
+    )
+    schedule = FlightSchedule(
+        airline_code="AC",
+        flight_number="AC801",
+        schedule_status="live_schedule",
+        source="airlabs_schedules",
+        departure_local=departure,
+        arrival_local=arrival,
+        departure_utc=departure.astimezone(UTC),
+        arrival_utc=arrival.astimezone(UTC),
+        duration_minutes=420,
+        departure_terminal="1",
+        arrival_terminal="2",
+        aircraft_icao="B789",
+        provider_flight_status="scheduled",
+        observed_at=generated_at,
+    )
+    fare_provider = _StaticFareProvider(
+        _fare_result(
+            _confirmed_offer(selected_date=selected_date, verified_at=generated_at),
+            observed_at=generated_at,
+        )
+    )
+    service = PredictionService(
+        trained_model_dir,
+        context_provider=ContextProvider(),
+        schedule_provider=_StaticScheduleProvider(
+            ScheduleSearchResult((schedule,), frozenset({"AC"}))
+        ),  # type: ignore[arg-type]
+        flight_offer_provider=fare_provider,
+        now_provider=lambda: generated_at,
+    )
+
+    result = service.compare(
+        ComparisonRequest(
+            origin="YYZ",
+            destination="LHR",
+            departure_date=selected_date,
+        )
+    )
+
+    assert result.result_status == "verified_offers_found"
+    assert len(result.timetable_references) == 1
+    assert result.timetable_references[0].flight_number == "AC801"
+    assert len(result.offers) == 1
+    assert {offer.flight_number for offer in result.offers} == {"AC801"}
+    assert {offer.cabin for offer in result.offers} == {"economy"}
+    assert all(offer.schedule_status == "priced_offer" for offer in result.offers)
+    assert all(
+        offer.bookability_status == "booking_option_verified" for offer in result.offers
+    )
+    assert result.offers[0].live_fare is not None
+    assert result.offers[0].live_fare.total_amount == 512.34
+    assert result.offers[0].live_fare.taxes_included is None
+    assert result.offers[0].live_fare.provider_cache_hit is False
+    assert result.offers[0].live_fare.provider_cache_age_seconds == 0
+    assert result.fare_search_metadata is not None
+    assert result.fare_search_metadata.monthly_call_limit == 250
+    assert result.fare_search_metadata.monthly_calls_used == 2
+    assert result.fare_search_metadata.search_monthly_limit == 250
+    assert result.fare_search_metadata.pricing_monthly_limit is None
+
+    selected = next(offer for offer in result.offers if offer.cabin == "economy")
     detail = service.offer_detail(
         OfferDetailRequest(
             origin="YYZ",
@@ -413,20 +609,257 @@ def test_date_only_compare_expands_every_provider_flight_per_catalog_cabin(
             offer_id=selected.id,
         )
     )
-    assert detail.schedule_status == "recurring_timetable_projection"
+
     assert detail.itinerary.time_basis == "provider_schedule"
     assert detail.itinerary.legs[0].flight_number == "AC801"
-    assert detail.itinerary.legs[0].departure_terminal is None
-    assert detail.itinerary.legs[0].arrival_terminal is None
-    assert detail.itinerary.legs[0].aircraft_icao is None
-    assert detail.itinerary.legs[0].departure_utc is not None
-    assert detail.schedule_sample_truncated is True
-    assert detail.schedule_sample_limit == AIRLABS_FREE_SAMPLE_LIMIT
-    assert "最多返回 50 行" in detail.notice.zh
-    assert "at most 50 rows" in detail.notice.en
+    assert detail.itinerary.legs[0].departure_terminal == "1"
+    assert detail.itinerary.legs[0].cabin == "economy"
+    assert fare_provider.force_refresh_values == [False, False]
+    refreshed_detail = service.offer_detail(
+        OfferDetailRequest(
+            origin="YYZ",
+            destination="LHR",
+            departure_date=selected_date,
+            offer_id=selected.id,
+            force_refresh=True,
+        )
+    )
+    assert refreshed_detail.offer.id == detail.offer.id
+    assert fare_provider.force_refresh_values == [False, False, True]
+    curve = detail.price_curve
+    assert curve.status == "model_projection"
+    assert curve.historical_prices_available is False
+    assert curve.start_date == date(2026, 7, 14)
+    assert curve.end_date == selected_date
+    assert [point.quote_date for point in curve.points] == [
+        date(2026, 7, 14),
+        date(2026, 7, 15),
+        date(2026, 7, 16),
+    ]
+    assert curve.points[0].estimated_price_usd == selected.estimated_price_usd
+    assert all(
+        point.interval_80_low_usd
+        <= point.estimated_price_usd
+        <= point.interval_80_high_usd
+        for point in curve.points
+    )
+    assert all(
+        first.quote_time < second.quote_time
+        for first, second in zip(curve.points, curve.points[1:], strict=False)
+    )
+    assert curve.points[-1].quote_time.astimezone(UTC) < departure.astimezone(UTC)
+    assert "不是已采集的历史票价" in curve.notice.zh
+    assert "not collected fare history" in curve.notice.en
 
 
-def test_no_key_fallback_has_no_fake_flight_number_or_clock_time_and_model_hub_legs(
+def test_priced_connection_preserves_each_leg_layover_and_live_fare_ranking(
+    trained_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    generated_at = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    selected_date = date(2026, 7, 20)
+    connecting = ConfirmedFlightOffer(
+        provider_offer_id="priced-lh-connection",
+        validating_airline_code="LH",
+        airline_name="Lufthansa",
+        cabin="business",
+        total_amount_usd=480.0,
+        base_amount_usd=390.0,
+        last_ticketing_date=selected_date,
+        number_of_bookable_seats=9,
+        seat_count_capped=True,
+        verified_at=generated_at,
+        provider_cache_hit=False,
+        provider_cache_age_seconds=0,
+        booking_provider="Lufthansa",
+        booking_url="https://www.google.com/travel/flights/booking/lh-connection",
+        booking_url_kind="direct_get",
+        booking_verified=True,
+        segments=(
+            FlightOfferSegment(
+                segment_id="1",
+                origin="YYZ",
+                destination="FRA",
+                departure_at=datetime.combine(selected_date, time(9, 0)),
+                arrival_at=datetime.combine(selected_date, time(22, 0)),
+                marketing_airline_code="LH",
+                operating_airline_code="AC",
+                flight_number="471",
+                departure_terminal="1",
+                arrival_terminal="1",
+                aircraft_icao="A333",
+                cabin="business",
+                booking_class="J",
+                fare_basis="JFLEX",
+                fare_brand="BUSINESS FLEX",
+                checked_bags_quantity=2,
+                checked_bags_weight=None,
+                checked_bags_weight_unit=None,
+            ),
+            FlightOfferSegment(
+                segment_id="2",
+                origin="FRA",
+                destination="LHR",
+                departure_at=datetime.combine(
+                    selected_date + timedelta(days=1), time(8, 0)
+                ),
+                arrival_at=datetime.combine(
+                    selected_date + timedelta(days=1), time(8, 30)
+                ),
+                marketing_airline_code="LH",
+                operating_airline_code="LH",
+                flight_number="900",
+                departure_terminal="1",
+                arrival_terminal="2",
+                aircraft_icao="A320",
+                cabin="business",
+                booking_class="J",
+                fare_basis="JFLEX",
+                fare_brand="BUSINESS FLEX",
+                checked_bags_quantity=2,
+                checked_bags_weight=None,
+                checked_bags_weight_unit=None,
+            ),
+        ),
+        refundable_fare=True,
+        no_penalty_fare=False,
+        no_restriction_fare=False,
+    )
+    direct = _confirmed_offer(
+        selected_date=selected_date,
+        verified_at=generated_at,
+        total=820.0,
+    )
+    fare_result = FlightOfferSearchResult(
+        offers=(direct, connecting),
+        status="confirmed_offers",
+        observed_at=generated_at,
+        environment="production",
+        searched_cabins=("economy", "business"),
+        calls_used=3,
+        cache_hit=False,
+        search_calls_used=2,
+        pricing_calls_used=1,
+        search_monthly_limit=250,
+        pricing_monthly_limit=None,
+        search_monthly_used=3,
+        pricing_monthly_used=None,
+    )
+    fare_provider = _StaticFareProvider(fare_result)
+    service = PredictionService(
+        trained_model_dir,
+        context_provider=ContextProvider(),
+        schedule_provider=_StaticScheduleProvider(
+            ScheduleSearchResult((), frozenset())
+        ),  # type: ignore[arg-type]
+        flight_offer_provider=fare_provider,
+        now_provider=lambda: generated_at,
+    )
+
+    result = service.compare(
+        ComparisonRequest(
+            origin="YYZ",
+            destination="LHR",
+            departure_date=selected_date,
+        )
+    )
+
+    assert len(result.offers) == 2
+    by_id = {offer.id: offer for offer in result.offers}
+    assert by_id[result.rankings.direct_first[0]].routing_status == "provider_direct"
+    cheapest = by_id[result.rankings.lowest_price[0]]
+    assert cheapest.routing_status == "provider_itinerary"
+    assert cheapest.live_fare is not None
+    assert cheapest.live_fare.total_amount == 480.0
+    assert cheapest.stops == 1
+    assert [segment.flight_number for segment in cheapest.segments] == [
+        "LH471",
+        "LH900",
+    ]
+
+    detail = service.offer_detail(
+        OfferDetailRequest(
+            origin="YYZ",
+            destination="LHR",
+            departure_date=selected_date,
+            offer_id=cheapest.id,
+        )
+    )
+    assert detail.itinerary.kind == "one_stop"
+    assert len(detail.itinerary.legs) == 2
+    assert len(detail.itinerary.layovers) == 1
+    assert detail.itinerary.layovers[0].airport == "FRA"
+    assert detail.itinerary.layovers[0].duration_minutes == 600
+    assert detail.itinerary.total_duration_minutes == 1_110
+    assert detail.price_curve.points[0].estimated_price_usd == cheapest.estimated_price_usd
+
+
+def test_unknown_airline_requires_a_priced_cabin_and_is_not_expanded(
+    trained_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    generated_at = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    selected_date = date(2026, 7, 15)
+    origin_zone = ZoneInfo("America/Toronto")
+    destination_zone = ZoneInfo("Europe/London")
+    departure = datetime.combine(selected_date, time(9, 0), tzinfo=origin_zone)
+    arrival = (departure.astimezone(UTC) + timedelta(minutes=420)).astimezone(
+        destination_zone
+    )
+    schedule = FlightSchedule(
+        airline_code="8M",
+        flight_number="8M750",
+        schedule_status="live_schedule",
+        source="airlabs_schedules",
+        departure_local=departure,
+        arrival_local=arrival,
+        departure_utc=departure.astimezone(UTC),
+        arrival_utc=arrival.astimezone(UTC),
+        duration_minutes=420,
+        provider_flight_status="scheduled",
+        observed_at=generated_at,
+    )
+    unknown_offer = _confirmed_offer(
+        selected_date=selected_date,
+        verified_at=generated_at,
+        airline="8M",
+        airline_name="Myanmar Airways International",
+        flight_number="750",
+    )
+    service = PredictionService(
+        trained_model_dir,
+        context_provider=ContextProvider(),
+        schedule_provider=_StaticScheduleProvider(
+            ScheduleSearchResult((schedule,), frozenset({"8M"}))
+        ),  # type: ignore[arg-type]
+        flight_offer_provider=_StaticFareProvider(
+            _fare_result(unknown_offer, observed_at=generated_at)
+        ),
+        now_provider=lambda: generated_at,
+    )
+
+    result = service.compare(
+        ComparisonRequest(
+            origin="YYZ",
+            destination="LHR",
+            departure_date=selected_date,
+        )
+    )
+
+    assert len(result.offers) == 1
+    assert result.offers[0].airline_code == "8M"
+    assert result.offers[0].cabin == "economy"
+    assert result.offers[0].cabin_status == "provider_confirmed"
+    assert len(result.timetable_references) == 1
+    assert result.timetable_references[0].flight_number == "8M750"
+    assert "购票选项与 HTTPS 预订链接二次验证" in (
+        result.timetable_references[0].reference_reason.zh
+    )
+
+
+def test_no_key_strict_mode_returns_empty_instead_of_model_flights(
     trained_model_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -440,39 +873,14 @@ def test_no_key_fallback_has_no_fake_flight_number_or_clock_time_and_model_hub_l
             departure_date=selected_date,
         )
     )
-    assert comparison.offers
-    assert all(offer.schedule_status == "model_scenario" for offer in comparison.offers)
-    assert all(offer.flight_number is None for offer in comparison.offers)
-    assert all(offer.scheduled_departure_local is None for offer in comparison.offers)
-    assert all(offer.scheduled_arrival_local is None for offer in comparison.offers)
-
-    selected = next(offer for offer in comparison.offers if offer.airline_code == "AA")
-    detail = service.offer_detail(
-        OfferDetailRequest(
-            origin="YYZ",
-            destination="LHR",
-            departure_date=selected_date,
-            offer_id=selected.id,
-        )
-    )
-    assert detail.itinerary.kind == "one_stop"
-    assert detail.itinerary.layover_airport == "DFW"
-    assert detail.itinerary.layover_minutes == 90
-    assert len(detail.itinerary.legs) == 2
-    leg_minutes = sum(leg.duration_minutes for leg in detail.itinerary.legs)
-    assert leg_minutes + 90 == selected.duration_minutes
-    assert (
-        detail.itinerary.legs[0].duration_minutes
-        == service._route("YYZ", "DFW").duration_minutes
-    )
-    assert (
-        detail.itinerary.legs[1].duration_minutes
-        == service._route("DFW", "LHR").duration_minutes
-    )
-    assert selected.duration_minutes > comparison.duration_minutes + 90
-    assert all(leg.flight_number is None for leg in detail.itinerary.legs)
-    assert all(leg.departure_local is None for leg in detail.itinerary.legs)
-    assert detail.fallback_reason is not None
+    assert comparison.offers == []
+    assert comparison.timetable_references == []
+    assert comparison.result_status == "fare_provider_not_configured"
+    assert comparison.rankings.model_dump() == {
+        "direct_first": [],
+        "lowest_price": [],
+        "student_first": [],
+    }
 
     with pytest.raises(OfferNotFoundError, match="does not exist"):
         service.offer_detail(
@@ -603,7 +1011,7 @@ def test_same_day_safe_reference_uses_utc_timeline_across_spring_forward(
     assert result.departure_time.isoformat() == "2027-03-14T12:00:00-04:00"
 
 
-def test_endpoint_hub_is_not_replaced_with_an_unrelated_airline_hub(
+def test_legacy_route_airline_hints_do_not_create_strict_offers(
     trained_model_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -621,32 +1029,6 @@ def test_endpoint_hub_is_not_replaced_with_an_unrelated_airline_hub(
         )
     )
 
-    ek_offers = [offer for offer in comparison.offers if offer.airline_code == "EK"]
-    assert ek_offers
-    assert all(offer.route_status == "model_scenario" for offer in ek_offers)
-    assert all(offer.stops is None for offer in ek_offers)
-    assert all(offer.routing_status == "model_route_unresolved" for offer in ek_offers)
-    assert all(offer.duration_minutes == comparison.duration_minutes for offer in ek_offers)
-    assert all(offer.flight_number is None for offer in ek_offers)
-
-    selected = next(offer for offer in ek_offers if offer.cabin == "economy")
-    detail = service.offer_detail(
-        OfferDetailRequest(
-            origin="DXB",
-            destination="JFK",
-            departure_date=selected_date,
-            offer_id=selected.id,
-        )
-    )
-    assert detail.itinerary.kind == "route_unresolved"
-    assert detail.itinerary.layover_airport is None
-    assert detail.itinerary.legs == []
-    assert detail.itinerary.total_distance_km == comparison.distance_km
-    assert detail.itinerary.total_duration_minutes == comparison.duration_minutes
-
-    offers_by_id = {offer.id: offer for offer in comparison.offers}
-    ranked = [offers_by_id[offer_id] for offer_id in comparison.rankings.direct_first]
-    routing_ranks = [service._routing_rank(offer) for offer in ranked]
-    assert routing_ranks == sorted(routing_ranks)
-    assert ranked[0].routing_status == "provider_direct"
-    assert ranked[-1].routing_status == "model_route_unresolved"
+    assert comparison.offers == []
+    assert comparison.timetable_references == []
+    assert comparison.result_status == "fare_provider_not_configured"

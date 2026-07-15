@@ -127,7 +127,7 @@ class _ConfirmedRouteProvider(ContextProvider):
         return {"AC", "BA"}
 
 
-def test_confirmed_direct_carriers_precede_connecting_scenarios(
+def test_legacy_route_airline_hints_do_not_bypass_strict_bookable_mode(
     trained_model_dir: Path,
     monkeypatch,
 ) -> None:
@@ -152,45 +152,14 @@ def test_confirmed_direct_carriers_precede_connecting_scenarios(
 
     assert result.departure_timezone == "America/Toronto"
     assert result.departure_time.hour == 9
-    assert len({offer.airline_code for offer in result.offers}) == 60
-    confirmed = [offer for offer in result.offers if offer.route_status == "provider_confirmed"]
-    scenarios = [offer for offer in result.offers if offer.route_status == "model_scenario"]
-    assert {offer.airline_code for offer in confirmed} == {"AC", "BA"}
-    assert all(offer.stops == 0 for offer in confirmed)
-    connecting_scenarios = [offer for offer in scenarios if offer.stops == 1]
-    unresolved_scenarios = [offer for offer in scenarios if offer.stops is None]
-    assert connecting_scenarios
-    assert unresolved_scenarios
-    assert all(
-        service._model_hub(offer.airline_code, "YYZ", "LHR") is None
-        for offer in unresolved_scenarios
-    )
-    assert all(offer.duration_minutes == result.duration_minutes for offer in confirmed)
-    assert all(
-        offer.duration_minutes > result.duration_minutes + 90
-        for offer in connecting_scenarios
-    )
-    assert all(
-        offer.duration_minutes == result.duration_minutes for offer in unresolved_scenarios
-    )
-    aa_offer = next(offer for offer in connecting_scenarios if offer.airline_code == "AA")
-    assert aa_offer.duration_minutes == (
-        service._route("YYZ", "DFW").duration_minutes
-        + 90
-        + service._route("DFW", "LHR").duration_minutes
-    )
-    assert all(offer.punctuality_basis == "direct_leg_model" for offer in confirmed)
-    assert all(
-        offer.punctuality_basis == "two_leg_independence_scenario"
-        for offer in connecting_scenarios
-    )
-    assert all(
-        offer.punctuality_basis == "route_only_model"
-        for offer in unresolved_scenarios
-    )
-    offers_by_id = {offer.id: offer for offer in result.offers}
-    ranked = [offers_by_id[offer_id] for offer_id in result.rankings.direct_first]
-    assert all(offer.route_status == "provider_confirmed" for offer in ranked[: len(confirmed)])
+    assert result.offers == []
+    assert result.timetable_references == []
+    assert result.result_status == "fare_provider_not_configured"
+    assert result.rankings.model_dump() == {
+        "direct_first": [],
+        "lowest_price": [],
+        "student_first": [],
+    }
 
 
 def test_origin_timezone_rejects_dst_gap_and_overlap() -> None:

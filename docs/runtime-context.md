@@ -11,23 +11,42 @@ substituted for a live bookable fare.
 | Weather | Open-Meteo current/forecast plus NOAA METAR/TAF | Clearly labelled synthetic month/latitude prior | `live`, `forecast`, or `proxy` |
 | Airport operations | FAA NAS Status for authoritative current US events; optional AirLabs schedule samples elsewhere | ADSB.lol current aircraft-density proxy, plus a clearly labelled training/synthetic target-time prior | `live` or `proxy` |
 | Disruption news | No-key GDELT DOC 2.0 articles from the recent seven-day window, ordered `DateDesc`; official GAL rolling RSS if DOC fails | Route cache no older than six hours with reduced influence, otherwise a neutral value with no articles | `live`, `historical`, or `neutral` |
-| Offer schedules/routes | AirLabs near-real-time `schedules`, then recurring `routes`, when a free key is configured | Model-only direct/connecting legs with no fabricated flight number or clock time | `live_schedule`, `recurring_timetable_projection`, or `model_scenario` |
+| Strict flight comparison | SerpApi Google Flights search followed by a `booking_token` booking-options request | Structured empty `offers`; AirLabs schedules/routes may appear only in `timetable_references` | `strict_bookable_only`; retained rows use `bookability_status=booking_option_verified` |
 
 The service catches provider timeouts, malformed payloads, quota exhaustion, and empty results.
-It then returns a labelled fallback rather than failing the whole prediction. Set
-`EXTERNAL_CONTEXT_ENABLED=0` for deterministic offline development.
+Context signals may return a labelled fallback rather than fail the whole prediction; strict fare
+search instead returns labelled empty `offers` and never substitutes an unpriced row. Set
+`EXTERNAL_CONTEXT_ENABLED=0` for deterministic offline context development.
 
-To enable the optional free AirLabs integration, create a free provider key and set it in the same
-shell that starts the server:
+Strict comparison needs a SerpApi key. SerpApi Free currently includes 250 successful searches per
+provider billing period plus 50 requests per hour; the period boundary follows the account's
+`plan_renewal_date`, not the calendar month. Initial Google Flights searches and `booking_token`
+follow-ups share that allowance. The application applies one persistent local billing-period ledger
+and a hard ceiling of 250 reserved attempts.
+Configure the same shell that starts the server:
 
 ```powershell
+$env:FLIGHT_OFFER_PROVIDER="serpapi"
+$env:SERPAPI_API_KEY="your-serpapi-key"
+$env:SERPAPI_MONTHLY_LIMIT="250"
 $env:AIRLABS_API_KEY="your-free-key"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
 The application reads the process environment and does not automatically load `.env`. Never put
-the key in source code, commit it, embed it in a browser URL, or expose it to the client. No key is
-a supported mode: the service returns explicitly labelled model/proxy fallbacks.
+credentials in source code, commits, browser/frontend data, or application logs. SerpApi officially
+requires the server to include the key in the HTTPS query sent to `https://serpapi.com`, so complete
+outbound provider URLs must not be logged.
+`SERPAPI_MONTHLY_LIMIT` defaults to 250 when omitted. Values above 250 are clamped to 250, and an
+invalid or non-positive value does not disable the safety ceiling. One comparison uses at most four
+cabin searches and six booking-token candidate validations, so it reserves at most 10 provider
+requests. At most six candidates are selected with airline diversity first and price filling the
+remaining slots; this is not a complete list of airlines or flights. The worst-case 10-request path
+allows about five fresh full comparisons per hour before accounting for any other requests.
+The AirLabs key remains optional and is used for airport-operations samples and timetable
+references, not to make strict offers. Missing credentials or exhausted quota are supported modes:
+context signals may still use labelled model/proxy fallbacks, while strict flight comparison
+returns a structured empty result instead of inventing flights.
 
 Within two hours of departure, the service uses fresh Open-Meteo current model conditions and
 can blend NOAA METAR airport observations with TAF. From two to 30 hours it blends the
@@ -84,38 +103,81 @@ more than 30 minutes after generation; otherwise the service advances 30 minutes
 and converts that instant back to the origin timezone. A next-day result is rejected with 422. The
 response labels these cases `origin_local_noon_model_reference` or
 `origin_local_remaining_day_model_reference`. Neither timestamp is an actual flight departure. A
-real flight number or clock time appears only when a complete provider schedule/timetable row passes
-route, date, timezone, duration, status, and future-departure validation.
+real flight number or clock time appears in the main list only when every segment of a
+provider-priced offer passes route, date, timezone, continuity, duration, cabin, fare, and
+future-departure validation. AirLabs rows may show those fields only inside the clearly separated
+reference list.
 
-AirLabs `schedules` is a near-real-time feed whose free horizon is roughly the next several hours;
-only complete future departures with a scheduled or unrecognized status remain selectable.
-Cancelled, departed, active, landed, and past live identities override matching recurring rows
-before filtering, so a routes projection cannot revive them. AirLabs `routes` is a recurring
-weekday timetable, so a match projected onto the selected date is labelled
-`recurring_timetable_projection`, not a live or guaranteed operation. Both require
-`AIRLABS_API_KEY` and are constrained by free quota, row limits, field completeness, and route
-coverage. Live schedule terminal values remain provider estimates, not confirmed day-of-operation
-assignments. Possible terminals and last-used aircraft from a recurring row are not returned as
-facts about the selected date. `schedule_observed_at` is the fetch time for a live schedule but the
-provider route-record `updated` time for a recurring projection; it is not one uniform freshness
-clock.
+Strict mode uses an evidence chain, not a schedule projection. It searches Google Flights for each
+of the four requested travel classes with `deep_search=true` and `show_hidden=true`, then keeps only
+bounded candidates that contain a `booking_token`. These flags broaden visible results but do not
+guarantee all airlines, flights, cabins, sellers, or private fares. At most six candidates are chosen,
+preferring distinct airlines before lower-priced remaining candidates. Each retained candidate is
+followed by a booking-options request, for at most 10 provider requests per comparison. Only a response
+whose `selected_flights` exactly matches the original segment sequence and contains a seller,
+matching flight numbers, positive one-way USD price, and HTTPS `booking_request.url` can enter
+`offers`. The itinerary must also remain continuous, use one provider-confirmed cabin throughout,
+contain real flight numbers and complete local/UTC times, and have one to four segments (zero to
+three stops). Its `live_fare` is independent of `estimated_price_usd` and its 80% model interval.
+The free response does not reliably establish whether taxes are included, so `taxes_included` is
+unknown rather than asserted true.
+
+The free allowance is a provider-account limit, not an unlimited service guarantee. The local
+ledger conservatively reserves every attempted initial or token request before issuing it, and stops
+before `SERPAPI_MONTHLY_LIMIT` is exceeded. Its compatibility field `monthly_calls_used` follows the
+`plan_renewal_date` billing period and counts reserved attempts, not provider-billed successes.
+SerpApi currently says cached, errored, and failed searches do not count against provider quota, but
+the local ledger still reserves them and can stop early to guarantee the free ceiling. Review SerpApi
+account usage independently because provider quota rules
+and plan terms can change. Missing configuration, exhausted local budget, authentication failure,
+rate limiting, provider failure, no matching offers, an absent
+`booking_token`, an itinerary mismatch, or a missing usable booking option is represented by
+explicit `fare_search_metadata.status` and `result_status` values with empty `offers`; none enables
+a model or timetable fallback.
+
+SerpApi may serve a provider result cached for up to about one hour; the application also maintains
+a five-minute strict-result cache. `live_fare.provider_cache_hit` is inferred from a local cache hit
+or provider status/time heuristics; it detects likely reuse but does not identify or prove the exact
+cache layer. `provider_cache_age_seconds` is the age of the
+displayed result relative to `verified_at`, bounded to 0–3900 seconds to allow processing and clock
+tolerance. `verified_at` is SerpApi `search_metadata.created_at` (provider result time), not the current
+API response time. The dashboard displays response generation time separately.
+
+AirLabs `schedules` and `routes` are reference-only in strict comparison. A complete dated schedule
+or recurring weekday projection may appear in `timetable_references` with
+`bookability_status=unverified`, but neither can enter `offers` or rankings because AirLabs does not
+confirm current fare and availability. Cancelled, departed, active, landed, and past live identities
+continue to suppress matching recurring references, so a routes projection cannot revive them.
+AirLabs calls still require `AIRLABS_API_KEY` and remain constrained by free quota, row limits,
+field completeness, time horizon, and route coverage. Terminal values are provider estimates, not
+confirmed day-of-operation assignments. Possible terminals and last-used aircraft from recurring
+rows are not returned as facts about the selected date. `schedule_observed_at` is the fetch time for
+a live schedule but the route record's `updated` time for a recurring projection; it is not one
+uniform freshness clock.
 
 Each schedules/routes request is capped at 50 rows. If either endpoint reports `request.has_more`
 or returns 50 rows, comparison and offer-detail responses set `schedule_sample_truncated=true` and
-`schedule_sample_limit=50`; their bilingual warning/notice states that the real flight list may be
-incomplete. `false` means no truncation signal was observed from endpoints actually queried; it does
-not prove complete coverage when an endpoint was skipped, unavailable, quota-limited, or outside its
-time window. The free integration does not attempt pagination.
+`schedule_sample_limit=50`; their bilingual warning/notice states that the AirLabs timetable
+reference list may be incomplete. This flag says nothing about SerpApi Google Flights coverage.
+`false` means no truncation signal was observed from AirLabs endpoints actually queried; it does not
+prove complete reference coverage when an endpoint was skipped, unavailable, quota-limited, or
+outside its time window. The free AirLabs integration does not attempt pagination.
 
-Routing uses an explicit three-state contract. `provider_direct` has `stops=0` and ranks first;
-`model_one_stop` has `stops=1`, uses only a distinct airline-specific mapped hub, and ranks next;
-`model_route_unresolved` has `stops=null` and ranks last. An unresolved offer uses O&D model
-distance/duration references internally but does not claim that the airline flies direct or via a
-connection. Its detail itinerary is `route_unresolved` with `legs=[]`. Cabins always remain
-`catalog_scenario`, because neither schedules nor routes confirms bookable cabin inventory. A
-one-stop fallback contains two model legs plus a 90-minute layover assumption and retains the
-explicit two-independent-leg on-time scenario (`p²`). No fallback invents a flight number,
-departure/arrival time, segment, or unrelated transfer airport.
+Strict mode never creates route-level, timetable-only, or model-only flight offers. Every retained
+offer is a complete SerpApi Google Flights `priced_offer` with
+`schedule_source=serpapi_google_flights_booking`, `cabin_status=provider_confirmed`, and
+`bookability_status=booking_option_verified`. `provider_direct` represents one segment;
+`provider_itinerary` represents two to four continuous segments. `route_airlines`, model hubs,
+catalogue cabin expansion, and unresolved O&D scenarios cannot populate the main list. The schema
+retains older enum values for compatibility, but strict responses do not generate those offers.
+
+This approach does not pretend to provide universal coverage. Even with `deep_search` and
+`show_hidden`, Google Flights and its visible sellers
+may omit a route, airline, cabin, date, private fare, or booking option. Strict mode returns no offer
+in those cases; it never fabricates a replacement from AirLabs, an airline catalogue, or the
+prediction model. A verified booking option is a Google Flights snapshot at the query time, not a
+promise that the airline or seller will preserve the same inventory, fare rules, or final checkout
+price.
 
 ## News feature
 
@@ -161,15 +223,26 @@ This is deliberately conservative:
 
 ## Second-level offer, weather, and news pages
 
-Every comparison offer links to `GET /details/offer`. The page calls `POST /v1/offer-detail` with
-the route, `departure_date`, and opaque `offer_id`. Its response repeats the selected offer and
-adds a direct, one-stop, or unresolved itinerary. Complete near-real-time schedules use
-`airlabs_live_schedule`; recurring route rows projected onto the requested weekday use
-`airlabs_recurring_timetable_projection`; otherwise determined legs are `model_duration_only`.
-The unresolved case has no legs and exposes only O&D model reference totals; a determined
-connection exposes its two segment estimates and 90-minute layover assumption. Flight numbers and
-clock times stay null. The offer's cabin remains
-`catalog_scenario` in all three cases.
+Every strict comparison offer links to `GET /details/offer`. The page calls
+`POST /v1/offer-detail` with the route, `departure_date`, opaque `offer_id`, and `force_refresh`.
+Initial load sends `force_refresh=false` and reuses the five-minute strict cache. Only the explicit
+Refresh and re-query button sends `force_refresh=true`, which reruns at most four cabin searches plus
+six `booking_token` validations. The frontend timeout is 90 seconds. Its response repeats the selected
+Google Flights offer and returns the complete one-to-four segment itinerary, including flight numbers,
+local/UTC times, confirmed cabin, booking/fare fields when supplied, and provider-confirmed layovers. AirLabs
+timetable and model-only rows have no offer
+ID or detail link; an expired or no-longer-confirmed ID returns 404. A confirmed price is still a
+time-sensitive snapshot rather than a booking guarantee. The API exposes only an HTTPS booking URL
+returned by the verified provider response; it never invents one.
+
+The detail response also includes `price_curve`, a daily model projection from the current
+origin-local date to the final honest pre-departure date. Each point contains a simulated quote
+date/time, lead days, model estimate, and 80% interval. The first point uses the same generated time
+and features as the selected offer. The final quote instant is always strictly before departure;
+for a flight exactly at local midnight there is no falsely relabelled point on the departure date.
+The entire curve is generated in one request by changing simulated quote time. It is explicitly not
+collected fare history, a live fare, or a bookable quote, and points beyond the model's main 180-day
+training horizon are marked as extrapolation.
 
 The dashboard creates same-tab, shareable URLs for `GET /details/weather` and
 `GET /details/news` after a successful comparison. Query parameters contain `origin`,
@@ -208,21 +281,26 @@ unchanged.
 ## Student, baggage, and fare-rule fields
 
 The comparison response uses three-state or multi-state policy fields. `unknown` is not treated as
-`not_included`. A public airline student-program page is labelled `program_available`; it is not
-labelled as an actual student fare for the requested trip. `confirmed_free` is reserved for
-offer-level evidence, which the strict-free model-estimate mode normally does not have.
+`not_included`. Ordinary free Google Flights queries cannot verify an actual student-only discount,
+so the UI shows that criterion as `unknown` and it receives no ranking bonus. A public airline
+student-program page is labelled `program_available`; it is not labelled as an actual student fare
+for the requested trip. `confirmed_free`,
+`confirmed_included`, and `confirmed_discount` are reserved for applicable offer-level evidence;
+missing or ambiguous fare-rule fields remain `unknown`.
 
 The student ranking follows the requested lexicographic order:
 
-1. lower estimated price;
+1. lower confirmed `live_fare.total_amount` (one adult, one way, USD; tax inclusion unknown);
 2. confirmed free checked baggage;
 3. confirmed actual student discount;
 4. confirmed free change/refund;
 5. lower age and verification burden.
 
-`program_available` alone does not satisfy the actual-discount criterion. Its published age and
-verification metadata is considered only in the fifth criterion. Because estimated prices will
-usually differ, later criteria most often act as tie-breakers.
+`program_available` alone does not satisfy the actual-discount criterion. With the current SerpApi
+chain, actual student discount remains unknown and gives no score. Its published age and
+verification metadata is considered only in the fifth criterion. The synthetic model estimate and
+price curve never replace the confirmed live fare in ranking. Because confirmed totals will usually
+differ, later criteria most often act as tie-breakers.
 
 ## Source links and operational limits
 
@@ -230,6 +308,9 @@ usually differ, later criteria most often act as tie-breakers.
 - [Open-Meteo forecast API](https://open-meteo.com/en/docs)
 - [Open-Meteo free API terms and attribution](https://open-meteo.com/en/terms)
 - [FAA NAS Status](https://nasstatus.faa.gov/)
+- [SerpApi Google Flights API](https://serpapi.com/google-flights-api)
+- [SerpApi Google Flights booking options](https://serpapi.com/google-flights-booking-options)
+- [SerpApi plans, successful-search accounting, and free billing-period quota](https://serpapi.com/pricing)
 - [AirLabs schedules API](https://airlabs.co/docs/schedules)
 - [AirLabs routes API](https://airlabs.co/docs/routes)
 - [ADSB.lol public API](https://www.adsb.lol/docs/open-data/api/)
@@ -241,5 +322,7 @@ usually differ, later criteria most often act as tie-breakers.
 Free-provider quotas, fields, coverage, and terms can change. Review the linked sources before
 deploying publicly or commercially. Use or redistribution of GDELT data must cite and link the
 GDELT Project; the dashboard includes that visible attribution. API keys belong in the process
-environment or another local secret store, never in the repository. The application does not
-automatically load `.env`; set `AIRLABS_API_KEY` in the shell that starts the server.
+environment or another local secret store, never in the repository, browser/frontend, or application
+logs. The server includes the SerpApi key only in the provider-required HTTPS query to
+`https://serpapi.com`; complete outbound URLs must not be logged. The application does not
+automatically load `.env`; set provider variables in the shell that starts the server.
