@@ -1351,6 +1351,7 @@ class ComparisonResponse(BaseModel):
         "fare_provider_rate_limited",
         "fare_provider_budget_not_configured",
         "fare_provider_budget_exhausted",
+        "fare_provider_coverage_limited",
         "fare_provider_processing",
         "fare_provider_error",
         "fare_provider_unavailable",
@@ -1429,6 +1430,14 @@ class ComparisonResponse(BaseModel):
             "provider_error": "fare_provider_error",
             "provider_unavailable": "fare_provider_unavailable",
         }[self.fare_search_metadata.status]
+        if (
+            not self.offers
+            and self.fare_search_metadata.status == "no_results"
+            and self.fare_search_metadata.quota_skipped_candidate_count > 0
+            and self.fare_search_metadata.coverage_status
+            in {"quota_limited", "quota_and_provider_incomplete"}
+        ):
+            expected_status = "fare_provider_coverage_limited"
         if self.result_status != expected_status:
             raise ValueError("result status must agree with fare-search metadata and offers")
         return self

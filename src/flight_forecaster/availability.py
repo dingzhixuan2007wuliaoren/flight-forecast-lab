@@ -68,11 +68,12 @@ SERPAPI_DEFAULT_MONTHLY_LIMIT = 250
 SERPAPI_MAX_MONTHLY_LIMIT = 250
 FLIGHT_OFFER_CACHE_TTL_SECONDS = 300.0
 MAX_PROVIDER_RESPONSE_BYTES = 5_000_000
-REQUEST_TIMEOUT_SECONDS = 25.0
+REQUEST_TIMEOUT_SECONDS = 15.0
 ACCOUNT_REQUEST_TIMEOUT_SECONDS = 8.0
 SEARCH_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 2.0
 MAX_CACHE_ENTRIES = 128
 MAX_BOOKING_WORKERS = 6
+MAX_BOOKING_CANDIDATES_PER_COMPARISON = 6
 SERPAPI_MAX_HOURLY_LIMIT = 50
 MAX_PROVIDER_CACHE_AGE_SECONDS = 65 * 60
 MAX_PROVIDER_FUTURE_SKEW_SECONDS = 5 * 60
@@ -1211,11 +1212,15 @@ class SerpApiFlightOfferProvider:
 
         confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
         booking_failures: list[BaseException] = []
+        requested_booking_calls = min(
+            len(candidates),
+            MAX_BOOKING_CANDIDATES_PER_COMPARISON,
+        )
         try:
             booking_reservation = self._ledger.synchronize_and_reserve(
                 account.billing_cycle_key,
                 account.hour_bucket_key,
-                calls=len(candidates),
+                calls=requested_booking_calls,
                 monthly_limit=account.monthly_limit,
                 hourly_limit=account.hourly_limit,
                 provider_monthly_usage=account.monthly_used,
@@ -1326,7 +1331,13 @@ class SerpApiFlightOfferProvider:
             retry_quota_limited=retry_quota_limited,
             search_failed_cabins=search_failed_cabin_count,
         )
-        quota_limit = booking_reservation.limiting_quota if quota_skipped_candidate_count else None
+        quota_limit: QuotaLimit | None = None
+        if quota_skipped_candidate_count:
+            quota_limit = (
+                booking_reservation.limiting_quota
+                if booking_reservation.reserved_calls < requested_booking_calls
+                else "provider_specific"
+            )
         if retry_quota_limited:
             quota_limit = (
                 "hourly"
@@ -1335,8 +1346,9 @@ class SerpApiFlightOfferProvider:
             )
 
         # A single itinerary can be returned through multiple booking tokens and
-        # sellers. All reserved tokens are verified first; only then is each
-        # flight-and-cabin group reduced to its cheapest confirmed price.
+        # sellers. The bounded, fairly ordered subset is verified first; only
+        # then is each flight-and-cabin group reduced to its cheapest confirmed
+        # price. Candidates outside the subset remain explicitly unverified.
         best_by_group: dict[tuple[Any, ...], tuple[int, ConfirmedFlightOffer]] = {}
         for position in range(booking_calls):
             offer = confirmed_by_position.get(position)
@@ -1891,10 +1903,9 @@ class SerpApiFlightOfferProvider:
                 )
             )
 
-        # If the shared free quota only permits partial verification, first give
-        # each returned cabin one chance, then consume the remaining capacity in
-        # provider-price order. With sufficient quota, every eligible token is
-        # still returned and verified.
+        # Give each returned cabin one chance first, then spend the remaining
+        # per-comparison capacity in provider-price order. Candidates beyond the
+        # bounded subset remain explicitly unverified.
         selected: list[_SearchCandidate] = []
         for cabin in _CABINS:
             if by_cabin[cabin]:

@@ -64,16 +64,21 @@ requires the server to include the key in the HTTPS query sent to `https://serpa
 outbound provider URLs must not be logged.
 `SERPAPI_MONTHLY_LIMIT` defaults to 250 when omitted. Values above 250 are clamped to 250, and an
 invalid or non-positive value does not disable the safety ceiling. One comparison performs the four
-SerpApi cabin searches and then processes every eligible `booking_token` candidate those searches
-actually return. The number of booking-option validation calls therefore varies with the response
-and remaining hourly/monthly free allowance. Results are bounded by SerpApi coverage, provider
+SerpApi cabin searches and attempts booking-option validation for at most six eligible
+`booking_token` candidates. SearchAPI and released Ignav apply the same six-candidate cap independently
+for each source. Excess candidates are reported as partial, quota-limited coverage rather than no
+flights. Results are bounded by each source's cap, SerpApi coverage, provider
 responses, and the configured free quota; they are not a complete global list of airlines or flights.
 SearchAPI's local wall is the one-time 100-request signup allocation for the installation/account;
 it is never described or reset as a monthly allowance. Its free account endpoint can represent this
 as `monthly_allowance=0` with the unused grant in `remaining_credits`; that zero is accepted only
 when the subscription is absent and all returned counters remain within the 100-request free ceiling.
 The independent SQLite lifetime ledger is still authoritative. `auto` invokes every configured and released
-strict source, even after another source confirms offers. One actually attempted source keeps its own
+strict source concurrently, even after another source confirms offers. SearchAPI's four cabin searches
+run together and at most six booking-option checks are attempted per comparison. Only that bounded
+batch is reserved, so an interrupted process cannot pre-allocate the entire remaining account balance.
+Unused candidates are reported as quota-limited coverage rather than silently treated as no results.
+One actually attempted source keeps its own
 provider identity; two or more attempted sources produce `strict_fare_aggregate` with non-nested
 `provider_runs` containing each source's status, coverage, quota, and sanitized diagnostics. Only
 offers independently verified by their own source can be merged. A source's failure, processing, or
@@ -191,9 +196,11 @@ future-departure validation. AirLabs rows may show those fields only inside the 
 reference list.
 
 Strict mode uses an evidence chain, not a schedule projection. An active strict adapter searches its
-fare source for each of the four requested travel classes, then processes every eligible candidate
-that carries the source's opaque booking-verification token or identifier, subject to the remaining
-free quota and provider availability. Where supported, `deep_search=true` and `show_hidden=true`
+fare source for each of the four requested travel classes, then attempts at most six eligible candidates
+per source and comparison when they carry the source's opaque booking-verification token or identifier,
+subject to the remaining free quota and provider availability. SerpApi, SearchAPI, and released Ignav
+each apply this cap independently; unattempted candidates produce partial, `quota_limited` coverage.
+Where supported, `deep_search=true` and `show_hidden=true`
 broaden visible results but do not
 guarantee all airlines, flights, cabins, sellers, or private fares. Each attempted candidate is
 followed by a booking-options request. Only a response
@@ -241,8 +248,8 @@ fallback. `fare_search_metadata` also exposes `coverage_scope`,
 and `retry_quota_limited`. For `strict_fare_aggregate`, these top-level counts are the sums across
 attempted runs before cross-source deduplication, while `provider_runs` preserves every individual
 source snapshot. `coverage_status` is `complete`, `quota_limited`, `provider_incomplete`,
-`quota_and_provider_incomplete`, or `not_evaluated`; `quota_limit` identifies the hourly or monthly
-ceiling when quota truncated validation. A response may therefore contain a useful partial set of
+`quota_and_provider_incomplete`, or `not_evaluated`; `quota_limit` identifies the provider ceiling or
+the provider-specific six-candidate comparison cap when validation is truncated. A response may therefore contain a useful partial set of
 strictly verified offers while clearly reporting which eligible candidates were not verified.
 On a five-minute strict-cache hit, per-response call counts are zero while the candidate coverage
 counts describe the original search; `cache_hit=true` and the bilingual notice make that distinction
@@ -352,9 +359,9 @@ Every strict comparison offer links to `GET /details/offer`. The page calls
 `POST /v1/offer-detail` with the route, `departure_date`, opaque `offer_id`, and `force_refresh`.
 Initial load sends `force_refresh=false` and reuses the five-minute strict cache. Only the explicit
 Refresh and re-query button sends `force_refresh=true`, which reruns the four cabin searches and
-attempts every eligible returned candidate allowed by the remaining free quota and provider
-response. The frontend timeout is 360 seconds so bounded batches of free-quota candidate
-validation can finish. Its response repeats the selected
+attempts at most six eligible returned candidates per strict source, subject to the remaining free quota
+and provider response. The main comparison request has a 150-second browser wait limit and retains a
+visible timeout or failure message instead of spinning indefinitely. Its response repeats the selected
 strict provider offer and returns the complete one-to-four segment itinerary, including flight numbers,
 local/UTC times, confirmed cabin, booking/fare fields when supplied, and provider-confirmed layovers. AirLabs
 timetable and model-only rows have no offer

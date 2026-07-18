@@ -49,10 +49,9 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
         "quota_limit",
     ):
         assert field in dashboard
+    assert "at most six candidates" in dashboard
     for obsolete_claim in (
-        "最多 6 个候选",
         "最多 10 次",
-        "at most six candidates",
         "at most 10 provider requests",
         "four cabin searches plus six",
     ):
@@ -66,10 +65,10 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert "weather_feature_status" in offer_page
     assert "data.offers.length" in dashboard
     assert "coverageCacheSnapshot" in dashboard
+    assert "150000" in offer_page
+    assert "360000" not in offer_page
     for obsolete_claim in (
-        "最多 6 个候选",
         "最多 10 次",
-        "at most six candidates",
         "at most 10 provider requests",
         "four cabin searches plus six",
     ):

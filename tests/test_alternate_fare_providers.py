@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 
 import pytest
@@ -66,10 +67,21 @@ class _SearchApiClient:
         account_payload: dict[str, Any] | None = None,
         account_status: int = 200,
         include_candidate: bool = True,
+        candidate_cabins: set[str] | None = None,
+        candidates_per_cabin: int = 1,
     ) -> None:
-        self.account_payload = account_payload or _free_searchapi_account()
+        self.account_payload = (
+            account_payload
+            if account_payload is not None
+            else _free_searchapi_account()
+        )
         self.account_status = account_status
-        self.include_candidate = include_candidate
+        self.candidate_cabins = (
+            set(candidate_cabins)
+            if candidate_cabins is not None
+            else ({"economy"} if include_candidate else set())
+        )
+        self.candidates_per_cabin = candidates_per_cabin
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def get(
@@ -93,8 +105,38 @@ class _SearchApiClient:
             _searchapi_search_payload(
                 cabin,
                 params,
-                include_candidate=self.include_candidate and cabin == "economy",
+                include_candidate=cabin in self.candidate_cabins,
+                candidate_count=self.candidates_per_cabin,
             )
+        )
+
+
+class _ConcurrentSearchApiClient(_SearchApiClient):
+    def __init__(self) -> None:
+        super().__init__(candidate_cabins=set(_TRAVEL_CLASSES.values()))
+        self.search_barrier = Barrier(4, timeout=2)
+        self.booking_barrier = Barrier(4, timeout=2)
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        if url == SEARCHAPI_SEARCH_URL:
+            barrier = (
+                self.booking_barrier
+                if "booking_token" in params
+                else self.search_barrier
+            )
+            barrier.wait()
+        return super().get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
         )
 
 
@@ -120,6 +162,34 @@ class _PartiallyFailingSearchApiClient(_SearchApiClient):
             headers=headers,
             timeout=timeout,
         )
+
+
+class _RejectingBoundedSearchApiClient(_SearchApiClient):
+    def __init__(self) -> None:
+        super().__init__(
+            candidate_cabins=set(_TRAVEL_CLASSES.values()),
+            candidates_per_cabin=3,
+        )
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        response = super().get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+        if url == SEARCHAPI_SEARCH_URL and "booking_token" in params:
+            response.payload["booking_options"] = []
+            response.content = json.dumps(response.payload).encode("utf-8")
+            response.text = response.content.decode("utf-8")
+        return response
 
 
 class _IgnavClient:
@@ -153,6 +223,69 @@ class _IgnavClient:
         assert url == IGNAV_BOOKING_LINKS_URL
         assert json == {"ignav_id": "ignavcandidate01"}
         return _Response(_ignav_booking_payload(self.booking_url))
+
+
+class _BoundedConcurrentIgnavClient:
+    def __init__(
+        self,
+        *,
+        booking_url: str = "https://www.aircanada.com/booking/test",
+    ) -> None:
+        self.booking_url = booking_url
+        self.search_barrier = Barrier(4)
+        self.booking_barrier = Barrier(6)
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.candidates: dict[str, tuple[str, float]] = {}
+        for cabin_index, cabin in enumerate(_TRAVEL_CLASSES):
+            for candidate_index in range(3):
+                candidate_id = f"ignav_{cabin}_{candidate_index:02d}"
+                self.candidates[candidate_id] = (
+                    cabin,
+                    500.0 + cabin_index * 100 + candidate_index,
+                )
+
+    def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        assert headers["X-Api-Key"] == "ignav-test-key"
+        assert timeout > 0
+        self.calls.append((url, dict(json)))
+        if url == IGNAV_ONE_WAY_URL:
+            self.search_barrier.wait()
+            cabin = str(json["cabin_class"])
+            rows = [
+                _ignav_candidate(
+                    ignav_id=candidate_id,
+                    cabin=candidate_cabin,
+                    amount=amount,
+                )
+                for candidate_id, (candidate_cabin, amount) in self.candidates.items()
+                if candidate_cabin == cabin
+            ]
+            return _Response(
+                {
+                    "origin": "YYZ",
+                    "destination": "LHR",
+                    "departure_date": DEPARTURE_DATE.isoformat(),
+                    "itineraries": rows,
+                }
+            )
+        assert url == IGNAV_BOOKING_LINKS_URL
+        self.booking_barrier.wait()
+        candidate_id = str(json["ignav_id"])
+        cabin, amount = self.candidates[candidate_id]
+        return _Response(
+            _ignav_booking_payload(
+                self.booking_url,
+                cabin=cabin,
+                amount=amount,
+            )
+        )
 
 
 class _NoCallClient:
@@ -225,6 +358,7 @@ def _searchapi_search_payload(
     params: dict[str, Any],
     *,
     include_candidate: bool,
+    candidate_count: int = 1,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "search_metadata": _metadata(cabin),
@@ -237,10 +371,11 @@ def _searchapi_search_payload(
         payload["best_flights"] = [
             {
                 "type": "One way",
-                "price": 512.34,
-                "booking_token": "bookingtoken0001",
+                "price": 512.34 + index,
+                "booking_token": f"bookingtoken{index + 1:04d}",
                 "flights": [_searchapi_flight(cabin)],
             }
+            for index in range(candidate_count)
         ]
     return payload
 
@@ -296,22 +431,32 @@ def _ignav_outbound() -> dict[str, Any]:
     }
 
 
-def _ignav_candidate() -> dict[str, Any]:
+def _ignav_candidate(
+    *,
+    ignav_id: str = "ignavcandidate01",
+    cabin: str = "economy",
+    amount: float = 510.0,
+) -> dict[str, Any]:
     return {
-        "ignav_id": "ignavcandidate01",
-        "cabin_class": "economy",
-        "price": {"amount": 510.0, "currency": "USD", "status": "verified"},
+        "ignav_id": ignav_id,
+        "cabin_class": cabin,
+        "price": {"amount": amount, "currency": "USD", "status": "verified"},
         "outbound": _ignav_outbound(),
         "bags": {"checked": 1},
     }
 
 
-def _ignav_booking_payload(booking_url: str) -> dict[str, Any]:
+def _ignav_booking_payload(
+    booking_url: str,
+    *,
+    cabin: str = "economy",
+    amount: float = 510.0,
+) -> dict[str, Any]:
     return {
         "itinerary": {
-            "cabin_class": "economy",
+            "cabin_class": cabin,
             "price": {
-                "amount": 510.0,
+                "amount": amount,
                 "currency": "USD",
                 "status": "verified",
             },
@@ -380,10 +525,99 @@ def test_searchapi_strictly_searches_four_one_way_cabins_and_verifies_booking(
         for url, params in client.calls
         if url == SEARCHAPI_SEARCH_URL and "booking_token" not in params
     ]
-    assert [call["travel_class"] for call in cabin_calls] == list(
+    assert sorted(call["travel_class"] for call in cabin_calls) == sorted(
         _TRAVEL_CLASSES.values()
     )
     assert all(call["flight_type"] == "one_way" for call in cabin_calls)
+
+
+def test_searchapi_runs_cabin_and_booking_requests_with_bounded_concurrency(
+    tmp_path: Path,
+) -> None:
+    client = _ConcurrentSearchApiClient()
+    provider = SearchApiFlightOfferProvider(
+        "searchapi-test-key",
+        usage_path=tmp_path / "usage-concurrent.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.search_calls_used == 4
+    assert result.pricing_calls_used == 4
+    assert result.verified_candidate_count == 4
+    assert len(result.offers) == 4
+    assert client.search_barrier.broken is False
+    assert client.booking_barrier.broken is False
+
+
+def test_searchapi_reserves_exactly_one_bounded_booking_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _SearchApiClient(
+        candidate_cabins=set(_TRAVEL_CLASSES.values()),
+        candidates_per_cabin=3,
+    )
+    provider = SearchApiFlightOfferProvider(
+        "searchapi-test-key",
+        usage_path=tmp_path / "usage-batches.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+    requested_reservations: list[int] = []
+    original_reserve = provider._ledger.reserve
+
+    def recording_reserve(
+        provider_code: str,
+        calls: int,
+        *,
+        hard_limit: int,
+        require_all: bool = False,
+    ) -> int:
+        requested_reservations.append(calls)
+        return original_reserve(
+            provider_code,
+            calls,
+            hard_limit=hard_limit,
+            require_all=require_all,
+        )
+
+    monkeypatch.setattr(provider._ledger, "reserve", recording_reserve)
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.eligible_candidate_count == 12
+    assert result.pricing_calls_used == 6
+    assert result.quota_skipped_candidate_count == 6
+    assert result.coverage_status == "quota_limited"
+    assert result.quota_limit == "provider_specific"
+    assert requested_reservations == [4, 6]
+
+
+def test_searchapi_partial_rejections_do_not_claim_complete_no_results(
+    tmp_path: Path,
+) -> None:
+    provider = SearchApiFlightOfferProvider(
+        "searchapi-test-key",
+        usage_path=tmp_path / "usage-rejected.sqlite3",
+        client=_RejectingBoundedSearchApiClient(),
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "no_results"
+    assert result.offers == ()
+    assert result.eligible_candidate_count == 12
+    assert result.verification_attempted_count == 6
+    assert result.strictly_rejected_candidate_count == 6
+    assert result.quota_skipped_candidate_count == 6
+    assert result.coverage_status == "quota_limited"
+    assert result.quota_limit == "provider_specific"
 
 
 @pytest.mark.parametrize(
@@ -642,6 +876,60 @@ def test_ignav_release_still_requires_a_verified_public_https_booking_link(
         assert result.strictly_rejected_candidate_count == 1
 
 
+def test_ignav_verifies_one_concurrent_batch_and_reports_remaining_candidates(
+    tmp_path: Path,
+) -> None:
+    client = _BoundedConcurrentIgnavClient()
+    provider = IgnavQuarantineFlightOfferProvider(
+        "ignav-test-key",
+        usage_path=tmp_path / "ignav-bounded.sqlite3",
+        release_verified=True,
+        free_account_attested=True,
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.search_calls_used == 4
+    assert result.eligible_candidate_count == 12
+    assert result.verification_attempted_count == 6
+    assert result.pricing_calls_used == 6
+    assert result.quota_skipped_candidate_count == 6
+    assert result.coverage_status == "quota_limited"
+    assert result.quota_limit == "provider_specific"
+    assert provider._ledger.snapshot(provider.ledger_provider_code) == 10
+    assert sum(url == IGNAV_ONE_WAY_URL for url, _ in client.calls) == 4
+    assert sum(url == IGNAV_BOOKING_LINKS_URL for url, _ in client.calls) == 6
+
+
+def test_ignav_partial_rejections_do_not_claim_complete_no_results(
+    tmp_path: Path,
+) -> None:
+    provider = IgnavQuarantineFlightOfferProvider(
+        "ignav-test-key",
+        usage_path=tmp_path / "ignav-rejected.sqlite3",
+        release_verified=True,
+        free_account_attested=True,
+        client=_BoundedConcurrentIgnavClient(
+            booking_url="http://www.aircanada.com/booking/test"
+        ),
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "no_results"
+    assert result.offers == ()
+    assert result.eligible_candidate_count == 12
+    assert result.verification_attempted_count == 6
+    assert result.strictly_rejected_candidate_count == 6
+    assert result.quota_skipped_candidate_count == 6
+    assert result.coverage_status == "quota_limited"
+    assert result.quota_limit == "provider_specific"
+
+
 class _FallbackStub:
     configured = True
     environment = "production"
@@ -653,6 +941,23 @@ class _FallbackStub:
 
     def search(self, *_args: Any, **_kwargs: Any) -> FlightOfferSearchResult:
         self.log.append(self.name)
+        return self.result
+
+
+class _BarrierFallbackStub(_FallbackStub):
+    def __init__(
+        self,
+        name: str,
+        result: FlightOfferSearchResult,
+        log: list[str],
+        barrier: Barrier,
+    ) -> None:
+        super().__init__(name, result, log)
+        self.barrier = barrier
+
+    def search(self, *_args: Any, **_kwargs: Any) -> FlightOfferSearchResult:
+        self.log.append(self.name)
+        self.barrier.wait()
         return self.result
 
 
@@ -764,7 +1069,33 @@ def test_fallback_queries_every_strict_provider_and_aggregates_confirmed_runs() 
         SERPAPI_PROVIDER_CODE,
         SEARCHAPI_PROVIDER_CODE,
     }
-    assert call_log == ["serpapi", "searchapi"]
+    assert sorted(call_log) == ["searchapi", "serpapi"]
+
+
+def test_fallback_runs_strict_providers_concurrently() -> None:
+    call_log: list[str] = []
+    barrier = Barrier(2, timeout=2)
+    provider = FallbackFlightOfferProvider(
+        (
+            _BarrierFallbackStub("serpapi", _offer_result(), call_log, barrier),
+            _BarrierFallbackStub(
+                "searchapi",
+                _offer_result(
+                    provider_code=SEARCHAPI_PROVIDER_CODE,
+                    provider_name=SEARCHAPI_PROVIDER_NAME,
+                ),
+                call_log,
+                barrier,
+            ),
+        )
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert len(result.provider_runs) == 2
+    assert barrier.broken is False
+    assert sorted(call_log) == ["searchapi", "serpapi"]
 
 
 def test_fallback_isolates_unexpected_later_provider_exception() -> None:
@@ -787,7 +1118,7 @@ def test_fallback_isolates_unexpected_later_provider_exception() -> None:
         "UnexpectedProviderError"
     )
     assert "sensitive provider detail" not in repr(result)
-    assert call_log == ["serpapi", "raising-searchapi"]
+    assert sorted(call_log) == ["raising-searchapi", "serpapi"]
 
 
 def _complete_no_results(
@@ -839,7 +1170,7 @@ def test_fallback_continues_after_complete_no_results_to_expand_coverage() -> No
         "no_results",
         "confirmed_offers",
     ]
-    assert call_log == ["serpapi", "searchapi"]
+    assert sorted(call_log) == ["searchapi", "serpapi"]
 
 
 def test_fallback_single_source_result_remains_backward_compatible() -> None:
@@ -956,6 +1287,56 @@ def test_aggregate_distinguishes_provider_failure_from_complete_no_results() -> 
         "no_results",
         "provider_error",
     ]
+
+
+def test_aggregate_keeps_bounded_empty_runs_as_coverage_limited_no_results() -> None:
+    call_log: list[str] = []
+
+    def bounded_empty(provider_code: str, provider_name: str) -> FlightOfferSearchResult:
+        return FlightOfferSearchResult(
+            offers=(),
+            status="no_results",
+            observed_at=NOW,
+            environment="production",
+            searched_cabins=("economy", "premium_economy", "business", "first"),
+            calls_used=10,
+            cache_hit=False,
+            search_calls_used=4,
+            pricing_calls_used=6,
+            eligible_candidate_count=12,
+            verification_attempted_count=6,
+            strictly_rejected_candidate_count=6,
+            quota_skipped_candidate_count=6,
+            coverage_status="quota_limited",
+            quota_limit="provider_specific",
+            provider_code=provider_code,
+            provider_name=provider_name,
+        )
+
+    result = FallbackFlightOfferProvider(
+        (
+            _FallbackStub(
+                "serpapi",
+                bounded_empty(SERPAPI_PROVIDER_CODE, SERPAPI_PROVIDER_NAME),
+                call_log,
+            ),
+            _FallbackStub(
+                "searchapi",
+                bounded_empty(SEARCHAPI_PROVIDER_CODE, SEARCHAPI_PROVIDER_NAME),
+                call_log,
+            ),
+        )
+    ).search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "no_results"
+    assert result.offers == ()
+    assert result.eligible_candidate_count == 24
+    assert result.verification_attempted_count == 12
+    assert result.strictly_rejected_candidate_count == 12
+    assert result.quota_skipped_candidate_count == 12
+    assert result.coverage_status == "quota_limited"
+    assert result.quota_limit == "provider_specific"
+    assert [run.status for run in result.provider_runs] == ["no_results", "no_results"]
 
 
 def test_aggregate_marks_confirmed_plus_budget_exhausted_source_quota_limited() -> None:

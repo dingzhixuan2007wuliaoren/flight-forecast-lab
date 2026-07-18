@@ -997,6 +997,55 @@ def test_empty_provider_outcomes_remain_distinct_across_service_contract(
     assert len(comparison.fare_search_metadata.diagnostics) == len(diagnostic)
 
 
+def test_bounded_empty_subset_is_reported_as_coverage_limited(
+    trained_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    generated_at = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    fare_result = FlightOfferSearchResult(
+        offers=(),
+        status="no_results",
+        observed_at=generated_at,
+        environment="production",
+        searched_cabins=("economy", "premium_economy", "business", "first"),
+        calls_used=10,
+        cache_hit=False,
+        search_calls_used=4,
+        pricing_calls_used=6,
+        search_monthly_limit=250,
+        search_monthly_used=10,
+        eligible_candidate_count=8,
+        verification_attempted_count=6,
+        strictly_rejected_candidate_count=6,
+        quota_skipped_candidate_count=2,
+        coverage_status="quota_limited",
+        quota_limit="provider_specific",
+    )
+    service = PredictionService(
+        trained_model_dir,
+        context_provider=ContextProvider(),
+        schedule_provider=_StaticScheduleProvider(ScheduleSearchResult((), frozenset())),  # type: ignore[arg-type]
+        flight_offer_provider=_StaticFareProvider(fare_result),
+        now_provider=lambda: generated_at,
+    )
+
+    comparison = service.compare(
+        ComparisonRequest(
+            origin="YYZ",
+            destination="LHR",
+            departure_date=date(2026, 7, 22),
+        )
+    )
+
+    assert comparison.offers == []
+    assert comparison.result_status == "fare_provider_coverage_limited"
+    assert comparison.fare_search_metadata is not None
+    assert comparison.fare_search_metadata.status == "no_results"
+    assert comparison.fare_search_metadata.coverage_status == "quota_limited"
+    assert "leaving 2 unverified" in comparison.fare_search_metadata.notice.en
+
+
 def test_departure_date_rejects_past_and_more_than_370_days(
     trained_model_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

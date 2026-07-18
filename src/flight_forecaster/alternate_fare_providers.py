@@ -18,6 +18,7 @@ import json
 import re
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -77,6 +78,7 @@ IGNAV_ONE_WAY_URL = "https://ignav.com/api/fares/one-way"
 IGNAV_BOOKING_LINKS_URL = "https://ignav.com/api/fares/booking-links"
 IGNAV_FREE_CALL_LIMIT = 1_000
 IGNAV_MAX_ITINERARIES_PER_CABIN = 1_000
+MAX_ALTERNATE_BOOKING_WORKERS = 6
 
 _CABINS: tuple[Cabin, ...] = (
     "economy",
@@ -355,6 +357,7 @@ class _Diagnostics:
         self.ledger = ledger
         self.now_provider = now_provider
         self.items: list[ProviderDiagnostic] = []
+        self._lock = threading.Lock()
 
     def record(
         self,
@@ -385,9 +388,10 @@ class _Diagnostics:
             exception_type=safe_type,
             search_id=safe_id,
         )
-        self.ledger.record(self.provider_code, diagnostic)
-        if len(self.items) < 10:
-            self.items.append(diagnostic)
+        with self._lock:
+            self.ledger.record(self.provider_code, diagnostic)
+            if len(self.items) < 10:
+                self.items.append(diagnostic)
 
     def snapshot(self) -> tuple[ProviderDiagnostic, ...]:
         return tuple(self.items)
@@ -938,7 +942,12 @@ class SearchApiFlightOfferProvider(_AdapterBase):
             )
         hourly_capacity = account_quota.hourly_remaining
         capacity = min(lifetime_capacity, hourly_capacity)
-        hard_limit = local_used + capacity
+        provider_booking_capacity = max(0, capacity - len(_CABINS))
+        comparison_capacity = min(
+            capacity,
+            len(_CABINS) + MAX_ALTERNATE_BOOKING_WORKERS,
+        )
+        hard_limit = local_used + comparison_capacity
         limiting_quota = "hourly" if hourly_capacity < lifetime_capacity else "lifetime"
         search_reservation = self._ledger.reserve(
             self.ledger_provider_code,
@@ -955,27 +964,36 @@ class SearchApiFlightOfferProvider(_AdapterBase):
             )
 
         payloads: dict[Cabin, dict[str, Any]] = {}
-        searched_cabins: list[Cabin] = []
+        searched_cabins: list[Cabin] = list(_CABINS)
         failed_cabin_statuses: list[SearchStatus] = []
-        for cabin in _CABINS:
-            searched_cabins.append(cabin)
-            try:
-                payloads[cabin] = self._search_cabin(
+        with ThreadPoolExecutor(
+            max_workers=len(_CABINS),
+            thread_name_prefix="searchapi-search",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._search_cabin,
                     origin,
                     destination,
                     departure_date,
                     cabin,
                     diagnostics,
-                )
-            except _AdapterError as exc:
-                failed_cabin_statuses.append(exc.status)
-            except Exception:
-                failed_cabin_statuses.append("provider_unavailable")
-                diagnostics.record(
-                    stage="cabin_search",
-                    http_status=None,
-                    exception_type="PayloadError",
-                )
+                ): cabin
+                for cabin in _CABINS
+            }
+            for future in as_completed(futures):
+                cabin = futures[future]
+                try:
+                    payloads[cabin] = future.result()
+                except _AdapterError as exc:
+                    failed_cabin_statuses.append(exc.status)
+                except Exception:
+                    failed_cabin_statuses.append("provider_unavailable")
+                    diagnostics.record(
+                        stage="cabin_search",
+                        http_status=None,
+                        exception_type="PayloadError",
+                    )
 
         candidates = _select_searchapi_candidates(
             payloads,
@@ -1000,54 +1018,69 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 coverage_status=("provider_incomplete" if failed_count else "complete"),
             )
 
-        pricing_reservation = self._ledger.reserve(
-            self.ledger_provider_code,
-            len(candidates),
-            hard_limit=hard_limit,
-        )
-        attempted_candidates = candidates[:pricing_reservation]
+        # Verify one bounded batch only.  Candidates outside this batch remain
+        # explicitly quota-limited; a comparison never drains the provider by
+        # walking subsequent batches.
         confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
         provider_failures = 0
         strict_rejections = 0
-        for position, candidate in enumerate(attempted_candidates):
-            try:
-                payload, received_at, http_status = self._booking_options(
-                    candidate,
-                    origin,
-                    destination,
-                    departure_date,
-                    diagnostics,
-                )
-                offer = _parse_searchapi_booking_confirmation(
-                    payload,
-                    candidate,
-                    origin,
-                    destination,
-                    departure_date,
-                    received_at,
-                )
-            except _AdapterError:
-                provider_failures += 1
-                continue
-            except Exception:
-                provider_failures += 1
-                diagnostics.record(
-                    stage="validation",
-                    http_status=None,
-                    exception_type="PayloadError",
-                )
-                continue
-            if offer is None:
-                strict_rejections += 1
-                diagnostics.record(
-                    stage="validation",
-                    http_status=http_status,
-                    exception_type="StrictCandidateRejected",
-                    search_id=_searchapi_payload_id(payload),
-                    observed_at=received_at,
-                )
-            else:
-                confirmed_by_position[position] = offer
+        requested = min(len(candidates), MAX_ALTERNATE_BOOKING_WORKERS)
+        reserved = self._ledger.reserve(
+            self.ledger_provider_code,
+            requested,
+            hard_limit=hard_limit,
+        )
+        attempted_candidates = candidates[:reserved]
+        if attempted_candidates:
+            with ThreadPoolExecutor(
+                max_workers=len(attempted_candidates),
+                thread_name_prefix="searchapi-booking",
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        self._booking_options,
+                        candidate,
+                        origin,
+                        destination,
+                        departure_date,
+                        diagnostics,
+                    ): (position, candidate)
+                    for position, candidate in enumerate(attempted_candidates)
+                }
+                for future in as_completed(futures):
+                    position, candidate = futures[future]
+                    try:
+                        payload, received_at, http_status = future.result()
+                        offer = _parse_searchapi_booking_confirmation(
+                            payload,
+                            candidate,
+                            origin,
+                            destination,
+                            departure_date,
+                            received_at,
+                        )
+                    except _AdapterError:
+                        provider_failures += 1
+                        continue
+                    except Exception:
+                        provider_failures += 1
+                        diagnostics.record(
+                            stage="validation",
+                            http_status=None,
+                            exception_type="PayloadError",
+                        )
+                        continue
+                    if offer is None:
+                        strict_rejections += 1
+                        diagnostics.record(
+                            stage="validation",
+                            http_status=http_status,
+                            exception_type="StrictCandidateRejected",
+                            search_id=_searchapi_payload_id(payload),
+                            observed_at=received_at,
+                        )
+                    else:
+                        confirmed_by_position[position] = offer
 
         verified_count = len(confirmed_by_position)
         quota_skipped = len(candidates) - len(attempted_candidates)
@@ -1060,6 +1093,16 @@ class SearchApiFlightOfferProvider(_AdapterBase):
         offers, deduplicated = _lowest_verified_offers(
             confirmed_by_position,
             len(attempted_candidates),
+        )
+        quota_limit = (
+            (
+                "provider_specific"
+                if provider_booking_capacity > MAX_ALTERNATE_BOOKING_WORKERS
+                and len(attempted_candidates) >= MAX_ALTERNATE_BOOKING_WORKERS
+                else limiting_quota
+            )
+            if quota_skipped
+            else None
         )
         common: dict[str, Any] = {
             "searched_cabins": tuple(searched_cabins),
@@ -1075,7 +1118,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
             "quota_skipped_candidate_count": quota_skipped,
             "deduplicated_verified_count": deduplicated,
             "coverage_status": coverage_status,
-            "quota_limit": (limiting_quota if quota_skipped else None),
+            "quota_limit": quota_limit,
         }
         if offers:
             return self._result(
@@ -1084,7 +1127,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 offers=offers,
                 **common,
             )
-        if quota_skipped:
+        if quota_skipped and quota_limit != "provider_specific":
             status: SearchStatus = (
                 "rate_limited" if limiting_quota == "hourly" else "budget_exhausted"
             )
@@ -1812,31 +1855,35 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             )
 
         payloads: dict[Cabin, dict[str, Any]] = {}
-        try:
-            for cabin in _CABINS:
-                payloads[cabin] = self._search_cabin(
+        failed_cabin_statuses: list[SearchStatus] = []
+        with ThreadPoolExecutor(
+            max_workers=len(_CABINS),
+            thread_name_prefix="ignav-search",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._search_cabin,
                     origin,
                     destination,
                     departure_date,
                     cabin,
                     diagnostics,
-                )
-        except _AdapterError as exc:
-            return self._result(
-                exc.status,
-                observed_at,
-                searched_cabins=tuple(payloads),
-                search_calls_used=len(payloads) + 1,
-                diagnostics=diagnostics.snapshot(),
-            )
-        except Exception:
-            return self._result(
-                "provider_unavailable",
-                observed_at,
-                searched_cabins=tuple(payloads),
-                search_calls_used=len(payloads) + 1,
-                diagnostics=diagnostics.snapshot(),
-            )
+                ): cabin
+                for cabin in _CABINS
+            }
+            for future in as_completed(futures):
+                cabin = futures[future]
+                try:
+                    payloads[cabin] = future.result()
+                except _AdapterError as exc:
+                    failed_cabin_statuses.append(exc.status)
+                except Exception:
+                    failed_cabin_statuses.append("provider_unavailable")
+                    diagnostics.record(
+                        stage="cabin_search",
+                        http_status=None,
+                        exception_type="PayloadError",
+                    )
 
         candidates, invalid_rows = _select_ignav_candidates(
             payloads,
@@ -1856,62 +1903,85 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
                 diagnostics=diagnostics.snapshot(),
+                search_failed_cabin_count=len(failed_cabin_statuses),
+                coverage_status="provider_incomplete",
             )
         if not candidates:
+            failed_count = len(failed_cabin_statuses)
             return self._result(
-                "no_results",
+                (
+                    _searchapi_failed_cabin_status(failed_cabin_statuses)
+                    if failed_count
+                    else "no_results"
+                ),
                 observed_at,
                 searched_cabins=_CABINS,
                 search_calls_used=len(_CABINS),
                 diagnostics=diagnostics.snapshot(),
-                coverage_status="complete",
+                search_failed_cabin_count=failed_count,
+                coverage_status=("provider_incomplete" if failed_count else "complete"),
             )
 
+        requested_candidates = min(
+            len(candidates),
+            MAX_ALTERNATE_BOOKING_WORKERS,
+        )
         pricing_reservation = self._ledger.reserve(
             self.ledger_provider_code,
-            len(candidates),
+            requested_candidates,
             hard_limit=self.free_call_limit,
         )
         attempted_candidates = candidates[:pricing_reservation]
         confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
         provider_failures = 0
         strict_rejections = 0
-        for position, candidate in enumerate(attempted_candidates):
-            try:
-                payload, received_at, http_status = self._booking_links(
-                    candidate,
-                    diagnostics,
-                )
-                offer = _parse_ignav_booking_confirmation(
-                    payload,
-                    candidate,
-                    origin,
-                    destination,
-                    departure_date,
-                    received_at,
-                )
-            except _AdapterError:
-                provider_failures += 1
-                continue
-            except Exception:
-                provider_failures += 1
-                diagnostics.record(
-                    stage="validation",
-                    http_status=None,
-                    exception_type="PayloadError",
-                )
-                continue
-            if offer is None:
-                strict_rejections += 1
-                diagnostics.record(
-                    stage="validation",
-                    http_status=http_status,
-                    exception_type="StrictCandidateRejected",
-                    search_id=_ignav_payload_id(payload),
-                    observed_at=received_at,
-                )
-            else:
-                confirmed_by_position[position] = offer
+        if attempted_candidates:
+            with ThreadPoolExecutor(
+                max_workers=len(attempted_candidates),
+                thread_name_prefix="ignav-booking",
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        self._booking_links,
+                        candidate,
+                        diagnostics,
+                    ): (position, candidate)
+                    for position, candidate in enumerate(attempted_candidates)
+                }
+                for future in as_completed(futures):
+                    position, candidate = futures[future]
+                    try:
+                        payload, received_at, http_status = future.result()
+                        offer = _parse_ignav_booking_confirmation(
+                            payload,
+                            candidate,
+                            origin,
+                            destination,
+                            departure_date,
+                            received_at,
+                        )
+                    except _AdapterError:
+                        provider_failures += 1
+                        continue
+                    except Exception:
+                        provider_failures += 1
+                        diagnostics.record(
+                            stage="validation",
+                            http_status=None,
+                            exception_type="PayloadError",
+                        )
+                        continue
+                    if offer is None:
+                        strict_rejections += 1
+                        diagnostics.record(
+                            stage="validation",
+                            http_status=http_status,
+                            exception_type="StrictCandidateRejected",
+                            search_id=_ignav_payload_id(payload),
+                            observed_at=received_at,
+                        )
+                    else:
+                        confirmed_by_position[position] = offer
 
         verified_count = len(confirmed_by_position)
         quota_skipped = len(candidates) - len(attempted_candidates)
@@ -1919,10 +1989,21 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             evaluated=True,
             provider_failed=provider_failures,
             quota_skipped=quota_skipped,
+            search_failed_cabins=len(failed_cabin_statuses),
         )
         offers, deduplicated = _lowest_verified_offers(
             confirmed_by_position,
             len(attempted_candidates),
+        )
+        quota_limit = (
+            (
+                "provider_specific"
+                if pricing_reservation == requested_candidates
+                and len(candidates) > requested_candidates
+                else "lifetime"
+            )
+            if quota_skipped
+            else None
         )
         common: dict[str, Any] = {
             "searched_cabins": _CABINS,
@@ -1934,10 +2015,11 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             "verified_candidate_count": verified_count,
             "strictly_rejected_candidate_count": strict_rejections,
             "provider_failed_candidate_count": provider_failures,
+            "search_failed_cabin_count": len(failed_cabin_statuses),
             "quota_skipped_candidate_count": quota_skipped,
             "deduplicated_verified_count": deduplicated,
             "coverage_status": coverage_status,
-            "quota_limit": ("lifetime" if quota_skipped else None),
+            "quota_limit": quota_limit,
         }
         if offers:
             return self._result(
@@ -1946,7 +2028,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 offers=offers,
                 **common,
             )
-        if quota_skipped:
+        if quota_skipped and quota_limit != "provider_specific":
             status: SearchStatus = "budget_exhausted"
         elif provider_failures:
             status = "provider_error"
@@ -2050,10 +2132,9 @@ class FallbackFlightOfferProvider:
         fetched_at: datetime,
         force_refresh: bool = False,
     ) -> FlightOfferSearchResult:
-        results: list[FlightOfferSearchResult] = []
-        for provider in self.providers:
+        def run_provider(provider: Any) -> FlightOfferSearchResult:
             try:
-                result = provider.search(
+                return provider.search(
                     origin,
                     destination,
                     departure_date,
@@ -2061,8 +2142,23 @@ class FallbackFlightOfferProvider:
                     force_refresh=force_refresh,
                 )
             except Exception:
-                result = _unexpected_provider_result(provider, fetched_at)
-            results.append(result)
+                return _unexpected_provider_result(provider, fetched_at)
+
+        results_by_position: dict[int, FlightOfferSearchResult] = {}
+        with ThreadPoolExecutor(
+            max_workers=len(self.providers),
+            thread_name_prefix="strict-provider",
+        ) as pool:
+            futures = {
+                pool.submit(run_provider, provider): position
+                for position, provider in enumerate(self.providers)
+            }
+            for future in as_completed(futures):
+                results_by_position[futures[future]] = future.result()
+        results = [
+            results_by_position[position]
+            for position in range(len(self.providers))
+        ]
 
         attempted = [
             result
@@ -2166,15 +2262,23 @@ def _aggregate_strict_provider_results(
             "provider_error",
         )
         if status == "no_results":
-            status = (
-                "budget_exhausted"
-                if any(
-                    result.coverage_status
-                    in {"quota_limited", "quota_and_provider_incomplete"}
-                    for result in results
-                )
-                else "provider_error"
-            )
+            quota_limited_results = [
+                result
+                for result in results
+                if result.coverage_status
+                in {"quota_limited", "quota_and_provider_incomplete"}
+            ]
+            if quota_limited_results and all(
+                result.quota_limit == "provider_specific"
+                for result in quota_limited_results
+            ):
+                # The per-comparison candidate cap is a coverage boundary, not
+                # evidence that a provider account has exhausted its free quota.
+                # Keep no_results so the service can expose the dedicated
+                # fare_provider_coverage_limited state from the aggregate counts.
+                status = "no_results"
+            else:
+                status = "budget_exhausted" if quota_limited_results else "provider_error"
 
     verified_candidate_count = sum(
         result.verified_candidate_count for result in results

@@ -397,6 +397,45 @@ def test_dashboard_renders_bilingual_provider_status_and_searchapi_attribution()
         assert fragment in dashboard
 
 
+def test_dashboard_bounds_comparison_wait_and_preserves_request_errors() -> None:
+    dashboard = TestClient(app).get("/").text
+
+    for fragment in (
+        "var activeComparison = null;",
+        "var comparisonTimeoutMs = 150000;",
+        "var slowComparisonThresholdMs = 30000;",
+        "state.elapsedTimer = window.setInterval(updateLoadingMessage, 1000);",
+        "state.controller.abort();",
+        "if (activeComparison) {",
+        "window.clearTimeout(state.timeoutTimer)",
+        "window.clearInterval(state.elapsedTimer)",
+        "state.controller = null;",
+        "仍在验证报价供应商返回的航班与购票选项",
+        "Still verifying provider flights and booking options",
+        "比较已超过 150 秒",
+        "The comparison exceeded 150 seconds",
+    ):
+        assert fragment in dashboard
+    assert 'setMessage(loading ? "loading"' not in dashboard
+    assert "360000" not in dashboard
+
+
+def test_dashboard_distinguishes_quota_limited_candidate_coverage() -> None:
+    dashboard = TestClient(app).get("/").text
+
+    for fragment in (
+        (
+            'fare_provider_coverage_limited: ["fareProviderCoverageLimitedTitle", '
+            '"fareProviderCoverageLimitedBody"]'
+        ),
+        "本次已找到候选，但每个严格来源最多只验证 6 个",
+        "不能据此断言其余候选不可购买",
+        "Candidates were found, but each strict source verifies at most six per comparison",
+        "this does not prove the remaining candidates are unbookable",
+    ):
+        assert fragment in dashboard
+
+
 def test_offer_detail_frontend_accepts_only_consistent_strict_provider_mappings() -> None:
     detail = TestClient(app).get("/details/offer").text
 

@@ -107,8 +107,8 @@ Every external call reserves free allowance before network I/O. The provider sto
 
 SerpApi 免费计划目前包含每个 provider 结算周期 250 次成功搜索及每小时 50 次请求；周期边界
 以账户返回的 `plan_renewal_date` 为准，不按自然月切换。初始四舱搜索与 `booking_token` 后续查询
-共享这项额度。系统解析四个舱位搜索实际返回的全部合格候选，并在账户和本地安全账本的剩余额度内
-逐个验证；同一航程和舱位有多个已验证销售方时只保留最低价。`deep_search=true` 与
+共享这项额度。系统解析四个舱位搜索实际返回的合格候选，但 SerpApi 每次比较最多二次验证 6 个；
+超出的候选标为 `partial` / `quota_limited`，同一航程和舱位有多个已验证销售方时只保留最低价。`deep_search=true` 与
 `show_hidden=true` 会扩大 Google Flights 可见候选，但仍不能保证所有航司、航班、舱位、销售方
 或私有票价都被返回。额度不足时，已成功验证的结果仍可显示，未验证候选会被跳过，并通过
 `fare_search_metadata.coverage_status`、计数字段、`quota_limit` 和中英双语提示明确标记截断；
@@ -123,7 +123,7 @@ $env:SEARCHAPI_LIFETIME_LIMIT="100"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
-`auto` 会运行所有已配置且获准参与的严格源，而不是在第一个成功来源后停止。只有一个来源实际运行时保留该来源自己的 provider code；两个或更多来源实际运行时，顶层 `fare_search_metadata.provider_code=strict_fare_aggregate`，`provider_runs` 保存每个来源的独立状态、计数、额度与诊断。聚合只合并各来源已经独立通过二次购票验证的报价，并按“完整航段序列 + 舱位”跨源去重，保留最低最终确认价。任一来源失败、处理中或额度受限都会保留在逐源状态和聚合覆盖状态中；只有全部已完成来源都没有可验证报价时才返回结构化空结果。SearchAPI 的本地硬墙是安装生命周期 100 次，不按月重置，也不应配置成月额度。每个来源都会消耗自己的免费额度，因此增加来源可以缓解单源覆盖不足，但不能把多个免费计划变成无限额度。
+`auto` 会并发运行所有已配置且获准参与的严格源，而不是在第一个成功来源后停止。只有一个来源实际运行时保留该来源自己的 provider code；两个或更多来源实际运行时，顶层 `fare_search_metadata.provider_code=strict_fare_aggregate`，`provider_runs` 保存每个来源的独立状态、计数、额度与诊断。SerpApi、SearchAPI 和显式发布后的 Ignav 各自完成四舱搜索后，每个来源、每次比较最多二次验证六个候选；候选顺序先覆盖每个有结果的舱位，再按供应商搜索价格处理。未验证部分明确标记为 `partial` / `quota_limited`，不伪装成“没有航班”。SearchAPI 的四舱搜索并发执行，而且只为该有界验证批次预留额度，因此中断不会再一次占满全部剩余额度。聚合只合并各来源已经独立通过二次购票验证的报价，并按“完整航段序列 + 舱位”跨源去重，保留最低最终确认价。任一来源失败、处理中或额度受限都会保留在逐源状态和聚合覆盖状态中；只有全部已完成来源都没有可验证报价时才返回结构化空结果。SearchAPI 的本地硬墙是安装生命周期 100 次，不按月重置，也不应配置成月额度。每个来源都会消耗自己的免费额度，因此增加来源可以缓解单源覆盖不足，但不能把多个免费计划变成无限额度，也不保证全球全量航班。前端会显示比较耗时，30 秒后说明仍在验证供应商，并在 150 秒停止浏览器等待且保留可见错误；重复点击不会创建第二个并行请求。
 
 若 SerpApi 返回 `Processing` 或 `Queued`，后端会按 0.5、1、1.5、2 秒的有界退避读取固定的
 Search Archive 地址；它只轮询同一个经过白名单校验的 Search ID，不跟随响应中的任意 URL，
@@ -214,8 +214,9 @@ sources, metadata uses `strict_fare_aggregate` and preserves each source in `pro
 schedules/routes, route-level hints, catalogue-expanded cabins, and
 model-only flights never enter `offers` or rankings. The verified provider-result fare remains separate
 from the synthetic model estimate and forecast curve, and it is not a final-checkout guarantee.
-Each comparison processes every eligible candidate actually returned by the four cabin searches and
-attempts booking-token verification within the remaining free quota and available provider responses.
+For each comparison, SerpApi, SearchAPI, and released Ignav each attempt booking-option verification
+for at most six eligible candidates returned by their four cabin searches. Excess candidates are
+reported as `partial` / `quota_limited`, rather than as no flights.
 The response keeps only the lowest verified price across sellers and sources for the same complete
 segment sequence and cabin. Coverage
 counters and `coverage_status` distinguish complete candidate processing from quota or provider
