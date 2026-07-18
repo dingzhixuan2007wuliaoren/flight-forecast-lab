@@ -67,6 +67,10 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert "coverageCacheSnapshot" in dashboard
     assert "150000" in offer_page
     assert "360000" not in offer_page
+    assert "minimumDaySpacing=96" in offer_page
+    assert "points.forEach(function(xPoint,pointIndex)" in offer_page
+    assert "Math.min(5,points.length)" not in offer_page
+    assert "overflow-x:auto" in offer_page
     for obsolete_claim in (
         "最多 10 次",
         "at most 10 provider requests",
