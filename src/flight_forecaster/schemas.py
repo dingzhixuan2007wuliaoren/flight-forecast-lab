@@ -45,6 +45,8 @@ ScheduleSource = Literal[
     "airlabs_routes",
     "model_fallback",
     "serpapi_google_flights_booking",
+    "searchapi_google_flights_booking",
+    "ignav_verified_booking",
 ]
 DepartureTimeBasis = Literal[
     "origin_local_noon_model_reference",
@@ -312,6 +314,167 @@ class BilingualText(BaseModel):
     en: str
 
 
+ProviderRole = Literal["strict_fare", "strict_fare_candidate", "reference_only"]
+ProviderRuntimeStatus = Literal[
+    "not_configured",
+    "configured",
+    "quota_available",
+    "quota_exhausted",
+    "quarantined",
+    "reference_only",
+]
+ProviderQuotaStatus = Literal["unknown", "available", "exhausted", "not_applicable"]
+
+
+class RuntimeProviderStatusItem(BaseModel):
+    """Credential-safe provider state; never contains keys, tokens, or raw errors."""
+
+    code: str = Field(pattern=r"^[a-z0-9_]{2,64}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    role: ProviderRole
+    configured: bool
+    active: bool = False
+    status: ProviderRuntimeStatus
+    quota_status: ProviderQuotaStatus = "unknown"
+    quota_used: int | None = Field(default=None, ge=0)
+    quota_limit: int | None = Field(default=None, ge=1)
+    quota_unit: (
+        Literal[
+            "hour",
+            "billing_period",
+            "credits",
+            "provider_managed",
+            "billing_period_requests",
+            "lifetime_requests",
+            "monthly_credits",
+            "daily_credits",
+            "monthly_units",
+        ]
+        | None
+    ) = None
+    quota_cost_per_call: int | None = Field(default=None, ge=1)
+    can_supply_strict_offers: bool
+    notice: BilingualText
+
+    @model_validator(mode="after")
+    def validate_provider_policy(self) -> RuntimeProviderStatusItem:
+        if self.role == "reference_only":
+            if self.status != "reference_only" or self.can_supply_strict_offers:
+                raise ValueError("reference-only providers cannot supply strict offers")
+        if self.status == "quarantined" and self.can_supply_strict_offers:
+            raise ValueError("quarantined providers cannot supply strict offers")
+        if self.status == "quota_exhausted" and self.quota_status != "exhausted":
+            raise ValueError("quota-exhausted provider must report exhausted quota")
+        if self.quota_used is not None and self.quota_limit is not None:
+            if self.quota_used > self.quota_limit:
+                raise ValueError("provider quota usage cannot exceed its limit")
+        if (
+            self.quota_used is not None or self.quota_limit is not None
+        ) and self.quota_unit is None:
+            raise ValueError("provider quota counts require a quota unit")
+        if self.quota_cost_per_call is not None and self.quota_unit is None:
+            raise ValueError("provider quota cost requires a quota unit")
+        return self
+
+
+class RuntimeProviderStatusResponse(BaseModel):
+    generated_at: datetime
+    strict_policy: BilingualText
+    providers: list[RuntimeProviderStatusItem]
+
+    @model_validator(mode="after")
+    def validate_unique_providers(self) -> RuntimeProviderStatusResponse:
+        codes = [provider.code for provider in self.providers]
+        if len(codes) != len(set(codes)):
+            raise ValueError("provider status codes must be unique")
+        return self
+
+
+FareReferenceStatus = Literal[
+    "available",
+    "no_results",
+    "not_configured",
+    "quota_exhausted",
+    "authentication_failed",
+    "rate_limited",
+    "provider_error",
+    "provider_unavailable",
+]
+
+
+class FareCoverageReference(BaseModel):
+    """Aggregate listing coverage that is permanently excluded from strict offers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_code: Literal["scrape_do_google_flights_reference"] = (
+        "scrape_do_google_flights_reference"
+    )
+    provider_name: Literal["Scrape.do Google Flights"] = "Scrape.do Google Flights"
+    role: Literal["reference_only"] = "reference_only"
+    status: FareReferenceStatus
+    observed_at: datetime
+    query_cabin: Literal["economy"] = "economy"
+    currency: Literal["USD"] = "USD"
+    candidate_count: int = Field(default=0, ge=0, le=30)
+    direct_candidate_count: int = Field(default=0, ge=0, le=30)
+    lowest_price_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    price_level: Literal["low", "typical", "high"] | None = None
+    typical_price_low_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    typical_price_high_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    cache_hit: bool = False
+    credits_reserved: Literal[0, 10, 20] = 0
+    monthly_credits_used: int = Field(default=0, ge=0, le=1_000)
+    monthly_credit_limit: int = Field(default=1_000, ge=0, le=1_000)
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    exception_type: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$",
+    )
+    provider_reported_request_cost: int | None = Field(default=None, ge=0, le=10)
+    provider_reported_remaining_credits: int | None = Field(
+        default=None,
+        ge=0,
+        le=1_000,
+    )
+    can_supply_strict_offers: Literal[False] = False
+    notice: BilingualText
+
+    @model_validator(mode="after")
+    def validate_reference_boundary(self) -> FareCoverageReference:
+        _require_timezone(self.observed_at)
+        if self.direct_candidate_count > self.candidate_count:
+            raise ValueError("direct reference candidates cannot exceed all candidates")
+        if self.status == "available":
+            if self.candidate_count == 0 or self.lowest_price_usd is None:
+                raise ValueError("available fare reference requires candidates and a price")
+        elif (
+            any(
+                value is not None
+                for value in (
+                    self.lowest_price_usd,
+                    self.price_level,
+                    self.typical_price_low_usd,
+                    self.typical_price_high_usd,
+                )
+            )
+            or self.candidate_count
+            or self.direct_candidate_count
+        ):
+            raise ValueError("non-available fare reference cannot retain listing facts")
+        if (self.typical_price_low_usd is None) != (self.typical_price_high_usd is None):
+            raise ValueError("fare reference typical-price range must be complete")
+        if (
+            self.typical_price_low_usd is not None
+            and self.typical_price_high_usd is not None
+            and self.typical_price_high_usd < self.typical_price_low_usd
+        ):
+            raise ValueError("fare reference typical-price range is reversed")
+        if self.monthly_credits_used > self.monthly_credit_limit:
+            raise ValueError("fare reference usage cannot exceed its local free hard limit")
+        return self
+
+
 class ProviderMetadata(BaseModel):
     status: SignalStatus
     source: str
@@ -501,12 +664,16 @@ class ProviderOfferSegment(BaseModel):
 
 
 class LiveFare(BaseModel):
-    """A live Google Flights fare with a separately verified booking option."""
+    """A live provider fare with a separately verified booking option."""
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["booking_option_confirmed"] = "booking_option_confirmed"
-    provider_code: Literal["serpapi_google_flights"] = "serpapi_google_flights"
+    provider_code: Literal[
+        "serpapi_google_flights",
+        "searchapi_google_flights",
+        "ignav_verified_fares",
+    ] = "serpapi_google_flights"
     provider_name: str = Field(min_length=1, max_length=255)
     provider_offer_id: str = Field(min_length=1, max_length=512)
     environment: Literal["production"] = "production"
@@ -534,6 +701,13 @@ class LiveFare(BaseModel):
     @model_validator(mode="after")
     def validate_fare(self) -> LiveFare:
         _require_timezone(self.verified_at)
+        provider_names = {
+            "serpapi_google_flights": "SerpApi Google Flights",
+            "searchapi_google_flights": "SearchAPI.io Google Flights",
+            "ignav_verified_fares": "Ignav Verified Fares",
+        }
+        if self.provider_name != provider_names[self.provider_code]:
+            raise ValueError("live-fare provider code and name must match")
         if self.expires_at is not None:
             _require_timezone(self.expires_at)
             if self.expires_at <= self.verified_at:
@@ -588,7 +762,20 @@ class FareSearchMetadata(BaseModel):
         "provider_error",
         "provider_unavailable",
     ]
-    provider_code: Literal["serpapi_google_flights", "none"]
+    provider_code: Literal[
+        "serpapi_google_flights",
+        "searchapi_google_flights",
+        "ignav_quarantine",
+        "ignav_verified_fares",
+        "strict_fare_aggregate",
+        "none",
+    ]
+    provider_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+    )
+    provider_runs: list[FareSearchMetadata] = Field(default_factory=list, max_length=4)
     environment: Literal["production", "test", "disabled"]
     observed_at: datetime
     searched_cabins: list[Cabin] = Field(default_factory=list, max_length=4)
@@ -596,25 +783,51 @@ class FareSearchMetadata(BaseModel):
     search_call_count: int = Field(default=0, ge=0)
     pricing_call_count: int = Field(default=0, ge=0)
     cache_hit: bool = False
-    monthly_call_limit: int | None = Field(default=None, ge=0)
-    monthly_calls_used: int | None = Field(default=None, ge=0)
-    search_monthly_limit: int | None = Field(default=None, ge=0)
-    search_monthly_used: int | None = Field(default=None, ge=0)
-    pricing_monthly_limit: int | None = Field(default=None, ge=0)
-    pricing_monthly_used: int | None = Field(default=None, ge=0)
+    quota_unit: Literal["billing_period_requests", "lifetime_requests"] | None = None
+    monthly_call_limit: int | None = Field(
+        default=None,
+        ge=0,
+        description="Legacy field name; interpret with quota_unit.",
+    )
+    monthly_calls_used: int | None = Field(
+        default=None,
+        ge=0,
+        description="Legacy field name; interpret with quota_unit.",
+    )
+    search_monthly_limit: int | None = Field(
+        default=None,
+        ge=0,
+        description="Legacy field name; interpret with quota_unit.",
+    )
+    search_monthly_used: int | None = Field(
+        default=None,
+        ge=0,
+        description="Legacy field name; interpret with quota_unit.",
+    )
+    pricing_monthly_limit: int | None = Field(
+        default=None,
+        ge=0,
+        description="Legacy field name; interpret with quota_unit.",
+    )
+    pricing_monthly_used: int | None = Field(
+        default=None,
+        ge=0,
+        description="Legacy field name; interpret with quota_unit.",
+    )
     archive_poll_count: int = Field(default=0, ge=0)
     diagnostics: list[FareProviderDiagnostic] = Field(
         default_factory=list,
         max_length=10,
     )
-    coverage_scope: Literal["provider_returned_booking_token_candidates"] = (
-        "provider_returned_booking_token_candidates"
+    coverage_scope: Literal["provider_returned_booking_verification_candidates"] = (
+        "provider_returned_booking_verification_candidates"
     )
     eligible_candidate_count: int = Field(default=0, ge=0)
     verification_attempted_count: int = Field(default=0, ge=0)
     verified_candidate_count: int = Field(default=0, ge=0)
     strictly_rejected_candidate_count: int = Field(default=0, ge=0)
     provider_failed_candidate_count: int = Field(default=0, ge=0)
+    search_failed_cabin_count: int = Field(default=0, ge=0)
     quota_skipped_candidate_count: int = Field(default=0, ge=0)
     deduplicated_verified_count: int = Field(default=0, ge=0)
     coverage_status: Literal[
@@ -624,12 +837,31 @@ class FareSearchMetadata(BaseModel):
         "provider_incomplete",
         "quota_and_provider_incomplete",
     ] = "not_evaluated"
-    quota_limit: Literal["monthly", "hourly"] | None = None
+    quota_limit: Literal[
+        "monthly",
+        "hourly",
+        "lifetime",
+        "provider_specific",
+    ] | None = None
+    retry_quota_limited: bool = Field(default=False, strict=True)
     notice: BilingualText
 
     @model_validator(mode="after")
     def validate_metadata(self) -> FareSearchMetadata:
         _require_timezone(self.observed_at)
+        if self.provider_code == "strict_fare_aggregate":
+            if len(self.provider_runs) < 2:
+                raise ValueError("aggregate fare metadata requires at least two provider runs")
+            if any(run.provider_runs for run in self.provider_runs):
+                raise ValueError("aggregate provider runs cannot be nested")
+            run_codes = [run.provider_code for run in self.provider_runs]
+            if (
+                len(run_codes) != len(set(run_codes))
+                or any(code in {"none", "strict_fare_aggregate"} for code in run_codes)
+            ):
+                raise ValueError("aggregate provider runs must identify unique strict providers")
+        elif self.provider_runs:
+            raise ValueError("single-provider fare metadata cannot contain provider runs")
         if len(self.searched_cabins) != len(set(self.searched_cabins)):
             raise ValueError("searched cabins must be unique")
         if self.call_count != self.search_call_count + self.pricing_call_count:
@@ -642,13 +874,20 @@ class FareSearchMetadata(BaseModel):
             raise ValueError("verification attempts must equal all verification outcomes")
         if self.deduplicated_verified_count > self.verified_candidate_count:
             raise ValueError("deduplicated verified count cannot exceed verified candidates")
+        if self.retry_quota_limited and not (
+            self.provider_failed_candidate_count or self.search_failed_cabin_count
+        ):
+            raise ValueError("retry quota limitation requires a failed provider attempt")
         if self.coverage_status == "not_evaluated":
+            if self.retry_quota_limited:
+                raise ValueError("unevaluated candidate coverage cannot be retry-quota limited")
             if any(
                 (
                     self.verification_attempted_count,
                     self.verified_candidate_count,
                     self.strictly_rejected_candidate_count,
                     self.provider_failed_candidate_count,
+                    self.search_failed_cabin_count,
                     self.quota_skipped_candidate_count,
                     self.deduplicated_verified_count,
                 )
@@ -658,15 +897,47 @@ class FareSearchMetadata(BaseModel):
             self.verification_attempted_count + self.quota_skipped_candidate_count
         ):
             raise ValueError("eligible candidates must equal attempted plus quota-skipped")
+        provider_run_incomplete = bool(
+            self.provider_runs
+            and any(
+                run.status not in {"confirmed_offers", "no_results"}
+                or run.coverage_status
+                in {"provider_incomplete", "quota_and_provider_incomplete"}
+                for run in self.provider_runs
+            )
+        )
+        provider_run_quota_limited = bool(
+            self.provider_runs
+            and any(
+                run.status in {"rate_limited", "budget_exhausted"}
+                or run.coverage_status
+                in {"quota_limited", "quota_and_provider_incomplete"}
+                for run in self.provider_runs
+            )
+        )
+        quota_truncated = bool(
+            self.quota_skipped_candidate_count
+            or self.retry_quota_limited
+            or provider_run_quota_limited
+        )
         expected_coverage = (
             "quota_and_provider_incomplete"
-            if self.provider_failed_candidate_count and self.quota_skipped_candidate_count
+            if (
+                self.provider_failed_candidate_count
+                or self.search_failed_cabin_count
+                or provider_run_incomplete
+            )
+            and quota_truncated
             else (
                 "provider_incomplete"
-                if self.provider_failed_candidate_count
+                if (
+                    self.provider_failed_candidate_count
+                    or self.search_failed_cabin_count
+                    or provider_run_incomplete
+                )
                 else (
                     "quota_limited"
-                    if self.quota_skipped_candidate_count
+                    if quota_truncated
                     else (
                         "not_evaluated" if self.coverage_status == "not_evaluated" else "complete"
                     )
@@ -679,7 +950,11 @@ class FareSearchMetadata(BaseModel):
             "quota_limited",
             "quota_and_provider_incomplete",
         }
-        if quota_limited != (self.quota_limit is not None):
+        unevaluated_quota_wall = (
+            self.coverage_status == "not_evaluated"
+            and self.status in {"rate_limited", "budget_exhausted"}
+        )
+        if not unevaluated_quota_wall and quota_limited != (self.quota_limit is not None):
             raise ValueError("candidate quota limit must match quota-truncated coverage")
         if self.monthly_calls_used is not None and self.monthly_call_limit is None:
             raise ValueError("monthly usage requires a monthly call limit")
@@ -698,10 +973,21 @@ class FareSearchMetadata(BaseModel):
             if value is not None
         ]
         if len(individual_limits) > 1 or len(individual_usage) > 1:
-            raise ValueError("SerpApi must expose one shared monthly quota, not split quotas")
+            raise ValueError(
+                "a fare provider must expose one shared monthly quota (or lifetime quota), "
+                "not split quotas"
+            )
         if self.monthly_call_limit is not None:
-            if self.monthly_call_limit > 250:
-                raise ValueError("SerpApi local monthly hard limit cannot exceed 250")
+            maximum = {
+                "serpapi_google_flights": 250,
+                "searchapi_google_flights": 100,
+                "ignav_quarantine": 1_000,
+                "ignav_verified_fares": 1_000,
+                "strict_fare_aggregate": 0,
+                "none": 0,
+            }[self.provider_code]
+            if self.monthly_call_limit > maximum:
+                raise ValueError(f"local free-quota hard limit cannot exceed {maximum}")
             if not individual_limits or self.monthly_call_limit != individual_limits[0]:
                 raise ValueError("monthly limit must equal the single shared quota")
         elif individual_limits:
@@ -714,13 +1000,65 @@ class FareSearchMetadata(BaseModel):
         if self.status == "not_configured":
             if self.provider_code != "none" or self.environment != "disabled":
                 raise ValueError("an unconfigured provider must be disabled and use code none")
-        elif self.provider_code != "serpapi_google_flights":
-            raise ValueError("configured fare-search results must identify SerpApi Google Flights")
-        if self.status == "test_environment_rejected" and self.environment != "test":
-            raise ValueError("test-environment rejection requires environment test")
+        elif self.provider_code == "none":
+            raise ValueError("configured fare-search results must identify their provider")
+        provider_names = {
+            "serpapi_google_flights": "SerpApi Google Flights",
+            "searchapi_google_flights": "SearchAPI.io Google Flights",
+            "ignav_quarantine": "Ignav (strict quarantine)",
+            "ignav_verified_fares": "Ignav Verified Fares",
+            "strict_fare_aggregate": "Strict Fare Provider Aggregate",
+            "none": "No strict fare provider",
+        }
+        if self.provider_name is None:
+            self.provider_name = provider_names[self.provider_code]
+        elif self.provider_name != provider_names[self.provider_code]:
+            raise ValueError("fare-search provider code and name must match")
+        expected_quota_unit = {
+            "serpapi_google_flights": "billing_period_requests",
+            "searchapi_google_flights": "lifetime_requests",
+            "ignav_quarantine": "lifetime_requests",
+            "ignav_verified_fares": "lifetime_requests",
+            "strict_fare_aggregate": None,
+            "none": None,
+        }[self.provider_code]
+        has_quota_counts = any(
+            value is not None
+            for value in (
+                self.monthly_call_limit,
+                self.monthly_calls_used,
+                self.search_monthly_limit,
+                self.search_monthly_used,
+                self.pricing_monthly_limit,
+                self.pricing_monthly_used,
+            )
+        )
+        if has_quota_counts and self.quota_unit is None:
+            self.quota_unit = expected_quota_unit
+        if self.quota_unit != (expected_quota_unit if has_quota_counts else None):
+            raise ValueError("fare-search quota unit must match its provider and counters")
+        if self.status == "test_environment_rejected" and self.environment not in {
+            "test",
+            "disabled",
+        }:
+            raise ValueError("test-environment rejection requires test or disabled environment")
         if self.status in {"confirmed_offers", "no_results"} and (self.environment != "production"):
             raise ValueError("live fare-search results require the production environment")
         return self
+
+    def includes_confirmed_provider(self, provider_code: str, provider_name: str) -> bool:
+        """Return whether this metadata contains the fare's confirmed source run."""
+
+        if (self.provider_code, self.provider_name) == (provider_code, provider_name):
+            return self.status == "confirmed_offers"
+        return bool(
+            self.provider_code == "strict_fare_aggregate"
+            and any(
+                run.status == "confirmed_offers"
+                and (run.provider_code, run.provider_name) == (provider_code, provider_name)
+                for run in self.provider_runs
+            )
+        )
 
 
 class ComparisonOffer(BaseModel):
@@ -777,6 +1115,11 @@ class ComparisonOffer(BaseModel):
 
     @model_validator(mode="after")
     def validate_schedule_claims(self) -> ComparisonOffer:
+        priced_sources = {
+            "serpapi_google_flights": "serpapi_google_flights_booking",
+            "searchapi_google_flights": "searchapi_google_flights_booking",
+            "ignav_verified_fares": "ignav_verified_booking",
+        }
         if self.routing_status == "provider_itinerary":
             if (
                 self.route_status != "provider_confirmed"
@@ -810,11 +1153,16 @@ class ComparisonOffer(BaseModel):
         if self.bookability_status == "unverified" and self.live_fare is not None:
             raise ValueError("unverified offers cannot include a live fare")
         if self.bookability_status == "booking_option_verified":
+            expected_priced_source = (
+                priced_sources.get(self.live_fare.provider_code)
+                if self.live_fare is not None
+                else None
+            )
             if (
                 self.route_status != "provider_confirmed"
                 or self.routing_status not in {"provider_direct", "provider_itinerary"}
                 or self.schedule_status != "priced_offer"
-                or self.schedule_source != "serpapi_google_flights_booking"
+                or self.schedule_source != expected_priced_source
                 or self.cabin_status != "provider_confirmed"
                 or self.live_fare is None
                 or not self.live_fare.booking_verified
@@ -822,7 +1170,7 @@ class ComparisonOffer(BaseModel):
                 or self.stops is None
             ):
                 raise ValueError(
-                    "verified booking options require a provider itinerary, Google Flights "
+                    "verified booking options require a provider itinerary, provider "
                     "schedule, provider-confirmed cabin, live fare, booking evidence, and segments"
                 )
             if len(self.segments) != self.stops + 1:
@@ -853,12 +1201,12 @@ class ComparisonOffer(BaseModel):
             ):
                 raise ValueError("model scenarios cannot include a flight number or clock time")
             return self
-        expected_source = {
-            "live_schedule": "airlabs_schedules",
-            "recurring_timetable_projection": "airlabs_routes",
-            "priced_offer": "serpapi_google_flights_booking",
+        expected_sources = {
+            "live_schedule": {"airlabs_schedules"},
+            "recurring_timetable_projection": {"airlabs_routes"},
+            "priced_offer": set(priced_sources.values()),
         }[self.schedule_status]
-        if self.schedule_source != expected_source or any(
+        if self.schedule_source not in expected_sources or any(
             value is None for value in schedule_values
         ):
             raise ValueError("provider schedules require a matching source and complete times")
@@ -939,9 +1287,14 @@ class TimetableReference(BaseModel):
     duration_minutes: int = Field(gt=0)
     schedule_status: Literal[
         "live_schedule",
+        "future_schedule_reference",
         "recurring_timetable_projection",
     ]
-    schedule_source: Literal["airlabs_schedules", "airlabs_routes"]
+    schedule_source: Literal[
+        "airlabs_schedules",
+        "aerodatabox_schedule",
+        "airlabs_routes",
+    ]
     scheduled_departure_local: datetime
     scheduled_arrival_local: datetime
     scheduled_departure_utc: datetime
@@ -955,6 +1308,7 @@ class TimetableReference(BaseModel):
     def validate_reference(self) -> TimetableReference:
         expected_source = {
             "live_schedule": "airlabs_schedules",
+            "future_schedule_reference": "aerodatabox_schedule",
             "recurring_timetable_projection": "airlabs_routes",
         }[self.schedule_status]
         if self.schedule_source != expected_source:
@@ -1005,6 +1359,11 @@ class ComparisonResponse(BaseModel):
     ]
     strict_mode_notice: BilingualText
     fare_search_metadata: FareSearchMetadata | None = None
+    provider_statuses: list[RuntimeProviderStatusItem] = Field(default_factory=list)
+    fare_reference_snapshots: list[FareCoverageReference] = Field(
+        default_factory=list,
+        max_length=2,
+    )
     timetable_references: list[TimetableReference] = Field(default_factory=list)
     schedule_sample_truncated: bool
     schedule_sample_limit: Literal[50] = 50
@@ -1013,6 +1372,11 @@ class ComparisonResponse(BaseModel):
 
     @model_validator(mode="after")
     def validate_availability_mode(self) -> ComparisonResponse:
+        reference_codes = [reference.provider_code for reference in self.fare_reference_snapshots]
+        if len(reference_codes) != len(set(reference_codes)):
+            raise ValueError("fare reference provider codes must be unique")
+        if any(reference.can_supply_strict_offers for reference in self.fare_reference_snapshots):
+            raise ValueError("fare coverage references cannot supply strict offers")
         offer_ids = [offer.id for offer in self.offers]
         if len(offer_ids) != len(set(offer_ids)):
             raise ValueError("comparison offer ids must be unique")
@@ -1041,6 +1405,17 @@ class ComparisonResponse(BaseModel):
             or self.fare_search_metadata.environment != "production"
         ):
             raise ValueError("confirmed offers require production fare-search metadata")
+        if self.offers and any(
+            offer.live_fare is None
+            or not self.fare_search_metadata.includes_confirmed_provider(
+                offer.live_fare.provider_code,
+                offer.live_fare.provider_name,
+            )
+            for offer in self.offers
+        ):
+            raise ValueError(
+                "comparison metadata must contain every live fare's confirmed provider run"
+            )
         expected_status = {
             "confirmed_offers": ("verified_offers_found" if self.offers else "no_verified_offer"),
             "no_results": "no_verified_offer",
@@ -1112,6 +1487,8 @@ class ItineraryLeg(BaseModel):
         "airlabs_live_schedule",
         "airlabs_recurring_timetable_projection",
         "serpapi_booking_confirmed",
+        "searchapi_booking_confirmed",
+        "ignav_verified_booking_confirmed",
         "model_duration_only",
     ]
 
@@ -1169,7 +1546,11 @@ class ItineraryLeg(BaseModel):
             or abs((self.arrival_local.astimezone(UTC) - self.arrival_utc).total_seconds()) > 120
         ):
             raise ValueError("provider leg local and UTC fields must describe the same instants")
-        if self.data_basis == "serpapi_booking_confirmed" and (
+        if self.data_basis in {
+            "serpapi_booking_confirmed",
+            "searchapi_booking_confirmed",
+            "ignav_verified_booking_confirmed",
+        } and (
             self.marketing_airline_code is None or self.cabin is None
         ):
             raise ValueError(
@@ -1305,10 +1686,18 @@ class OfferItinerary(BaseModel):
             raise ValueError("itinerary time basis must match every leg")
         if self.layover_status == "provider_confirmed" and (
             self.time_basis != "provider_schedule"
-            or any(leg.data_basis != "serpapi_booking_confirmed" for leg in self.legs)
+            or any(
+                leg.data_basis
+                not in {
+                    "serpapi_booking_confirmed",
+                    "searchapi_booking_confirmed",
+                    "ignav_verified_booking_confirmed",
+                }
+                for leg in self.legs
+            )
         ):
             raise ValueError(
-                "provider-confirmed connections require booking-verified Google Flights legs"
+                "provider-confirmed connections require booking-verified provider legs"
             )
         return self
 
@@ -1370,3 +1759,22 @@ class OfferDetailResponse(BaseModel):
     itinerary: OfferItinerary
     price_curve: PriceForecastCurve
     notice: BilingualText
+
+    @model_validator(mode="after")
+    def validate_provider_attribution(self) -> OfferDetailResponse:
+        if self.offer.live_fare is None or self.fare_search_metadata is None:
+            raise ValueError("strict offer detail requires fare evidence and search metadata")
+        fare = self.offer.live_fare
+        metadata = self.fare_search_metadata
+        if not metadata.includes_confirmed_provider(fare.provider_code, fare.provider_name):
+            raise ValueError(
+                "offer detail metadata must contain the live fare's confirmed provider run"
+            )
+        provider_basis = {
+            "serpapi_google_flights": "serpapi_booking_confirmed",
+            "searchapi_google_flights": "searchapi_booking_confirmed",
+            "ignav_verified_fares": "ignav_verified_booking_confirmed",
+        }[fare.provider_code]
+        if any(leg.data_basis != provider_basis for leg in self.itinerary.legs):
+            raise ValueError("offer detail itinerary basis must match the live-fare provider")
+        return self

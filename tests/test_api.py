@@ -191,8 +191,8 @@ def test_strict_comparison_returns_structured_empty_result_without_fare_provider
         "student_first": [],
     }
     assert payload["timetable_references"] == []
-    assert "Google Flights" in payload["strict_mode_notice"]["zh"]
-    assert "booking-token" in payload["strict_mode_notice"]["en"]
+    assert "严格报价来源" in payload["strict_mode_notice"]["zh"]
+    assert "secondary booking-verification identifier" in payload["strict_mode_notice"]["en"]
     assert payload["fare_search_metadata"]["status"] == "not_configured"
     assert payload["context"]["weather"]["status"] == "proxy"
     assert payload["context"]["weather_feature_status"] == "ignored"

@@ -884,7 +884,7 @@ def test_unknown_airline_requires_a_priced_cabin_and_is_not_expanded(
     assert result.offers[0].cabin_status == "provider_confirmed"
     assert len(result.timetable_references) == 1
     assert result.timetable_references[0].flight_number == "8M750"
-    assert "购票选项与 HTTPS 预订链接二次验证" in (
+    assert "严格报价来源及其二次购票验证标识" in (
         result.timetable_references[0].reference_reason.zh
     )
 

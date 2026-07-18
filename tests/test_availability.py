@@ -317,12 +317,13 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
     assert len(client.account_calls) == 1
     assert len(client.search_calls) == 4
     assert len(client.booking_calls) == 8
-    assert result.coverage_scope == "provider_returned_booking_token_candidates"
+    assert result.coverage_scope == "provider_returned_booking_verification_candidates"
     assert result.eligible_candidate_count == 8
     assert result.verification_attempted_count == 8
     assert result.verified_candidate_count == 4
     assert result.strictly_rejected_candidate_count == 4
     assert result.provider_failed_candidate_count == 0
+    assert result.search_failed_cabin_count == 0
     assert result.quota_skipped_candidate_count == 0
     assert result.deduplicated_verified_count == 0
     assert result.coverage_status == "complete"
@@ -587,6 +588,54 @@ def test_booking_endpoint_bad_request_remains_a_provider_error(tmp_path: Path) -
     )
 
 
+def test_one_failed_cabin_keeps_other_strictly_confirmed_offers(
+    tmp_path: Path,
+) -> None:
+    class _OneCabinFailureClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.search_calls.append(kwargs)
+                return _Response({"error": "one cabin unavailable"}, 400)
+            return super().get(url, **kwargs)
+
+    client = _OneCabinFailureClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert {offer.cabin for offer in result.offers} == {
+        "premium_economy",
+        "business",
+        "first",
+    }
+    assert result.calls_used == 10
+    assert result.search_calls_used == 4
+    assert result.pricing_calls_used == 6
+    assert len(client.search_calls) == 4
+    assert len(client.booking_calls) == 6
+    assert result.eligible_candidate_count == 6
+    assert result.verification_attempted_count == 6
+    assert result.verified_candidate_count == 3
+    assert result.strictly_rejected_candidate_count == 3
+    assert result.provider_failed_candidate_count == 0
+    assert result.search_failed_cabin_count == 1
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "provider_incomplete"
+    assert result.quota_limit is None
+    assert any(
+        diagnostic.stage == "cabin_search"
+        and diagnostic.http_status == 400
+        and diagnostic.exception_type == "ProviderHttpError"
+        for diagnostic in result.diagnostics
+    )
+
+
 def test_processing_cabin_search_polls_archive_without_resubmitting_or_using_quota(
     tmp_path: Path,
 ) -> None:
@@ -649,6 +698,64 @@ def test_processing_cabin_search_polls_archive_without_resubmitting_or_using_quo
     assert "https://" not in persisted
 
 
+def test_pending_after_archive_poll_resubmits_once_then_succeeds(
+    tmp_path: Path,
+) -> None:
+    search_id = "retrysearch0001"
+    archive_url = SERPAPI_SEARCH_ARCHIVE_URL.format(search_id=search_id)
+
+    class _PendingThenSuccessfulClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.economy_submissions = 0
+            self.archive_calls = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if url == archive_url:
+                with self._lock:
+                    self.archive_calls += 1
+                return _Response(
+                    {"search_metadata": {"id": search_id, "status": "Queued"}}
+                )
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.search_calls.append(kwargs)
+                    self.economy_submissions += 1
+                    submission = self.economy_submissions
+                if submission == 1:
+                    return _Response(
+                        {
+                            "search_metadata": {
+                                "id": search_id,
+                                "status": "Processing",
+                            }
+                        }
+                    )
+                return _Response(_search_payload(1))
+            return super().get(url, **kwargs)
+
+    client = _PendingThenSuccessfulClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert result.calls_used == 13
+    assert result.search_calls_used == 5
+    assert result.pricing_calls_used == 8
+    assert result.search_monthly_used == 13
+    assert result.archive_poll_count == 1
+    assert client.economy_submissions == 2
+    assert len(client.search_calls) == 5
+    assert len(client.booking_calls) == 8
+    assert client.archive_calls == 1
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 13
+
+
 def test_queued_booking_option_polls_until_success_without_new_search(
     tmp_path: Path,
 ) -> None:
@@ -708,7 +815,89 @@ def test_queued_booking_option_polls_until_success_without_new_search(
     assert client.archive_calls == 2
 
 
-def test_processing_timeout_is_distinct_and_never_restarts_four_cabin_searches(
+def test_transient_booking_supplier_error_is_resubmitted_once_and_recovers(
+    tmp_path: Path,
+) -> None:
+    class _TransientBookingClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.target_submissions = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if (
+                url == SERPAPI_SEARCH_URL
+                and kwargs["params"].get("booking_token") == "booking-token-1"
+            ):
+                with self._lock:
+                    self.booking_calls.append(kwargs)
+                    self.target_submissions += 1
+                    submission = self.target_submissions
+                if submission == 1:
+                    return _Response({"error": "temporary supplier failure"}, 503)
+                return _Response(_booking_payload(1))
+            return super().get(url, **kwargs)
+
+    client = _TransientBookingClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert result.calls_used == 13
+    assert result.search_calls_used == 4
+    assert result.pricing_calls_used == 9
+    assert result.search_monthly_used == 13
+    assert len(client.booking_calls) == 9
+    assert client.target_submissions == 2
+    assert result.archive_poll_count == 0
+    assert any(
+        diagnostic.stage == "booking_options"
+        and diagnostic.http_status == 503
+        and diagnostic.exception_type == "TransientProviderHttpError"
+        for diagnostic in result.diagnostics
+    )
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 13
+
+
+def test_partial_confirmed_result_exposes_booking_retry_quota_limit(
+    tmp_path: Path,
+) -> None:
+    class _RetryBlockedByQuotaClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if (
+                url == SERPAPI_SEARCH_URL
+                and kwargs["params"].get("booking_token") == "booking-token-1"
+            ):
+                with self._lock:
+                    self.booking_calls.append(kwargs)
+                return _Response({"error": "temporary supplier failure"}, 503)
+            return super().get(url, **kwargs)
+
+    client = _RetryBlockedByQuotaClient()
+    result = _provider(tmp_path, client, monthly_limit=12).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert len(result.offers) == 3
+    assert result.calls_used == 12
+    assert result.search_calls_used == 4
+    assert result.pricing_calls_used == 8
+    assert len(client.booking_calls) == 8
+    assert result.eligible_candidate_count == 8
+    assert result.verification_attempted_count == 8
+    assert result.provider_failed_candidate_count == 1
+    # The first verification was sent, so this candidate is not mislabeled as
+    # unattempted. The separately exposed retry wall still makes coverage quota
+    # limited as well as provider incomplete.
+    assert result.quota_skipped_candidate_count == 0
+    assert result.retry_quota_limited is True
+    assert result.coverage_status == "quota_and_provider_incomplete"
+    assert result.quota_limit == "monthly"
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 12
+
+
+def test_two_processing_rounds_stop_after_exactly_one_controlled_resubmission(
     tmp_path: Path,
 ) -> None:
     search_id = "stillpending01"
@@ -755,17 +944,144 @@ def test_processing_timeout_is_distinct_and_never_restarts_four_cabin_searches(
         poll_delays_seconds=(0.0, 0.0, 0.0),
     ).search("YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT)
 
-    assert result.status == "provider_processing"
-    assert result.offers == ()
-    assert result.calls_used == 4
-    assert result.archive_poll_count == 3
-    assert len(client.search_calls) == 4
-    assert client.archive_calls == 3
-    assert client.booking_calls == []
+    assert result.status == "confirmed_offers"
+    assert {offer.cabin for offer in result.offers} == {
+        "premium_economy",
+        "business",
+        "first",
+    }
+    assert result.calls_used == 11
+    assert result.search_calls_used == 5
+    assert result.pricing_calls_used == 6
+    assert result.archive_poll_count == 6
+    assert len(client.search_calls) == 5
+    assert client.archive_calls == 6
+    assert len(client.booking_calls) == 6
+    assert result.search_failed_cabin_count == 1
+    assert result.coverage_status == "provider_incomplete"
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 11
     assert any(
         diagnostic.exception_type == "ProviderProcessingError" and diagnostic.search_id == search_id
         for diagnostic in result.diagnostics
     )
+
+
+def test_processing_retry_is_not_submitted_when_quota_reservation_fails(
+    tmp_path: Path,
+) -> None:
+    search_id = "retrybudget001"
+    archive_url = SERPAPI_SEARCH_ARCHIVE_URL.format(search_id=search_id)
+
+    class _BudgetWallClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.archive_calls = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if url == archive_url:
+                self.archive_calls += 1
+                return _Response(
+                    {"search_metadata": {"id": search_id, "status": "Queued"}}
+                )
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.search_calls.append(kwargs)
+                return _Response(
+                    {"search_metadata": {"id": search_id, "status": "Processing"}}
+                )
+            return super().get(url, **kwargs)
+
+    client = _BudgetWallClient()
+    result = _provider(tmp_path, client, monthly_limit=4).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "budget_exhausted"
+    assert result.calls_used == 4
+    assert result.search_calls_used == 4
+    assert result.archive_poll_count == 1
+    assert len(client.search_calls) == 4
+    assert client.archive_calls == 1
+    assert client.booking_calls == []
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 4
+    assert any(
+        diagnostic.stage == "cabin_search"
+        and diagnostic.exception_type == "RetryBudgetExhausted"
+        and diagnostic.http_status is None
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_bad_request_is_nontransient_and_never_resubmitted(tmp_path: Path) -> None:
+    client = _Client(search_status=400)
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "provider_error"
+    assert result.calls_used == 4
+    assert result.search_calls_used == 4
+    assert len(client.search_calls) == 0
+    assert client.booking_calls == []
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 4
+    assert all(
+        diagnostic.exception_type == "ProviderHttpError"
+        for diagnostic in result.diagnostics
+        if diagnostic.stage == "cabin_search"
+    )
+
+
+def test_transport_failure_has_one_retry_and_a_fixed_transport_upper_bound(
+    tmp_path: Path,
+) -> None:
+    class _TransportFailureClient(_Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.total_gets = 0
+            self.economy_gets = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            with self._lock:
+                self.total_gets += 1
+            if (
+                url == SERPAPI_SEARCH_URL
+                and "booking_token" not in kwargs["params"]
+                and kwargs["params"]["travel_class"] == 1
+            ):
+                with self._lock:
+                    self.economy_gets += 1
+                raise TimeoutError("secret-bearing transport detail")
+            return super().get(url, **kwargs)
+
+    client = _TransportFailureClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    assert {offer.cabin for offer in result.offers} == {
+        "premium_economy",
+        "business",
+        "first",
+    }
+    assert result.calls_used == 11
+    assert result.search_calls_used == 5
+    assert result.pricing_calls_used == 6
+    assert client.economy_gets == 2
+    # One account call, four original cabin requests, one retry, and six strict
+    # booking validations for the three successful cabin payloads.
+    assert client.total_gets == 12
+    assert len(client.booking_calls) == 6
+    assert result.search_failed_cabin_count == 1
+    assert result.provider_failed_candidate_count == 0
+    assert result.coverage_status == "provider_incomplete"
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 11
+    serialized = json.dumps(_diagnostic_rows(tmp_path / "private" / "usage.sqlite3"))
+    assert "secret-bearing transport detail" not in serialized
 
 
 def test_pending_search_id_must_pass_allowlist_before_archive_poll(
@@ -802,11 +1118,13 @@ def test_pending_search_id_must_pass_allowlist_before_archive_poll(
         "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
     )
 
-    assert result.status == "provider_unavailable"
-    assert result.offers == ()
+    assert result.status == "confirmed_offers"
+    assert len(result.offers) == 3
     assert len(client.search_calls) == 4
     assert client.unexpected_urls == []
     assert result.archive_poll_count == 0
+    assert result.search_failed_cabin_count == 1
+    assert result.coverage_status == "provider_incomplete"
     assert any(
         diagnostic.exception_type == "PayloadError" and diagnostic.search_id is None
         for diagnostic in result.diagnostics
@@ -843,10 +1161,14 @@ def test_terminal_provider_error_is_not_reported_as_no_verified_offer(
         "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
     )
 
-    assert result.status == "provider_error"
-    assert result.offers == ()
-    assert len(client.search_calls) == 4
-    assert client.booking_calls == []
+    assert result.status == "confirmed_offers"
+    assert len(result.offers) == 3
+    assert result.calls_used == 11
+    assert result.search_calls_used == 5
+    assert len(client.search_calls) == 5
+    assert len(client.booking_calls) == 6
+    assert result.search_failed_cabin_count == 1
+    assert result.coverage_status == "provider_incomplete"
     assert any(
         diagnostic.exception_type == "ProviderSearchError" and diagnostic.search_id == search_id
         for diagnostic in result.diagnostics

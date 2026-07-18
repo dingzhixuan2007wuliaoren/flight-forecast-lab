@@ -4,9 +4,9 @@ Flight Forecast Lab 是一个可复现的双任务机器学习项目，用于比
 
 Flight Forecast Lab is a reproducible dual-task project with one fare model and two on-time variants for comparing **estimated fares** and **on-time probabilities**. The dashboard only asks for origin, destination, and departure date; distance, duration, weather, airport operations, and recent news are resolved automatically.
 
-> 重要：默认票价预测与准点率模型使用确定性的合成演示数据训练。配置 SerpApi Google Flights 后，主价格可显示经购票选项二次验证的来源结果报价；该结果可能来自最长约 1 小时的 provider 缓存。模型估价、价格曲线和准点率仍不是经过全球真实数据验证的生产预测。
+> 重要：默认票价预测与准点率模型使用确定性的合成演示数据训练。配置受支持的严格报价源（SerpApi、SearchAPI.io，或完成双开关显式发布后的 Ignav）后，主价格可显示经购票选项二次验证的来源结果报价；该结果可能使用 provider 缓存。模型估价、价格曲线和准点率仍不是经过全球真实数据验证的生产预测。
 >
-> Important: the default fare and on-time models use deterministic synthetic demo data. With SerpApi Google Flights configured, the primary price can be a provider-result fare that also passed booking-option verification; that provider result may be cached for up to about one hour. The model estimate, price curve, and on-time probability remain unvalidated demo predictions.
+> Important: the default fare and on-time models use deterministic synthetic demo data. With a supported strict fare source configured (SerpApi, SearchAPI.io, or Ignav only after its two explicit release switches), the primary price can be a provider-result fare that also passed booking-option verification; that result may use provider caching. The model estimate, price curve, and on-time probability remain unvalidated demo predictions.
 
 ## 功能 / Features
 
@@ -14,7 +14,7 @@ Flight Forecast Lab is a reproducible dual-task project with one fare model and 
 - 比较页面只输入日期；服务在内部使用出发机场当地正午或仍安全的同日 +30 分钟时刻作为模型、天气和新闻参考，以 `departure_time_basis` 明确标记，且不把它显示成实际航班钟点。
 - 119 个内置全球主要机场；其他有效 IATA 机场可通过免费的 OurAirports 目录回退解析。
 - 内置 60 家主要航司的保守政策目录；严格主列表只显示二次验证实际返回的航司与舱位，未知航司也不会被默认扩展成四种舱位。
-- 对 SerpApi 四舱搜索实际返回、并在免费额度与供应商响应范围内成功严格验证的全部候选提供三类排序：直飞优先、低价优先、学生友好优先；它们仍不是所有航司或全球航班的全量清单。
+- 对活动严格报价源四舱搜索实际返回、并在免费额度与供应商响应范围内成功严格验证的候选提供三类排序：直飞优先、低价优先、学生友好优先；它们仍不是所有航司或全球航班的全量清单。
 - 学生友好排序按：最低价格 → 已确认免费托运行李 → 已确认实际学生折扣 → 已确认免费改签/退票 → 年龄与验证要求。普通 Google Flights 免费查询不能确认实际学生专属折扣，因此该项保持 `unknown` 且不加分。
 - 无需密钥的 Open-Meteo 当前天气/小时预报与 NOAA METAR/TAF 航空气象；美国机场使用 FAA NAS Status 当前运行事件，其他机场可使用 AirLabs 航班样本或 ADSB.lol 飞机密度代理；新闻来自无需密钥的 GDELT。
 - 天气和新闻卡片以及每个严格确认报价均可进入独立的中英双语详情页；offer 详情含真实返回航段、转机等待时间与逐日价格模型预测曲线，天气和新闻页支持手动刷新，并分别每 10 分钟、15 分钟自动刷新。
@@ -30,7 +30,7 @@ The UI always labels external context as `live`, `forecast`, `proxy`, `historica
 | 天气 | 2 小时内使用 Open-Meteo 当前模型天气并结合 NOAA METAR/TAF；2–30 小时结合小时预报与 TAF；其后至 16 天使用 Open-Meteo 小时预报 | 可展示明确标记的训练同月平均值/季节先验，但准点预测切换到无天气模型，不把 proxy 当作天气输入 |
 | 机场运行 | 美国机场优先使用无需密钥的 FAA NAS Status 当前事件；其他机场配置 AirLabs 免费密钥后使用计划出港样本，否则显示 ADSB.lol 当前飞机密度代理 | 与目标起飞时刻不匹配时，模型使用明确标记的训练平均值/合成先验；当前快照仍单独展示 |
 | 时事新闻 | 无需密钥的 GDELT DOC 2.0 最近 7 天中断新闻，按最新观察时间排序；DOC 不可用时使用官方 GAL 滚动 RSS | 先使用最多 6 小时的带标签缓存并降低影响；没有缓存时返回中性值且不生成新闻 |
-| 严格航班比较 | 配置 SerpApi key 后，先搜索 Google Flights，再用结果中的 `booking_token` 查询购票选项；只有两次结果一致且字段完整的报价进入主列表 | 返回带原因的结构化空 offers；不使用时刻表投影或模型航班补位 |
+| 严格航班比较 | `auto` 查询每个已配置且获准参与的严格报价源；SerpApi、SearchAPI.io 以及双开关显式发布后的 `ignav_verified_fares` 都必须独立二次验证完整航段、正数票价与安全 HTTPS 路径 | 两个或更多严格源实际运行时返回 `strict_fare_aggregate`，并在 `provider_runs` 保留逐源状态；同一完整航段与舱位跨源只保留最低已验证价格。全部来源都没有可验证报价时才返回带原因的结构化空 `offers`；参考源绝不补位 |
 
 AirLabs 密钥是可选项。没有任何密钥时项目仍可运行。Open-Meteo 公共免费端点限非商业用途并采用 CC BY 4.0；GDELT 允许免费使用，但使用或再分发其数据时须注明并链接 GDELT。免费额度、覆盖和条款可能变化，公开部署前应重新检查 [Open-Meteo 官方条款](https://open-meteo.com/en/terms)、[GDELT 项目说明](https://www.gdeltproject.org/about.html)与其他来源要求，详见 [运行时数据与回退](docs/runtime-context.md)。
 
@@ -85,8 +85,21 @@ source .venv/bin/activate
 
 ### 严格未来报价与免费额度 / Strict future fares and free quota
 
-主比较列表先调用 SerpApi Google Flights 单程搜索，再使用每个候选返回的 `booking_token`
-查询购票选项。只有二次响应中的 `selected_flights` 与原候选完全一致，且存在带 HTTPS
+所有外部调用都在本地免费硬上限前预留额度；达到上限即停止，不自动购买、不透支，也不把参考数据升级成可售航班。`GET /v1/provider-status` 和主页状态面板只返回配置布尔值、角色、脱敏额度状态及双语说明，不返回密钥、原始错误或完整外部 URL。
+
+Every external call reserves free allowance before network I/O. The provider stops at the local hard ceiling—there is no automatic purchase or overage, and reference data is never promoted into a bookable flight. `GET /v1/provider-status` and the dashboard expose only configuration booleans, roles, sanitized quota state, and bilingual notices; they never expose credentials, raw provider errors, or complete outbound URLs.
+
+| 来源 / Source | 严格角色 / Strict role | 免费硬上限语义 / Free hard-stop semantics |
+| --- | --- | --- |
+| SerpApi · Google Flights | 首个配置顺序的可聚合严格源 / first configured aggregating strict source | 每个 provider 结算周期最多 250 次本地预留请求；不是自然月 / up to 250 locally reserved requests per provider billing period, not calendar month |
+| SearchAPI.io · Google Flights | 可聚合严格报价源 / aggregating strict fare source | 注册账户一次性 100 次请求；不会按月恢复 / one-time 100-request signup allocation; no monthly renewal |
+| Ignav | 默认 `ignav_quarantine`；显式发布后为 `ignav_verified_fares` / quarantined by default; separately identified after release | 一次性最多 1,000 次请求；只有 `IGNAV_STRICT_RELEASE=1` 与 `IGNAV_FREE_ACCOUNT_ATTESTED=1` 同时成立且完成受控验证才可进入主列表 / up to 1,000 lifetime requests; both explicit switches and controlled validation are required |
+| Scrape.do · Google Flights | 仅聚合覆盖参考 / aggregate coverage reference only | 每月 1,000 点数，每次参考调用预留 10 点数，瞬时失败最多受控重试一次 / 1,000 credits per month, 10 reserved per reference call, at most one controlled transient retry |
+| OpenSky Network | 当前航迹密度参考 / current trajectory-density reference | 无凭据时匿名模式默认启用，每日 400 API 点数；不能证明票价或库存 / anonymous access is active without credentials at 400 API credits per day; no fare or inventory proof |
+| AeroDataBox | 日期级时刻参考 / dated schedule reference | 优先采用可信 RapidAPI 免费计划账期头；没有可信重置信号时使用安装生命周期 600 单位硬墙，绝不按自然月自行重置 / trusted RapidAPI free-plan reset headers define a cycle; otherwise a 600-unit installation-lifetime wall applies |
+| AirLabs | 机场运行与时刻参考 / operations and timetable reference | 所有进程和调用点共用 SQLite 月度账本；缺少明确本地上限时拒绝调用，响应中的账户月上限/已用量只能进一步收紧硬墙 / one cross-process SQLite ledger; missing local limit fails closed and provider counters only tighten the wall |
+
+主比较会查询每个已配置且获准参与的严格报价源，并使用每个候选返回的二次验证令牌/标识查询购票选项。只有二次响应中的已选航段与原候选完全一致，且存在带 HTTPS
 购票请求、销售方、匹配航班号、完整航段、真实舱位和正数 USD 价格的结果才会进入 `offers`。
 若销售方动作是可直接打开的 GET 跳转，`booking_url_kind=direct_get`；Google 常见的
 `booking_request` 需要 POST 时，系统不丢弃 POST 数据后伪装成直链，而是提供
@@ -102,22 +115,28 @@ SerpApi 免费计划目前包含每个 provider 结算周期 250 次成功搜索
 系统不会使用模型航班补位：
 
 ```powershell
-$env:FLIGHT_OFFER_PROVIDER="serpapi"
+$env:FLIGHT_OFFER_PROVIDER="auto"
 $env:SERPAPI_API_KEY="your-serpapi-key"
 $env:SERPAPI_MONTHLY_LIMIT="250"
+$env:SEARCHAPI_API_KEY="your-searchapi-key"
+$env:SEARCHAPI_LIFETIME_LIMIT="100"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
-若 Search API 返回 `Processing` 或 `Queued`，后端会按 0.5、1、1.5、2 秒的有界退避读取固定的
+`auto` 会运行所有已配置且获准参与的严格源，而不是在第一个成功来源后停止。只有一个来源实际运行时保留该来源自己的 provider code；两个或更多来源实际运行时，顶层 `fare_search_metadata.provider_code=strict_fare_aggregate`，`provider_runs` 保存每个来源的独立状态、计数、额度与诊断。聚合只合并各来源已经独立通过二次购票验证的报价，并按“完整航段序列 + 舱位”跨源去重，保留最低最终确认价。任一来源失败、处理中或额度受限都会保留在逐源状态和聚合覆盖状态中；只有全部已完成来源都没有可验证报价时才返回结构化空结果。SearchAPI 的本地硬墙是安装生命周期 100 次，不按月重置，也不应配置成月额度。每个来源都会消耗自己的免费额度，因此增加来源可以缓解单源覆盖不足，但不能把多个免费计划变成无限额度。
+
+若 SerpApi 返回 `Processing` 或 `Queued`，后端会按 0.5、1、1.5、2 秒的有界退避读取固定的
 Search Archive 地址；它只轮询同一个经过白名单校验的 Search ID，不跟随响应中的任意 URL，
-也不重新提交四舱搜索。Archive 读取单独记录为 `archive_poll_count`，不计入
-`call_count` 或本地额度预留。轮询后仍未完成返回 `provider_processing`，终态/HTTP/网络错误
-返回 `provider_error`，只有成功完成但没有通过严格验证的购票选项才返回 `no_results`。
+Archive 读取单独记录为 `archive_poll_count`，不计入 `call_count` 或本地额度预留。若有界轮询后仍在处理，或发生供应商搜索错误、传输错误、HTTP 408/425/5xx，系统只有在再次原子预留免费额度成功后才受控重提一次；第二次提交可再次有界轮询，但绝不会触发第三次提交。HTTP 400、认证失败、429 或严格解析拒绝不会重试。最终仍在处理返回 `provider_processing`，终态/HTTP/网络错误返回 `provider_error`，只有成功完成但没有通过严格验证的购票选项才返回 `no_results`；重试额度不足由 `retry_quota_limited`、`coverage_status` 与 `quota_limit` 如实标记。
 
 When SerpApi reports `Processing` or `Queued`, the backend performs bounded polling of the same
 allowlisted Search ID through the fixed Search Archive endpoint. It never follows an arbitrary
-provider URL or resubmits the four-cabin search. The API distinguishes `provider_processing`,
-`provider_error`, and a successfully completed `no_results` response.
+provider URL. After an unresolved poll or another approved transient failure, it may resubmit once
+only after a fresh atomic quota reservation; the second submission can poll but cannot cause a
+third submission. HTTP 400, authentication failures, 429 responses, and strict-parse rejections are
+not retried. The API distinguishes `provider_processing`, `provider_error`, and a successfully
+completed `no_results` response, and exposes a retry blocked by quota without pretending the first
+attempt was skipped.
 
 异常诊断只保留观测时间、阶段、HTTP 状态、固定异常类型和经过格式校验的 Search ID，并写入
 Git 已忽略的 `artifacts/runtime/serpapi-usage.sqlite3`，最多保留 500 条；最近最多 10 条也会作为
@@ -144,12 +163,14 @@ SerpApi 可能返回最长约 1 小时的 provider 缓存。响应以 `provider_
 
 ### 可选免费 AirLabs 密钥 / Optional free AirLabs key
 
-免费 AirLabs 密钥用于非美国机场运行样本和独立的日期/周期时刻参考。`schedules` 是近实时计划接口，免费层通常只覆盖临近当前时刻的有限窗口；`routes` 是周期时刻表，不是所选日期已经确认运营的航班。两者都只进入不参与排名的 `timetable_references`，不能单独创建严格 offer。AirLabs 不提供座位库存或可售报价。
+免费 AirLabs 密钥用于非美国机场运行样本和独立的日期/周期时刻参考。`schedules` 是近实时计划接口，免费层通常只覆盖临近当前时刻的有限窗口；`routes` 是周期时刻表，不是所选日期已经确认运营的航班。两者都只进入不参与排名的 `timetable_references`，不能单独创建严格 offer。AirLabs 不提供座位库存或可售报价。所有 AirLabs 传输在网络调用前通过同一个跨进程 SQLite 账本预留一次调用；设置 key 却没有有效的 `AIRLABS_MONTHLY_CALL_LIMIT` 时会 fail closed。有效响应中的 `request.key.limits_by_month` 与 `limits_total` 会保存为脱敏账户快照，并且只能收紧后续可用量。
 
-没有 AirLabs 密钥时，美国机场仍可使用 FAA，其他机场运行页显示 ADSB.lol 代理并在需要时使用模型先验；它不会影响已配置 SerpApi 的严格报价验证。若 SerpApi 也未配置，严格比较返回结构化空结果，不再用纯模型航班填充列表。密钥只保存在本地环境变量，不要提交到 GitHub：
+没有 AirLabs 密钥时，美国机场仍可使用 FAA，其他机场运行页显示 OpenSky/ADSB.lol 代理并在需要时使用模型先验；它不会影响独立的严格报价验证。若没有任何可用严格报价源，严格比较返回结构化空结果，不再用纯模型航班填充列表。密钥只保存在本地环境变量，不要提交到 GitHub：
 
 ```powershell
 $env:AIRLABS_API_KEY="your-free-key"
+$env:AIRLABS_MONTHLY_CALL_LIMIT="1000"
+$env:AIRLABS_USAGE_DB="runtime/airlabs-usage.sqlite3"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
@@ -178,22 +199,25 @@ python -m flight_forecaster serve --model-dir artifacts/demo
 
 - 自动推算的距离和飞行时长；
 - 天气、机场运行和新闻信号及来源、状态、时间；机场运行还区分目标时刻信号与 `current_snapshot` 当前快照；
-- 仅针对 SerpApi Google Flights 搜索后又通过 `booking_token` 购票选项验证的未来报价，显示来源结果价格、缓存状态与年龄、真实返回舱位、完整航段、模型价格区间、准点率和风险；
+- 仅针对活动严格源搜索后又通过该来源购票选项二次验证的未来报价，显示来源结果价格、缓存状态与年龄、真实返回舱位、完整航段、模型价格区间、准点率和风险；
 - 行李、学生计划、退改、年龄及验证的保守状态；
 - `direct_first`、`lowest_price`、`student_first` 三组覆盖本次返回的全部严格验证 offer ID；
-- `availability_mode=strict_bookable_only`、`fare_search_metadata`、结构化 `result_status`、双语 `strict_mode_notice`，以及不参与比较的 `timetable_references`；`fare_search_metadata` 还以 `coverage_scope`、`eligible_candidate_count`、`verification_attempted_count`、`verified_candidate_count`、`strictly_rejected_candidate_count`、`provider_failed_candidate_count`、`quota_skipped_candidate_count`、`deduplicated_verified_count`、`coverage_status` 与 `quota_limit` 解释候选覆盖和截断；若 `cache_hit=true`，调用计数为本次新增调用（零），覆盖统计则明确来自原查询；
+- `availability_mode=strict_bookable_only`、`fare_search_metadata`、结构化 `result_status`、双语 `strict_mode_notice`，以及不参与比较的 `timetable_references`；两个或更多严格源实际运行时，metadata 使用 `strict_fare_aggregate` 并以 `provider_runs` 保留每个来源的状态和额度；顶层还以 `coverage_scope=provider_returned_booking_verification_candidates`、`eligible_candidate_count`、`verification_attempted_count`、`verified_candidate_count`、`strictly_rejected_candidate_count`、`provider_failed_candidate_count`、`search_failed_cabin_count`、`quota_skipped_candidate_count`、`deduplicated_verified_count`、`coverage_status`、`quota_limit` 与 `retry_quota_limited` 解释跨源候选覆盖和截断；某个舱位搜索失败时，其他舱位已独立严格验证的报价仍可保留，同时覆盖状态明确标为不完整；若 `cache_hit=true`，调用计数为本次新增调用（零），覆盖统计则明确来自原查询；
 - `departure_date`、内部参考时刻及 `departure_time_basis`；
 - 免费航班查询是否触及 50 行上限的 `schedule_sample_truncated` 与 `schedule_sample_limit`；
 - 中英双语限制说明。
 
-The endpoint defaults to strict bookable-offer mode. `offers` contains only SerpApi Google Flights
-results that survive a second `booking_token` request with an identical selected-flight response and a
-usable booking option. AirLabs schedules/routes, route-level hints, catalogue-expanded cabins, and
+The endpoint defaults to strict bookable-offer mode. In `auto`, every configured and released strict
+source runs; `offers` contains only results that survive that source's own second booking-option request
+with an identical selected-flight response and a usable booking option. With two or more attempted
+sources, metadata uses `strict_fare_aggregate` and preserves each source in `provider_runs`. AirLabs
+schedules/routes, route-level hints, catalogue-expanded cabins, and
 model-only flights never enter `offers` or rankings. The verified provider-result fare remains separate
 from the synthetic model estimate and forecast curve, and it is not a final-checkout guarantee.
 Each comparison processes every eligible candidate actually returned by the four cabin searches and
 attempts booking-token verification within the remaining free quota and available provider responses.
-The response keeps only the lowest verified seller price for the same itinerary and cabin. Coverage
+The response keeps only the lowest verified price across sellers and sources for the same complete
+segment sequence and cabin. Coverage
 counters and `coverage_status` distinguish complete candidate processing from quota or provider
 truncation. Even with `deep_search` and `show_hidden`, results are not a complete global inventory.
 Tax inclusion is unknown.
@@ -262,7 +286,7 @@ Tax inclusion is unknown.
 }
 ```
 
-严格模式详情只对应主列表中已通过 SerpApi `booking_token` 购票选项验证的 Google Flights 来源结果。首次打开详情以 `force_refresh=false` 复用 5 分钟严格缓存；只有页面“刷新并重新查询”按钮以 `force_refresh=true` 重新处理四舱搜索实际返回的候选，并继续受免费额度与供应商响应约束。已消失的报价不会由 AirLabs 或模型替代。`live_fare` 是来源结果生成时点的价格和舱位证据，可能来自最长约 1 小时的 provider 缓存，且不保证航空公司或销售方最终结账价格或税费；`estimated_price_usd` 与 `price_curve` 仍是独立的演示模型输出。曲线每日改变模型的模拟查询时刻并保持同一行程、舱位、新闻快照和其他特征；它不是已采集历史票价或未来真实报价。详情页也会在 `weather_feature_status=ignored` 时明确说明本次准点预测已忽略天气变量。
+严格模式详情只对应主列表中已通过当前来源购票选项二次验证的报价。每个航段的 `data_basis` 和顶层 `schedule_source` 必须与 `live_fare.provider_code` 一致（例如 SerpApi、SearchAPI 或显式发布后的 Ignav），不能硬编码成 SerpApi。首次打开详情以 `force_refresh=false` 复用 5 分钟严格缓存；只有页面“刷新并重新查询”按钮以 `force_refresh=true` 重新处理四舱搜索实际返回的候选，并继续受免费额度与供应商响应约束。已消失的报价不会由 AirLabs 或模型替代。`live_fare` 是来源结果生成时点的价格和舱位证据，可能使用 provider 缓存，且不保证航空公司或销售方最终结账价格或税费；`estimated_price_usd` 与 `price_curve` 仍是独立的演示模型输出。曲线每日改变模型的模拟查询时刻并保持同一行程、舱位、新闻快照和其他特征；它不是已采集历史票价或未来真实报价。详情页也会在 `weather_feature_status=ignored` 时明确说明本次准点预测已忽略天气变量。
 
 The detail pages use the same `中文 / English` switch as the dashboard. Weather refreshes every 10 minutes and news every 15 minutes; both also provide a manual refresh button. Initial offer-detail load reuses the five-minute strict cache; only its refresh button forces a new four-cabin search and candidate verification, still bounded by free quota and provider responses. A provider result can itself be cached for up to about one hour, with cache status and age shown separately from response generation time. Offer detail explicitly reports when `weather_feature_status=ignored` and the on-time prediction used the weather-free model.
 
@@ -297,7 +321,7 @@ python -m flight_forecaster train-csv `
 ## 关键限制 / Key limitations
 
 - 合成数据只证明训练、保存、加载和服务链路可工作，不代表真实市场表现。
-- 免费模式不提供全球全量实时可售票价；配置 SerpApi 后只显示通过二次验证的有界来源报价，模型估价和价格曲线始终另行标注。
+- 免费模式不提供全球全量实时可售票价；配置严格报价源后只显示通过该来源二次验证的有界报价，模型估价和价格曲线始终另行标注。
 - 普通 Google Flights 免费查询和公共学生计划页面都不能证明当前行程已经应用学生专属价；实际学生折扣显示 `unknown`，排序不加分。公开计划链接也不等于报价级折扣证据。
 - 行李和退改通常依赖具体 fare brand。没有报价级证据时保持 `unknown`。
 - FAA NAS Status 只覆盖美国且只表示其列出的当前事件；“没有列出事件”不保证机场所有航班完全正常。AirLabs 免费结果可能受时间窗口、配额和最多 50 行样本限制。

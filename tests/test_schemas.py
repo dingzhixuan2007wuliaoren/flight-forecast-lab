@@ -278,6 +278,36 @@ def test_production_live_fare_rejects_test_environment() -> None:
     assert metadata.status == "test_environment_rejected"
 
 
+def test_quarantined_ignav_identity_is_not_a_live_fare_provider() -> None:
+    payload = _confirmed_offer_payload()["live_fare"]
+    assert isinstance(payload, dict)
+    payload["provider_code"] = "ignav_quarantine"
+    payload["provider_name"] = "Ignav (strict quarantine)"
+
+    with pytest.raises(ValidationError):
+        LiveFare.model_validate(payload)
+
+
+def test_verified_ignav_identity_requires_its_matching_schedule_source() -> None:
+    payload = _confirmed_offer_payload()
+    fare = payload["live_fare"]
+    assert isinstance(fare, dict)
+    fare.update(
+        provider_code="ignav_verified_fares",
+        provider_name="Ignav Verified Fares",
+        source_url="https://ignav.com/",
+    )
+    payload["schedule_source"] = "ignav_verified_booking"
+
+    offer = ComparisonOffer.model_validate(payload)
+    assert offer.live_fare is not None
+    assert offer.live_fare.provider_code == "ignav_verified_fares"
+
+    payload["schedule_source"] = "searchapi_google_flights_booking"
+    with pytest.raises(ValidationError, match="verified booking options"):
+        ComparisonOffer.model_validate(payload)
+
+
 def test_offer_detail_request_defaults_to_cached_result_and_accepts_refresh() -> None:
     base = {
         "origin": "YYZ",

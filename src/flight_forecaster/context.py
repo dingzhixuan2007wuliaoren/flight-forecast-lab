@@ -21,6 +21,9 @@ from typing import Any
 from urllib import parse, request
 from xml.etree import ElementTree
 
+from flight_forecaster.airlabs_quota import AirLabsQuotaGate
+from flight_forecaster.supplemental_aviation import SupplementalQuotaExhausted
+
 REQUEST_TIMEOUT_SECONDS = 3.0
 CACHE_TTL_SECONDS = 300.0
 MAX_CACHE_ENTRIES = 512
@@ -295,6 +298,8 @@ class ContextProvider:
         airlabs_api_key: str | None = None,
         client: Any = None,
         context_priors: dict[str, Any] | None = None,
+        opensky_provider: Any | None = None,
+        airlabs_quota_gate: AirLabsQuotaGate | None = None,
     ) -> None:
         self.airlabs_api_key = (airlabs_api_key or "").strip() or None
         setting = os.getenv("EXTERNAL_CONTEXT_ENABLED", "1").strip().lower()
@@ -306,6 +311,8 @@ class ContextProvider:
         }
         self.client = client or _UrllibClient()
         self.context_priors = context_priors or {}
+        self.opensky_provider = opensky_provider
+        self.airlabs_quota_gate = airlabs_quota_gate or AirLabsQuotaGate.from_env()
         self._cache: dict[tuple[Any, ...], tuple[float, PredictionContext]] = {}
         self._route_cache: dict[tuple[str, str], tuple[float, set[str] | None]] = {}
         self._noaa_cache: dict[tuple[str, str], tuple[float, Any]] = {}
@@ -424,7 +431,7 @@ class ContextProvider:
         if found:
             return set(cached) if cached is not None else None
         try:
-            payload = self._get_json(
+            payload = self._get_airlabs_json(
                 AIRLABS_ROUTES_URL,
                 {
                     "api_key": self.airlabs_api_key,
@@ -838,6 +845,19 @@ class ContextProvider:
         elif current_snapshot is None:
             fallback_reasons.append("airlabs_api_key_missing")
 
+        if current_snapshot is None and self.opensky_provider is not None:
+            try:
+                current_snapshot = self._opensky_operations_snapshot(
+                    latitude,
+                    longitude,
+                    airport_type,
+                    fetched_at,
+                )
+            except SupplementalQuotaExhausted:
+                fallback_reasons.append("opensky_daily_quota_exhausted")
+            except Exception:
+                fallback_reasons.append("opensky_states_unavailable")
+
         if current_snapshot is None:
             try:
                 current_snapshot = self._adsb_operations_snapshot(
@@ -866,7 +886,7 @@ class ContextProvider:
         lead_minutes = abs((departure_utc - fetched_at).total_seconds()) / 60
         if (
             current_snapshot is not None
-            and current_snapshot.source == "adsb_lol"
+            and current_snapshot.source in {"opensky_states", "adsb_lol"}
             and lead_minutes <= ADSB_MODEL_MAX_LEAD_MINUTES
         ):
             target = replace(
@@ -885,6 +905,55 @@ class ContextProvider:
             prior,
             current_snapshot=current_snapshot,
             fallback_reason=fallback_reason,
+        )
+
+    def _opensky_operations_snapshot(
+        self,
+        latitude: float,
+        longitude: float,
+        airport_type: str,
+        fetched_at: datetime,
+    ) -> OperationsSnapshot:
+        snapshot = self.opensky_provider.snapshot(
+            latitude,
+            longitude,
+            airport_type,
+            fetched_at,
+        )
+        window = timedelta(minutes=OPERATIONS_SAMPLE_WINDOW_MINUTES)
+        return OperationsSnapshot(
+            snapshot.value,
+            "proxy",
+            snapshot.source,
+            snapshot.observed_at,
+            (
+                f"OpenSky 在机场附近发现 {snapshot.aircraft_count} 架有有效坐标的航空器；"
+                f"当前流量密度代理值为 {snapshot.value:.0%}。该值不是延误或拥堵实测。"
+            ),
+            (
+                f"OpenSky reported {snapshot.aircraft_count} aircraft with valid positions "
+                f"near the airport; current traffic-density proxy {snapshot.value:.0%}. "
+                "This is not a measured delay or congestion value."
+            ),
+            method="traffic_density",
+            data_tier="current_proxy",
+            applicability="current_only",
+            metrics=(
+                OperationsMetric("aircraft_count", snapshot.aircraft_count, "aircraft"),
+                OperationsMetric(
+                    "density_denominator",
+                    snapshot.density_denominator,
+                    "aircraft",
+                ),
+                OperationsMetric("authentication_mode", snapshot.authentication_mode),
+                OperationsMetric("provider_cache_hit", snapshot.cache_hit),
+                OperationsMetric("local_quota_used", snapshot.quota_used, "credits"),
+                OperationsMetric("local_quota_limit", snapshot.quota_limit, "credits"),
+                OperationsMetric("local_quota_period", snapshot.quota_period),
+            ),
+            window_start=fetched_at - window,
+            window_end=fetched_at + window,
+            sample_size=snapshot.aircraft_count,
         )
 
     def _faa_operations_snapshots(
@@ -1001,7 +1070,7 @@ class ContextProvider:
         departure: datetime,
         fetched_at: datetime,
     ) -> tuple[OperationsSnapshot | None, OperationsSnapshot | None]:
-        payload = self._get_json(
+        payload = self._get_airlabs_json(
             AIRLABS_SCHEDULES_URL,
             {
                 "api_key": self.airlabs_api_key,
@@ -1671,6 +1740,24 @@ class ContextProvider:
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
         return response.json()
+
+    def _get_airlabs_json(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> Any:
+        return self.airlabs_quota_gate.get_json(
+            self.client,
+            url,
+            params=params,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "flight-forecast-lab/0.2 (AirLabs context client)",
+            },
+            timeout=timeout,
+        )
 
     def _get_text(self, url: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> str:
         response = self.client.get(

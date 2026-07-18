@@ -15,6 +15,7 @@ from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from flight_forecaster.airlabs_quota import AirLabsQuotaGate
 from flight_forecaster.context import (
     AIRLABS_FREE_SAMPLE_LIMIT,
     AIRLABS_ROUTES_URL,
@@ -70,10 +71,14 @@ class ScheduleProvider:
         api_key: str | None,
         client: Any,
         enabled: bool = True,
+        aerodatabox_provider: Any | None = None,
+        airlabs_quota_gate: AirLabsQuotaGate | None = None,
     ) -> None:
         self.api_key = (api_key or "").strip() or None
         self.client = client
         self.enabled = bool(enabled)
+        self.aerodatabox_provider = aerodatabox_provider
+        self.airlabs_quota_gate = airlabs_quota_gate or AirLabsQuotaGate.from_env()
         self._cache: dict[tuple[str, str, date], tuple[float, ScheduleSearchResult]] = {}
         self._lock = threading.Lock()
 
@@ -95,8 +100,6 @@ class ScheduleProvider:
             return ScheduleSearchResult((), frozenset(), "invalid_departure_date")
         if not self.enabled:
             return ScheduleSearchResult((), frozenset(), "external_context_disabled")
-        if not self.api_key:
-            return ScheduleSearchResult((), frozenset(), "airlabs_api_key_not_configured")
 
         key = (origin_code, destination_code, departure_date)
         now_tick = monotonic()
@@ -112,13 +115,58 @@ class ScheduleProvider:
         blocked_live_identities: set[tuple[str, str, datetime]] = set()
         sample_truncated = False
 
-        # The live schedules endpoint only covers roughly the next ten hours. Avoid
-        # spending a free-tier call for dates that cannot be in that window.
-        origin_today = observed.astimezone(origin_timezone).date()
-        if origin_today <= departure_date <= origin_today + timedelta(days=1):
+        if self.api_key:
+            # The live schedules endpoint only covers roughly the next ten hours. Avoid
+            # spending a free-tier call for dates that cannot be in that window.
+            origin_today = observed.astimezone(origin_timezone).date()
+            if origin_today <= departure_date <= origin_today + timedelta(days=1):
+                try:
+                    payload = self._get_json(
+                        AIRLABS_SCHEDULES_URL,
+                        {
+                            "api_key": self.api_key,
+                            "dep_iata": origin_code,
+                            "arr_iata": destination_code,
+                            "limit": AIRLABS_FREE_SAMPLE_LIMIT,
+                        },
+                    )
+                    sample_truncated = sample_truncated or self._sample_is_truncated(payload)
+                    rows = self._response_rows(payload)
+                    for row in rows:
+                        airline = self._matching_airline(row, origin_code, destination_code)
+                        if airline is not None:
+                            route_airlines.add(airline)
+                        live_identity = self._live_identity(
+                            row,
+                            origin_code,
+                            destination_code,
+                            departure_date,
+                            origin_timezone,
+                        )
+                        if live_identity is not None and (
+                            live_identity[2] <= observed
+                            or not self._live_status_is_eligible(self._status(row.get("status")))
+                        ):
+                            blocked_live_identities.add(live_identity)
+                        parsed = self._parse_live_row(
+                            row,
+                            origin_code,
+                            destination_code,
+                            departure_date,
+                            origin_timezone,
+                            destination_timezone,
+                            observed,
+                        )
+                        if parsed is not None:
+                            schedules.append(parsed)
+                except Exception:
+                    reasons.append("airlabs_schedules_unavailable")
+
+            # The routes DB can fill the remainder of a date outside the live endpoint's
+            # roughly ten-hour window. Rows stay explicitly labelled as projections.
             try:
                 payload = self._get_json(
-                    AIRLABS_SCHEDULES_URL,
+                    AIRLABS_ROUTES_URL,
                     {
                         "api_key": self.api_key,
                         "dep_iata": origin_code,
@@ -132,67 +180,73 @@ class ScheduleProvider:
                     airline = self._matching_airline(row, origin_code, destination_code)
                     if airline is not None:
                         route_airlines.add(airline)
-                    live_identity = self._live_identity(
-                        row,
-                        origin_code,
-                        destination_code,
-                        departure_date,
-                        origin_timezone,
-                    )
-                    if live_identity is not None and (
-                        live_identity[2] <= observed
-                        or not self._live_status_is_eligible(self._status(row.get("status")))
-                    ):
-                        blocked_live_identities.add(live_identity)
-                    parsed = self._parse_live_row(
+                    parsed = self._parse_recurring_row(
                         row,
                         origin_code,
                         destination_code,
                         departure_date,
                         origin_timezone,
                         destination_timezone,
-                        observed,
                     )
                     if parsed is not None:
                         schedules.append(parsed)
             except Exception:
-                reasons.append("airlabs_schedules_unavailable")
+                reasons.append("airlabs_routes_unavailable")
+        else:
+            reasons.append("airlabs_api_key_not_configured")
 
-        # The routes DB can fill the remainder of a date outside the live endpoint's
-        # roughly ten-hour window. Rows stay explicitly labelled as projections.
-        try:
-            payload = self._get_json(
-                AIRLABS_ROUTES_URL,
-                {
-                    "api_key": self.api_key,
-                    "dep_iata": origin_code,
-                    "arr_iata": destination_code,
-                    "limit": AIRLABS_FREE_SAMPLE_LIMIT,
-                },
-            )
-            sample_truncated = sample_truncated or self._sample_is_truncated(payload)
-            rows = self._response_rows(payload)
-            for row in rows:
-                airline = self._matching_airline(row, origin_code, destination_code)
-                if airline is not None:
-                    route_airlines.add(airline)
-                parsed = self._parse_recurring_row(
-                    row,
+        # A dated AeroDataBox result is more specific than an AirLabs recurring
+        # projection. It remains a reference-only row and never enters fare offers.
+        has_dated_schedule = any(
+            schedule.schedule_status == "live_schedule" for schedule in schedules
+        )
+        if not has_dated_schedule and self.aerodatabox_provider is not None:
+            try:
+                supplemental = self.aerodatabox_provider.search(
                     origin_code,
                     destination_code,
                     departure_date,
-                    origin_timezone,
-                    destination_timezone,
+                    origin_timezone=origin_timezone,
+                    destination_timezone=destination_timezone,
+                    fetched_at=observed,
                 )
-                if parsed is not None:
-                    schedules.append(parsed)
-        except Exception:
-            reasons.append("airlabs_routes_unavailable")
+                sample_truncated = sample_truncated or supplemental.sample_truncated
+                if supplemental.fallback_code:
+                    reasons.append(supplemental.fallback_code)
+                for item in supplemental.schedules:
+                    route_airlines.add(item.airline_code)
+                    schedules.append(
+                        FlightSchedule(
+                            airline_code=item.airline_code,
+                            flight_number=item.flight_number,
+                            schedule_status="future_schedule_reference",
+                            source="aerodatabox_schedule",
+                            departure_local=item.departure_local,
+                            arrival_local=item.arrival_local,
+                            departure_utc=item.departure_utc,
+                            arrival_utc=item.arrival_utc,
+                            duration_minutes=item.duration_minutes,
+                            departure_terminal=item.departure_terminal,
+                            arrival_terminal=item.arrival_terminal,
+                            aircraft_icao=item.aircraft_icao,
+                            provider_flight_status=item.provider_flight_status,
+                            observed_at=item.observed_at,
+                        )
+                    )
+            except Exception:
+                reasons.append("aerodatabox_provider_unavailable")
 
         unique: dict[tuple[str, str, datetime], FlightSchedule] = {}
+        schedule_priority = {
+            "live_schedule": 3,
+            "future_schedule_reference": 2,
+            "recurring_timetable_projection": 1,
+        }
         for schedule in schedules:
             existing = unique.get(schedule.identity)
-            if existing is None or schedule.schedule_status == "live_schedule":
+            if existing is None or schedule_priority.get(schedule.schedule_status, 0) > (
+                schedule_priority.get(existing.schedule_status, 0)
+            ):
                 unique[schedule.identity] = schedule
         eligible = [
             schedule
@@ -232,18 +286,16 @@ class ScheduleProvider:
         return result
 
     def _get_json(self, url: str, params: dict[str, Any]) -> Any:
-        response = self.client.get(
+        return self.airlabs_quota_gate.get_json(
+            self.client,
             url,
             params=params,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "flight-forecast-lab/0.2.0 (schedule data client)",
+                "User-Agent": "flight-forecast-lab/0.2.0 (AirLabs schedule client)",
             },
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        if hasattr(response, "raise_for_status"):
-            response.raise_for_status()
-        return response.json()
 
     @staticmethod
     def _response_rows(payload: Any) -> list[dict[str, Any]]:

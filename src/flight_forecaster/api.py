@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
+from flight_forecaster.airlabs_quota import (
+    AirLabsQuotaError,
+    AirLabsQuotaLedger,
+    airlabs_usage_path,
+    configured_airlabs_monthly_limit,
+)
 from flight_forecaster.route_info import RouteLookupError
 from flight_forecaster.schemas import (
     ComparisonRequest,
@@ -19,6 +26,8 @@ from flight_forecaster.schemas import (
     OnTimeRequest,
     PricePrediction,
     PriceRequest,
+    RuntimeProviderStatusItem,
+    RuntimeProviderStatusResponse,
     WeatherDetailResponse,
 )
 from flight_forecaster.service import OfferNotFoundError, PredictionService
@@ -48,6 +57,525 @@ def _service_or_503() -> PredictionService:
         return get_service()
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _credential_present(*names: str) -> bool:
+    return any(bool(os.getenv(name, "").strip()) for name in names)
+
+
+def _ignav_strict_release_active() -> bool:
+    return bool(
+        os.getenv("FLIGHT_OFFER_PROVIDER", "none").strip().lower() != "ignav_quarantine"
+        and _credential_present("IGNAV_API_KEY", "IGNAV_TOKEN")
+        and _environment_enabled("IGNAV_STRICT_RELEASE", default=False)
+        and _environment_enabled("IGNAV_FREE_ACCOUNT_ATTESTED", default=False)
+    )
+
+
+def _selected_provider_codes() -> set[str]:
+    ignav_code = (
+        "ignav_verified_fares"
+        if _ignav_strict_release_active()
+        else "ignav_quarantine"
+    )
+    aliases = {
+        "serpapi": {"serpapi_google_flights"},
+        "serpapi_google_flights": {"serpapi_google_flights"},
+        "searchapi": {"searchapi_google_flights"},
+        "searchapi_io": {"searchapi_google_flights"},
+        "searchapi_google_flights": {"searchapi_google_flights"},
+        "serpapi_searchapi": {
+            "serpapi_google_flights",
+            "searchapi_google_flights",
+        },
+        "auto": {
+            "serpapi_google_flights",
+            "searchapi_google_flights",
+            ignav_code,
+        },
+        "ignav": {ignav_code},
+        "ignav_quarantine": {"ignav_quarantine"},
+        "ignav_verified_fares": {ignav_code},
+    }
+    raw = os.getenv("FLIGHT_OFFER_PROVIDER", "none")
+    return aliases.get(raw.strip().lower(), set())
+
+
+def _serpapi_quota_limit(configured: bool) -> int | None:
+    if not configured:
+        return None
+    raw = os.getenv("SERPAPI_MONTHLY_LIMIT", "250").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 250
+    return min(max(value, 1), 250)
+
+
+def _bounded_quota_limit(
+    names: tuple[str, ...],
+    *,
+    default: int,
+    maximum: int,
+) -> int:
+    raw = next((os.getenv(name, "").strip() for name in names if os.getenv(name, "").strip()), "")
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return min(value, maximum) if value > 0 else default
+
+
+def _searchapi_quota_limit() -> int:
+    # SearchAPI's 100-request signup allocation is a one-time account allowance,
+    # not a monthly or billing-period renewal.
+    return _bounded_quota_limit(
+        ("SEARCHAPI_LIFETIME_LIMIT", "SEARCHAPI_MONTHLY_LIMIT"),
+        default=100,
+        maximum=100,
+    )
+
+
+def _ignav_quota_limit() -> int:
+    return _bounded_quota_limit(
+        ("IGNAV_LIFETIME_LIMIT",),
+        default=1_000,
+        maximum=1_000,
+    )
+
+
+def _scrape_do_quota_limit() -> int:
+    return _bounded_quota_limit(
+        ("SCRAPE_DO_MONTHLY_CREDIT_LIMIT", "SCRAPEDO_MONTHLY_CREDIT_LIMIT"),
+        default=1_000,
+        maximum=1_000,
+    )
+
+
+def _environment_enabled(name: str, *, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _airlabs_quota_status(
+    *, configured: bool
+) -> tuple[bool, str, int | None, int | None]:
+    """Return credential-safe AirLabs state without making a provider request."""
+
+    if not configured:
+        return False, "not_applicable", None, None
+    limit = configured_airlabs_monthly_limit()
+    if limit is None:
+        # Credentials alone never enable a potentially overage-bearing call.
+        return False, "not_applicable", None, None
+
+    quota_status = "unknown"
+    quota_used: int | None = None
+    effective_limit = limit
+    usage_path = airlabs_usage_path(
+        model_dir().parent / "runtime" / "airlabs-usage.sqlite3"
+    )
+    if not usage_path.is_file():
+        return True, quota_status, quota_used, effective_limit
+
+    try:
+        now = datetime.now(UTC)
+        ledger = AirLabsQuotaLedger(usage_path)
+        local_used = ledger.calls_used(now=now)
+        snapshot = ledger.account_snapshot(now=now)
+        observed_used = local_used
+        provider_exhausted = False
+        if snapshot is not None:
+            observed_used = max(observed_used, snapshot.limits_total)
+            if snapshot.limits_by_month > 0:
+                effective_limit = min(effective_limit, snapshot.limits_by_month)
+            else:
+                provider_exhausted = True
+            provider_exhausted = provider_exhausted or snapshot.remaining <= 0
+        quota_used = min(observed_used, effective_limit)
+        quota_status = (
+            "exhausted"
+            if provider_exhausted or observed_used >= effective_limit
+            else "available"
+        )
+    except (AirLabsQuotaError, OSError):
+        # Never leak local exception details through the public status endpoint.
+        quota_status = "unknown"
+        quota_used = None
+    return True, quota_status, quota_used, effective_limit
+
+
+def _runtime_provider_status(
+    fare_metadata: object | None = None,
+) -> RuntimeProviderStatusResponse:
+    external_context_enabled = _environment_enabled(
+        "EXTERNAL_CONTEXT_ENABLED", default=True
+    )
+    selected = _selected_provider_codes()
+    serpapi_configured = _credential_present("SERPAPI_API_KEY")
+    searchapi_configured = _credential_present("SEARCHAPI_API_KEY")
+    ignav_configured = _credential_present("IGNAV_API_KEY", "IGNAV_TOKEN")
+    ignav_released = _ignav_strict_release_active()
+    scrape_do_configured = _credential_present(
+        "SCRAPE_DO_API_TOKEN",
+        "SCRAPEDO_API_TOKEN",
+        "SCRAPE_DO_TOKEN",
+        "SCRAPE_DO_API_KEY",
+        "SCRAPEDO_API_KEY",
+    )
+    airlabs_configured = _credential_present("AIRLABS_API_KEY")
+    (
+        airlabs_active,
+        airlabs_quota_status,
+        airlabs_quota_used,
+        airlabs_quota_limit,
+    ) = _airlabs_quota_status(configured=airlabs_configured)
+    airlabs_active = airlabs_active and external_context_enabled
+    aerodatabox_configured = _credential_present("AERODATABOX_API_KEY")
+    aerodatabox_active = aerodatabox_configured and external_context_enabled
+    opensky_registered = _credential_present("OPENSKY_CLIENT_ID") and _credential_present(
+        "OPENSKY_CLIENT_SECRET"
+    )
+    opensky_active = (
+        _environment_enabled("OPENSKY_ENABLED") and external_context_enabled
+    )
+    opensky_limit = _bounded_quota_limit(
+        ("OPENSKY_DAILY_CREDIT_LIMIT",),
+        default=4_000 if opensky_registered else 400,
+        maximum=4_000 if opensky_registered else 400,
+    )
+
+    strict_notice = {
+        "zh": (
+            "只有具有正价格、完整连续航段、真实航班号与时刻，并通过安全购票路径验证的报价"
+            "才能进入严格列表。额度耗尽的提供商会自动停止；隔离或仅参考来源绝不用于补造航班。"
+        ),
+        "en": (
+            "Only offers with a positive fare, complete continuous segments, real flight numbers "
+            "and times, and a verified safe booking path may enter the strict list. Providers stop "
+            "when quota is exhausted; quarantined and reference-only sources never fabricate "
+            "fallback flights."
+        ),
+    }
+
+    def strict_item(
+        *,
+        code: str,
+        name: str,
+        configured: bool,
+        eligible: bool,
+        quarantined: bool = False,
+        quota_limit: int | None = None,
+        quota_unit: str | None = None,
+        notice: dict[str, str] | None = None,
+    ) -> RuntimeProviderStatusItem:
+        if quarantined:
+            status = "quarantined"
+        else:
+            status = "configured" if configured else "not_configured"
+        if notice is None and quarantined:
+            notice = {
+                "zh": "该来源处于隔离状态；即使已配置，也不能向严格航班列表提供报价。",
+                "en": (
+                    "This source is quarantined and cannot supply the strict flight list even "
+                    "when configured."
+                ),
+            }
+        elif notice is None:
+            notice = {
+                "zh": "配置只表示凭据存在；每个报价仍须独立通过严格行程、价格与购票路径验证。",
+                "en": (
+                    "Configured means credentials are present; every offer must still pass "
+                    "independent itinerary, fare, and booking-path verification."
+                ),
+            }
+        return RuntimeProviderStatusItem(
+            code=code,
+            display_name=name,
+            role="strict_fare" if eligible else "strict_fare_candidate",
+            configured=configured,
+            active=code in selected,
+            status=status,
+            quota_status="unknown" if configured else "not_applicable",
+            quota_limit=quota_limit,
+            quota_unit=quota_unit if quota_limit is not None else None,
+            can_supply_strict_offers=eligible,
+            notice=notice,
+        )
+
+    providers = [
+        strict_item(
+            code="serpapi_google_flights",
+            name="SerpApi · Google Flights",
+            configured=serpapi_configured,
+            eligible=True,
+            quota_limit=_serpapi_quota_limit(serpapi_configured),
+            quota_unit="billing_period_requests",
+            notice={
+                "zh": (
+                    "严格报价源；本地硬上限按提供商账户结算周期执行，不按自然月重置。"
+                    "每个报价仍须通过完整行程、价格和购票路径验证。"
+                ),
+                "en": (
+                    "Strict fare source. Its local hard stop follows the provider account billing "
+                    "period, not a calendar month; every offer still requires full itinerary, "
+                    "fare, and booking-path verification."
+                ),
+            },
+        ),
+        strict_item(
+            code="searchapi_google_flights",
+            name="SearchAPI.io · Google Flights",
+            configured=searchapi_configured,
+            eligible=True,
+            quota_limit=_searchapi_quota_limit(),
+            quota_unit="lifetime_requests",
+            notice={
+                "zh": (
+                    "严格后备报价源；免费注册额度为账户一次性 100 次请求，不会按月恢复。"
+                    "每个报价仍须通过完整行程、价格和购票路径验证。"
+                ),
+                "en": (
+                    "Strict fallback fare source. The free signup allocation is 100 lifetime "
+                    "account requests and does not renew monthly; every offer still requires full "
+                    "itinerary, fare, and booking-path verification."
+                ),
+            },
+        ),
+        strict_item(
+            code=("ignav_verified_fares" if ignav_released else "ignav_quarantine"),
+            name=("Ignav Verified Fares" if ignav_released else "Ignav (strict quarantine)"),
+            configured=ignav_configured,
+            eligible=ignav_released,
+            quarantined=not ignav_released,
+            quota_limit=_ignav_quota_limit(),
+            quota_unit="lifetime_requests",
+            notice={
+                "zh": (
+                    "已完成显式严格发布与无付费方式确认；该独立已验证身份可参与严格链路，"
+                    "但账户一次性免费额度仍最多为 1,000 次请求。"
+                    if ignav_released
+                    else (
+                        "实验性来源保持隔离；账户一次性免费额度最多 1,000 次请求，"
+                        "只有完成受控实时验证、无付费方式确认并明确解除隔离后才可进入严格链路。"
+                    )
+                ),
+                "en": (
+                    "Explicit strict release and no-payment-method attestation are complete. "
+                    "This separately identified verified source may participate in the strict "
+                    "chain, while its one-time free allowance remains capped at 1,000 requests."
+                    if ignav_released
+                    else (
+                        "This experimental source remains quarantined. Its one-time free "
+                        "allowance is at most 1,000 requests; it cannot enter the strict chain "
+                        "until controlled validation, no-payment-method attestation, and explicit "
+                        "release are all complete."
+                    )
+                ),
+            },
+        ),
+        RuntimeProviderStatusItem(
+            code="scrape_do_google_flights_reference",
+            display_name="Scrape.do · Google Flights",
+            role="reference_only",
+            configured=scrape_do_configured,
+            active=scrape_do_configured,
+            status="reference_only",
+            quota_status="unknown" if scrape_do_configured else "not_applicable",
+            quota_limit=_scrape_do_quota_limit(),
+            quota_unit="monthly_credits",
+            quota_cost_per_call=10,
+            can_supply_strict_offers=False,
+            notice={
+                "zh": (
+                    "仅提供聚合覆盖参考，绝不单独生成严格航班。免费硬上限为每月 1,000 点数；"
+                    "每次参考查询预留 10 点数，瞬时失败最多受控重试一次。"
+                ),
+                "en": (
+                    "Aggregate coverage reference only; it never creates strict flights. The free "
+                    "hard stop is 1,000 credits per month, with 10 credits reserved per reference "
+                    "call and at most one controlled retry after a transient failure."
+                ),
+            },
+        ),
+        RuntimeProviderStatusItem(
+            code="airlabs_reference",
+            display_name="AirLabs",
+            role="reference_only",
+            configured=airlabs_configured,
+            active=airlabs_active,
+            status="reference_only",
+            quota_status=airlabs_quota_status,
+            quota_used=airlabs_quota_used,
+            quota_limit=airlabs_quota_limit,
+            quota_unit=(
+                "billing_period_requests" if airlabs_quota_limit is not None else None
+            ),
+            can_supply_strict_offers=False,
+            notice=(
+                {
+                    "zh": (
+                        "已配置凭据，但缺少 1–1000 范围内有效的 "
+                        "AIRLABS_MONTHLY_CALL_LIMIT；所有 AirLabs 网络调用均已关闭并拒绝执行。"
+                    ),
+                    "en": (
+                        "Credentials are configured, but AirLabs fails closed until "
+                        "AIRLABS_MONTHLY_CALL_LIMIT is a valid value from 1 to 1,000; all "
+                        "AirLabs network calls remain disabled."
+                    ),
+                }
+                if airlabs_configured and airlabs_quota_limit is None
+                else {
+                    "zh": (
+                        "仅提供机场运行与时刻参考，不能证明票价、库存或可购买。所有调用共用"
+                        "本地硬上限；状态页只读取已有账本中的脱敏计数，不会发起网络请求。"
+                    ),
+                    "en": (
+                        "Airport-operations and timetable reference only; it cannot prove fare, "
+                        "inventory, or bookability. All calls share a local hard stop, and this "
+                        "status reads only sanitized existing-ledger counts without network I/O."
+                    ),
+                }
+            ),
+        ),
+        RuntimeProviderStatusItem(
+            code="aerodatabox_reference",
+            display_name="AeroDataBox",
+            role="reference_only",
+            configured=aerodatabox_configured,
+            active=aerodatabox_active,
+            status="reference_only",
+            quota_status="unknown" if aerodatabox_active else "not_applicable",
+            quota_limit=(
+                _bounded_quota_limit(
+                    ("AERODATABOX_MONTHLY_UNIT_LIMIT",),
+                    default=600,
+                    maximum=600,
+                )
+                if aerodatabox_configured
+                else None
+            ),
+            quota_unit="provider_managed" if aerodatabox_configured else None,
+            can_supply_strict_offers=False,
+            notice={
+                "zh": (
+                    "仅提供日期级时刻参考，不提供已验证的当前票价或购票路径。可信的 "
+                    "RapidAPI 免费计划 reset 信息定义供应商周期；没有可信重置信号时，"
+                    "执行同一安装生命周期 600 API 单位硬墙。"
+                ),
+                "en": (
+                    "Dated schedule reference only; it does not provide a verified current fare "
+                    "or booking path. Trusted RapidAPI free-plan reset evidence defines a provider "
+                    "cycle; without a trustworthy reset signal, a 600-unit installation-lifetime "
+                    "hard wall applies."
+                ),
+            },
+        ),
+        RuntimeProviderStatusItem(
+            code="opensky_reference",
+            display_name="OpenSky Network",
+            role="reference_only",
+            configured=opensky_registered,
+            active=opensky_active,
+            status="reference_only",
+            quota_status="unknown" if opensky_active else "not_applicable",
+            quota_limit=opensky_limit,
+            quota_unit="daily_credits",
+            can_supply_strict_offers=False,
+            notice={
+                "zh": (
+                    "仅提供当前航迹密度运行参考，不能证明未来机票可购。即使没有凭据，匿名模式也默认启用，"
+                    "本地硬上限为每日 400 API 点数；OAuth 凭据完整时最多为每日 4,000 点数。"
+                ),
+                "en": (
+                    "Current trajectory-density reference only; it cannot prove a future ticket "
+                    "is bookable. Anonymous mode is active by default without credentials with a "
+                    "400-API-credit daily hard stop; complete OAuth credentials raise the ceiling "
+                    "to at most 4,000 per day."
+                ),
+            },
+        ),
+    ]
+
+    metadata = fare_metadata
+    top_level_provider_code = str(
+        getattr(metadata, "provider_code", "") or ""
+    ).strip().lower()
+    if top_level_provider_code == "strict_fare_aggregate":
+        raw_provider_runs = getattr(metadata, "provider_runs", ()) or ()
+        metadata_runs = (
+            tuple(raw_provider_runs)
+            if isinstance(raw_provider_runs, (list, tuple))
+            else ()
+        )
+    else:
+        metadata_runs = (metadata,)
+
+    provider_indexes = {
+        provider.code: index
+        for index, provider in enumerate(providers)
+        if provider.role != "reference_only"
+    }
+    for run in metadata_runs:
+        provider_code = str(getattr(run, "provider_code", "") or "").strip().lower()
+        provider_code = {
+            "serpapi": "serpapi_google_flights",
+            "searchapi": "searchapi_google_flights",
+            "ignav": "ignav_verified_fares" if ignav_released else "ignav_quarantine",
+        }.get(provider_code, provider_code)
+        if provider_code == "none" or not provider_code:
+            provider_code = next(iter(selected), "") if len(selected) == 1 else ""
+        provider_index = provider_indexes.get(provider_code)
+        if provider_index is None:
+            continue
+
+        provider = providers[provider_index]
+        fare_status = str(getattr(run, "status", "") or "").strip().lower()
+        coverage_status = str(
+            getattr(run, "coverage_status", "") or ""
+        ).strip().lower()
+        used = getattr(run, "monthly_calls_used", None)
+        limit = getattr(run, "monthly_call_limit", None)
+        exhausted = fare_status in {"budget_exhausted", "rate_limited"} or coverage_status in {
+            "quota_limited",
+            "quota_and_provider_incomplete",
+        }
+        succeeded = fare_status in {"confirmed_offers", "no_results"} and not exhausted
+        update: dict[str, object] = {"active": True}
+        if exhausted:
+            update.update(status="quota_exhausted", quota_status="exhausted")
+        elif succeeded and provider.status != "quarantined":
+            update.update(status="quota_available", quota_status="available")
+        if isinstance(used, int) and not isinstance(used, bool) and used >= 0:
+            update["quota_used"] = (
+                min(used, limit)
+                if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
+                else used
+            )
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            update["quota_limit"] = limit
+            metadata_quota_unit = getattr(run, "quota_unit", None)
+            update["quota_unit"] = metadata_quota_unit or (
+                "lifetime_requests"
+                if provider.code
+                in {
+                    "searchapi_google_flights",
+                    "ignav_quarantine",
+                    "ignav_verified_fares",
+                }
+                else "billing_period_requests"
+            )
+        providers[provider_index] = RuntimeProviderStatusItem.model_validate(
+            {**provider.model_dump(), **update}
+        )
+
+    return RuntimeProviderStatusResponse(
+        generated_at=datetime.now(UTC),
+        strict_policy=strict_notice,
+        providers=providers,
+    )
 
 
 @app.get("/", include_in_schema=False)
@@ -91,9 +619,7 @@ def health() -> dict[str, str | bool]:
             service is not None and service.flight_offer_provider.configured
         ),
         "fare_provider_environment": (
-            service.flight_offer_provider.environment
-            if service is not None
-            else "disabled"
+            service.flight_offer_provider.environment if service is not None else "disabled"
         ),
     }
 
@@ -101,6 +627,13 @@ def health() -> dict[str, str | bool]:
 @app.get("/v1/model-info")
 def model_info() -> dict:
     return _service_or_503().model_info()
+
+
+@app.get("/v1/provider-status", response_model=RuntimeProviderStatusResponse)
+def provider_status() -> RuntimeProviderStatusResponse:
+    """Return credential-safe provider roles and runtime availability metadata."""
+
+    return _runtime_provider_status()
 
 
 @app.post("/v1/predict/price", response_model=PricePrediction)
@@ -122,7 +655,9 @@ def predict_ontime(request: OnTimeRequest) -> OnTimePrediction:
 @app.post("/v1/compare", response_model=ComparisonResponse)
 def compare_flights(request: ComparisonRequest) -> ComparisonResponse:
     try:
-        return _service_or_503().compare(request)
+        response = _service_or_503().compare(request)
+        runtime = _runtime_provider_status(response.fare_search_metadata)
+        return response.model_copy(update={"provider_statuses": runtime.providers})
     except RouteLookupError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

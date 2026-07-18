@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 from timezonefinder import TimezoneFinder
 
+from flight_forecaster.airlabs_quota import AirLabsQuotaGate
 from flight_forecaster.availability import (
     ConfirmedFlightOffer,
     FlightOfferSearchResult,
@@ -52,6 +53,7 @@ from flight_forecaster.schemas import (
     ComparisonResponse,
     ContextDetailRequest,
     ContextSignal,
+    FareCoverageReference,
     FareSearchMetadata,
     ItineraryLayover,
     ItineraryLeg,
@@ -77,7 +79,34 @@ from flight_forecaster.schemas import (
     TimetableReference,
     WeatherDetailResponse,
 )
+from flight_forecaster.scrapedo_reference import (
+    SCRAPE_DO_PROVIDER_CODE,
+    SCRAPE_DO_PROVIDER_NAME,
+    ScrapeDoReferenceResult,
+    scrapedo_reference_provider_from_env,
+)
+from flight_forecaster.supplemental_aviation import (
+    aerodatabox_provider_from_env,
+    opensky_provider_from_env,
+    supplemental_usage_path,
+)
 from flight_forecaster.training import ARTIFACT_FILENAME, SCHEMA_VERSION
+
+_FARE_PROVIDER_SOURCE_URLS = {
+    "serpapi_google_flights": "https://serpapi.com/google-flights-api",
+    "searchapi_google_flights": "https://www.searchapi.io/google-flights",
+    "ignav_verified_fares": "https://ignav.com/",
+}
+_FARE_PROVIDER_SCHEDULE_SOURCES = {
+    "serpapi_google_flights": "serpapi_google_flights_booking",
+    "searchapi_google_flights": "searchapi_google_flights_booking",
+    "ignav_verified_fares": "ignav_verified_booking",
+}
+_FARE_PROVIDER_DETAIL_BASES = {
+    "serpapi_google_flights": "serpapi_booking_confirmed",
+    "searchapi_google_flights": "searchapi_booking_confirmed",
+    "ignav_verified_fares": "ignav_verified_booking_confirmed",
+}
 
 
 @lru_cache(maxsize=1)
@@ -207,6 +236,7 @@ class PredictionService:
         detail_provider: DetailProvider | None = None,
         schedule_provider: ScheduleProvider | None = None,
         flight_offer_provider: Any | None = None,
+        fare_reference_provider: Any | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.model_dir = Path(model_dir)
@@ -220,21 +250,42 @@ class PredictionService:
         if self.bundle.get("artifact_schema_version") != SCHEMA_VERSION:
             raise ValueError("unsupported model artifact schema; run train-demo again")
 
+        supplemental_usage = supplemental_usage_path(
+            self.model_dir.parent / "runtime" / "supplemental-aviation-usage.sqlite3"
+        )
+        airlabs_quota_gate = AirLabsQuotaGate.from_env(
+            default_usage_path=self.model_dir.parent / "runtime" / "airlabs-usage.sqlite3"
+        )
         self.context_provider = context_provider or ContextProvider(
             airlabs_api_key=os.getenv("AIRLABS_API_KEY"),
             context_priors=self.bundle.get("context_priors"),
+            opensky_provider=opensky_provider_from_env(supplemental_usage),
+            airlabs_quota_gate=airlabs_quota_gate,
         )
         self.detail_provider = detail_provider or DetailProvider(self.context_provider)
         self.schedule_provider = schedule_provider or ScheduleProvider(
             api_key=self.context_provider.airlabs_api_key,
             client=self.context_provider.client,
             enabled=self.context_provider.external_context_enabled,
+            aerodatabox_provider=aerodatabox_provider_from_env(supplemental_usage),
+            airlabs_quota_gate=(
+                self.context_provider.airlabs_quota_gate
+                if context_provider is not None
+                else airlabs_quota_gate
+            ),
         )
         self.flight_offer_provider = (
             flight_offer_provider
             if flight_offer_provider is not None
             else flight_offer_provider_from_env(
                 self.model_dir.parent / "runtime" / "serpapi-usage.sqlite3"
+            )
+        )
+        self.fare_reference_provider = (
+            fare_reference_provider
+            if fare_reference_provider is not None
+            else scrapedo_reference_provider_from_env(
+                self.model_dir.parent / "runtime" / "scrapedo-reference-usage.sqlite3"
             )
         )
         self._now_provider = now_provider or (lambda: datetime.now(UTC))
@@ -417,9 +468,9 @@ class PredictionService:
     def _provider_local_time(value: datetime, airport: Airport) -> datetime:
         """Attach an airport timezone to a provider-local wall-clock time.
 
-        Google Flights returns airport-local segment clocks without UTC offsets.
-        Strict mode resolves them from the airport and rejects DST gaps or ambiguous
-        folds instead of guessing an instant.
+        Strict fare sources may return airport-local segment clocks without UTC
+        offsets. Strict mode resolves them from the airport and rejects DST gaps or
+        ambiguous folds instead of guessing an instant.
         """
 
         if value.tzinfo is not None or value.utcoffset() is not None:
@@ -575,12 +626,13 @@ class PredictionService:
 
     @staticmethod
     def _fare_metadata(result: FlightOfferSearchResult) -> FareSearchMetadata:
+        provider_label = result.provider_name
         notices = {
             "confirmed_offers": BilingualText(
-                zh="报价已通过 Google Flights 搜索及 booking token 购票选项二次验证。",
+                zh=f"{provider_label} 返回的报价已通过完整行程、正价格与安全购票路径验证。",
                 en=(
-                    "Offers passed both the Google Flights search and booking-token "
-                    "booking-option verification."
+                    f"Offers returned by {provider_label} passed complete-itinerary, "
+                    "positive-fare, and safe-booking-path verification."
                 ),
             ),
             "no_results": BilingualText(
@@ -588,9 +640,9 @@ class PredictionService:
                 en="The production fare source returned no strictly verified offer.",
             ),
             "not_configured": BilingualText(
-                zh="尚未配置 SerpApi API 密钥；严格模式不会用时刻表补造结果。",
+                zh="尚未配置当前严格报价源的凭据；严格模式不会用时刻表补造结果。",
                 en=(
-                    "A SerpApi API key is not configured; strict mode "
+                    "The active strict fare provider is not configured; strict mode "
                     "does not substitute timetable projections."
                 ),
             ),
@@ -599,34 +651,38 @@ class PredictionService:
                 en=("Test or illustrative fare data is rejected by strict mode."),
             ),
             "authentication_failed": BilingualText(
-                zh="SerpApi 认证失败；未返回未验证航班。",
-                en="SerpApi authentication failed; no unverified flights were returned.",
+                zh=f"{provider_label} 认证失败；未返回未验证航班。",
+                en=(
+                    f"{provider_label} authentication failed; no unverified flights "
+                    "were returned."
+                ),
             ),
             "rate_limited": BilingualText(
                 zh="生产报价源当前限流；严格模式返回空结果。",
                 en="The production fare source is rate-limited; strict mode returns no offers.",
             ),
             "budget_not_configured": BilingualText(
-                zh="尚未设置本地免费月额度上限；为防止超额计费，本次未调用生产接口。",
+                zh="尚未设置适用的本地免费额度硬上限；为防止超额计费，本次未调用生产接口。",
                 en=(
-                    "Local monthly free-quota limits are not configured, so the "
+                    "The applicable local free-quota hard limit is not configured, so the "
                     "production API was not called to prevent overage charges."
                 ),
             ),
             "budget_exhausted": BilingualText(
-                zh="本地免费月额度保护已触发；本次不再调用生产接口。",
+                zh="本地免费额度硬保护已触发；本次不再调用生产接口。",
                 en=(
-                    "The local monthly free-quota guard is exhausted; no further "
+                    "The local free-quota hard guard is exhausted; no further "
                     "production calls were made."
                 ),
             ),
             "provider_processing": BilingualText(
                 zh=(
-                    "报价任务仍在 SerpApi 队列中或处理中；系统已完成有界轮询，未重新提交整组搜索。"
+                    f"{provider_label} 报价任务仍在队列中或处理中；系统已完成有界轮询，"
+                    "并最多进行一次额度受控的重提。"
                 ),
                 en=(
-                    "The fare search is still queued or processing at SerpApi after "
-                    "bounded polling; the full search was not resubmitted."
+                    f"The fare search is still queued or processing at {provider_label} after "
+                    "bounded polling and at most one quota-reserved controlled retry."
                 ),
             ),
             "provider_error": BilingualText(
@@ -652,13 +708,39 @@ class PredictionService:
             result.search_monthly_used,
             result.pricing_monthly_used,
         )
-        # SerpApi has one shared monthly pool for initial searches and
-        # booking-token follow-ups.  The provider exposes that pool in exactly
-        # one legacy slot; never add the slots and accidentally report 500.
+        # Every strict provider exposes its single shared hard limit in exactly
+        # one legacy quota slot. Never add the slots and double-count it.
         monthly_limit = next((value for value in limits if value is not None), None)
         monthly_used = next((value for value in usage if value is not None), None)
+        if result.status == "not_configured":
+            monthly_limit = None
+            monthly_used = None
         notice = notices[result.status]
-        if result.coverage_status in {"quota_limited", "quota_and_provider_incomplete"}:
+        if result.provider_runs:
+            run_summary = "; ".join(
+                f"{run.provider_name}: {run.status}" for run in result.provider_runs
+            )
+            notice = BilingualText(
+                zh=(
+                    f"系统已执行 {len(result.provider_runs)} 个可用严格报价源，"
+                    "并仅聚合各来源独立完成二次购票验证的结果。"
+                    f"同一完整航段与舱位只保留最低最终确认价；逐源状态：{run_summary}。"
+                ),
+                en=(
+                    f"The system ran {len(result.provider_runs)} available strict fare "
+                    "sources and aggregated only offers that independently passed each "
+                    "source's second-stage booking verification. Equivalent complete "
+                    "itineraries and cabins retain only the lowest final confirmed fare. "
+                    f"Per-source status: {run_summary}."
+                ),
+            )
+        elif result.coverage_status in {"quota_limited", "quota_and_provider_incomplete"}:
+            quota_scope_zh = {
+                "hourly": "小时",
+                "monthly": "月度",
+                "lifetime": "账户终身",
+                "provider_specific": "各供应商独立",
+            }.get(result.quota_limit, "供应商")
             provider_failure_zh = (
                 f"另有 {result.provider_failed_candidate_count} 个候选因供应商错误未完成验证；"
                 if result.provider_failed_candidate_count
@@ -670,38 +752,76 @@ class PredictionService:
                 if result.provider_failed_candidate_count
                 else ""
             )
+            cabin_failure_zh = (
+                f"另有 {result.search_failed_cabin_count} 个舱位搜索因供应商错误未完成；"
+                if result.search_failed_cabin_count
+                else ""
+            )
+            cabin_failure_en = (
+                f" A further {result.search_failed_cabin_count} cabin search(es) failed "
+                "because of provider errors."
+                if result.search_failed_cabin_count
+                else ""
+            )
             notice = BilingualText(
                 zh=(
-                    f"SerpApi 四舱搜索返回 {result.eligible_candidate_count} 个可验证候选；"
-                    f"本次受免费{('小时' if result.quota_limit == 'hourly' else '月度')}额度限制，"
+                    f"{provider_label} 四舱搜索返回 "
+                    f"{result.eligible_candidate_count} 个可验证候选；"
+                    f"本次受免费{quota_scope_zh}额度限制，"
                     f"仅尝试 {result.verification_attempted_count} 个，跳过 "
                     f"{result.quota_skipped_candidate_count} 个。{provider_failure_zh}"
+                    f"{cabin_failure_zh}"
                     "列表只包含成功严格验证的航班，"
                     "最低价仅指已验证子集。"
                 ),
                 en=(
-                    f"SerpApi's four-cabin search returned {result.eligible_candidate_count} "
+                    f"{provider_label}'s four-cabin search returned "
+                    f"{result.eligible_candidate_count} "
                     f"verifiable candidate(s). The free "
                     f"{result.quota_limit or 'provider'} quota allowed "
                     f"{result.verification_attempted_count} attempt(s), leaving "
                     f"{result.quota_skipped_candidate_count} unverified."
-                    f"{provider_failure_en} Only strictly "
+                    f"{provider_failure_en}{cabin_failure_en} Only strictly "
                     "verified flights are listed; the lowest price applies to the verified "
                     "subset only."
                 ),
             )
         elif result.coverage_status == "provider_incomplete":
+            candidate_failure_zh = (
+                f"其中 {result.provider_failed_candidate_count} 个候选因供应商错误"
+                "未能完成验证。"
+                if result.provider_failed_candidate_count
+                else ""
+            )
+            candidate_failure_en = (
+                f" {result.provider_failed_candidate_count} candidate(s) could not be "
+                "completed because of provider errors."
+                if result.provider_failed_candidate_count
+                else ""
+            )
+            cabin_failure_zh = (
+                f"另有 {result.search_failed_cabin_count} 个舱位搜索因供应商错误未完成。"
+                if result.search_failed_cabin_count
+                else ""
+            )
+            cabin_failure_en = (
+                f" {result.search_failed_cabin_count} cabin search(es) could not be "
+                "completed because of provider errors."
+                if result.search_failed_cabin_count
+                else ""
+            )
             notice = BilingualText(
                 zh=(
-                    f"已尝试 SerpApi 返回的全部 {result.eligible_candidate_count} 个候选，"
-                    f"其中 {result.provider_failed_candidate_count} 个因供应商错误未能完成验证。"
+                    f"已尝试 {provider_label} 成功舱位返回的全部 "
+                    f"{result.eligible_candidate_count} 个候选。"
+                    f"{candidate_failure_zh}{cabin_failure_zh}"
                     "列表只包含成功严格验证的航班。"
                 ),
                 en=(
-                    f"All {result.eligible_candidate_count} SerpApi candidate(s) were "
-                    f"attempted, but {result.provider_failed_candidate_count} could not be "
-                    "completed because of provider errors. Only strictly verified flights "
-                    "are listed."
+                    f"All {result.eligible_candidate_count} candidate(s) returned by "
+                    f"successful {provider_label} cabin searches were attempted."
+                    f"{candidate_failure_en}{cabin_failure_en} Only strictly verified "
+                    "flights are listed."
                 ),
             )
         if result.cache_hit and result.coverage_status != "not_evaluated":
@@ -715,12 +835,25 @@ class PredictionService:
         return FareSearchMetadata(
             status=result.status,
             provider_code=(
-                "none" if result.status == "not_configured" else "serpapi_google_flights"
+                "none" if result.status == "not_configured" else result.provider_code
             ),
+            provider_name=(
+                "No strict fare provider"
+                if result.status == "not_configured"
+                else result.provider_name
+            ),
+            provider_runs=[
+                PredictionService._fare_metadata(provider_run)
+                for provider_run in result.provider_runs
+            ],
             environment=(
                 "disabled"
                 if result.status == "not_configured"
-                else ("production" if result.environment == "production" else "test")
+                else (
+                    result.environment
+                    if result.environment in {"production", "test", "disabled"}
+                    else "disabled"
+                )
             ),
             observed_at=result.observed_at,
             searched_cabins=list(result.searched_cabins),
@@ -730,10 +863,32 @@ class PredictionService:
             cache_hit=result.cache_hit,
             monthly_call_limit=monthly_limit,
             monthly_calls_used=monthly_used,
-            search_monthly_limit=result.search_monthly_limit,
-            search_monthly_used=result.search_monthly_used,
-            pricing_monthly_limit=result.pricing_monthly_limit,
-            pricing_monthly_used=result.pricing_monthly_used,
+            quota_unit=(
+                None
+                if monthly_limit is None
+                else (
+                    "lifetime_requests"
+                    if result.provider_code
+                    in {
+                        "searchapi_google_flights",
+                        "ignav_quarantine",
+                        "ignav_verified_fares",
+                    }
+                    else "billing_period_requests"
+                )
+            ),
+            search_monthly_limit=(
+                None if result.status == "not_configured" else result.search_monthly_limit
+            ),
+            search_monthly_used=(
+                None if result.status == "not_configured" else result.search_monthly_used
+            ),
+            pricing_monthly_limit=(
+                None if result.status == "not_configured" else result.pricing_monthly_limit
+            ),
+            pricing_monthly_used=(
+                None if result.status == "not_configured" else result.pricing_monthly_used
+            ),
             archive_poll_count=result.archive_poll_count,
             diagnostics=[
                 {
@@ -751,11 +906,120 @@ class PredictionService:
             verified_candidate_count=result.verified_candidate_count,
             strictly_rejected_candidate_count=result.strictly_rejected_candidate_count,
             provider_failed_candidate_count=result.provider_failed_candidate_count,
+            search_failed_cabin_count=result.search_failed_cabin_count,
             quota_skipped_candidate_count=result.quota_skipped_candidate_count,
             deduplicated_verified_count=result.deduplicated_verified_count,
             coverage_status=result.coverage_status,
             quota_limit=result.quota_limit,
+            retry_quota_limited=result.retry_quota_limited,
             notice=notice,
+        )
+
+    @staticmethod
+    def _fare_reference_snapshot(
+        result: ScrapeDoReferenceResult,
+    ) -> FareCoverageReference:
+        notices = {
+            "available": BilingualText(
+                zh=(
+                    "Scrape.do 仅返回一次经济舱列表覆盖快照。候选数量和最低参考价未经购票展开验证，"
+                    "不能证明库存、最终价格或可购买性，也永远不会进入严格航班列表。"
+                ),
+                en=(
+                    "Scrape.do supplied one economy listing-coverage snapshot only. "
+                    "Candidate counts and the lowest reference price lack booking expansion, "
+                    "do not prove inventory, final price, or bookability, and can never enter "
+                    "the strict flight list."
+                ),
+            ),
+            "no_results": BilingualText(
+                zh=(
+                    "Scrape.do 的单次经济舱参考查询成功完成，但没有返回通过基础结构检查的列表候选；"
+                    "这不证明该航线没有可购买机票。"
+                ),
+                en=(
+                    "The single Scrape.do economy reference query completed but returned no "
+                    "listing candidates that passed basic structural checks; this does not "
+                    "prove that no bookable ticket exists."
+                ),
+            ),
+            "not_configured": BilingualText(
+                zh="未配置 Scrape.do 免费令牌，因此没有执行候选覆盖参考查询。",
+                en=(
+                    "No Scrape.do free-tier token is configured, so no candidate-coverage "
+                    "reference query was made."
+                ),
+            ),
+            "quota_exhausted": BilingualText(
+                zh=(
+                    "Scrape.do 本地免费额度硬上限或提供方免费余额已耗尽；"
+                    "系统已在下一次航班请求前停止，未使用付费额度。"
+                ),
+                en=(
+                    "The local Scrape.do free-credit hard stop or provider-reported free "
+                    "balance is exhausted; the system stopped before another flight request "
+                    "and did not use paid quota."
+                ),
+            ),
+            "authentication_failed": BilingualText(
+                zh="Scrape.do 拒绝了凭据；错误信息已脱敏，未显示或保存令牌。",
+                en=(
+                    "Scrape.do rejected the credential; the error is sanitized and the token "
+                    "is neither displayed nor retained in diagnostics."
+                ),
+            ),
+            "rate_limited": BilingualText(
+                zh=(
+                    "Scrape.do 暂时限流；系统最多在重新确认免费余额后受控重试一次，"
+                    "且不会用参考数据补造可购航班。"
+                ),
+                en=(
+                    "Scrape.do temporarily rate-limited the request; the system may retry "
+                    "once only after re-confirming free quota, and this reference can never "
+                    "fabricate a bookable flight."
+                ),
+            ),
+            "provider_error": BilingualText(
+                zh=(
+                    "Scrape.do 返回 HTTP 或传输错误；仅保留脱敏状态与固定异常类型，未保留原始响应。"
+                ),
+                en=(
+                    "Scrape.do returned an HTTP or transport error; only a sanitized status "
+                    "and fixed exception type are retained, not the raw response."
+                ),
+            ),
+            "provider_unavailable": BilingualText(
+                zh=(
+                    "Scrape.do 响应缺失或未通过结构校验；没有候选详情、令牌或价格被采用。"
+                ),
+                en=(
+                    "The Scrape.do response was missing or failed structural validation; no "
+                    "candidate detail, token, or price was accepted."
+                ),
+            ),
+        }
+        return FareCoverageReference(
+            provider_code=SCRAPE_DO_PROVIDER_CODE,
+            provider_name=SCRAPE_DO_PROVIDER_NAME,
+            status=result.status,
+            observed_at=result.observed_at,
+            candidate_count=result.candidate_count,
+            direct_candidate_count=result.direct_candidate_count,
+            lowest_price_usd=result.lowest_price_usd,
+            price_level=result.price_level,
+            typical_price_low_usd=result.typical_price_low_usd,
+            typical_price_high_usd=result.typical_price_high_usd,
+            cache_hit=result.cache_hit,
+            credits_reserved=result.credits_reserved,
+            monthly_credits_used=result.monthly_credits_used,
+            monthly_credit_limit=result.monthly_credit_limit,
+            http_status=result.http_status,
+            exception_type=result.exception_type,
+            provider_reported_request_cost=result.provider_reported_request_cost,
+            provider_reported_remaining_credits=(
+                result.provider_reported_remaining_credits
+            ),
+            notice=notices[result.status],
         )
 
     @staticmethod
@@ -1172,16 +1436,29 @@ class PredictionService:
                         "operation, seat inventory, or bookability on the selected date."
                     ),
                 )
+            elif schedule.schedule_status == "future_schedule_reference":
+                reason = BilingualText(
+                    zh=(
+                        "AeroDataBox 返回了所选日期的计划航班号与完整时刻，但该来源不证明"
+                        "座位库存、实时价格或可购买性，因此只显示在参考区。"
+                    ),
+                    en=(
+                        "AeroDataBox returned a flight number and complete scheduled times "
+                        "for the selected date, but it does not prove seat inventory, a live "
+                        "fare, or bookability, so this row remains reference-only."
+                    ),
+                )
             else:
                 reason = BilingualText(
                     zh=(
-                        "日期级时刻只证明提供商返回了航班计划；没有通过 Google Flights "
-                        "购票选项与 HTTPS 预订链接二次验证，因此不进入严格可售列表。"
+                        "日期级时刻只证明提供商返回了航班计划；没有由已启用的严格报价来源及其"
+                        "二次购票验证标识确认价格和可购路径，因此不进入严格可售列表。"
                     ),
                     en=(
                         "This dated timetable only shows a provider schedule. Without "
-                        "Google Flights booking-option and HTTPS booking-link verification, "
-                        "it cannot enter the strictly bookable list."
+                        "confirmation from an enabled strict fare source and its secondary "
+                        "booking-verification identifier, it cannot enter the strictly "
+                        "bookable list."
                     ),
                 )
             timetable_references.append(
@@ -1239,6 +1516,50 @@ class PredictionService:
                     confirmed_offer=confirmed,
                     provider_segments=provider_segments,
                 )
+            )
+
+        fare_reference_snapshots: list[FareCoverageReference] = []
+        reference_has_credential = bool(
+            getattr(self.fare_reference_provider, "credential_present", False)
+            or getattr(self.fare_reference_provider, "configured", False)
+        )
+        if (
+            not scenarios
+            and fare_result.status != "provider_processing"
+            and reference_has_credential
+        ):
+            try:
+                reference_result = self.fare_reference_provider.snapshot(
+                    request.origin,
+                    request.destination,
+                    departure_date,
+                    fetched_at=generated_at,
+                )
+            except Exception:
+                # A reference-only source must never break or weaken the strict
+                # comparison.  The fixed error type intentionally discards raw
+                # exception text, URLs, request parameters, and credentials.
+                reference_result = ScrapeDoReferenceResult(
+                    status="provider_unavailable",
+                    observed_at=generated_at,
+                    monthly_credit_limit=min(
+                        max(
+                            int(
+                                getattr(
+                                    self.fare_reference_provider,
+                                    "monthly_credit_limit",
+                                    0,
+                                )
+                                or 0
+                            ),
+                            0,
+                        ),
+                        1_000,
+                    ),
+                    exception_type="ReferenceBoundaryError",
+                )
+            fare_reference_snapshots.append(
+                self._fare_reference_snapshot(reference_result)
             )
 
         scenario_rows = [
@@ -1329,6 +1650,7 @@ class PredictionService:
             last_segment = scenario.provider_segments[-1]
             seats = confirmed.number_of_bookable_seats
             live_fare = LiveFare(
+                provider_code=confirmed.provider_code,
                 provider_name=confirmed.provider_name,
                 provider_offer_id=confirmed.provider_offer_id,
                 verified_at=confirmed.verified_at,
@@ -1343,7 +1665,7 @@ class PredictionService:
                 seats_remaining=(min(seats, 9) if seats is not None else None),
                 seat_count_capped=bool(seats is not None and seats >= 9),
                 last_ticketing_date=confirmed.last_ticketing_date,
-                source_url="https://serpapi.com/google-flights-api",
+                source_url=_FARE_PROVIDER_SOURCE_URLS[confirmed.provider_code],
             )
             offers.append(
                 ComparisonOffer(
@@ -1385,7 +1707,9 @@ class PredictionService:
                         else "multi_leg_independence_model"
                     ),
                     schedule_status="priced_offer",
-                    schedule_source="serpapi_google_flights_booking",
+                    schedule_source=_FARE_PROVIDER_SCHEDULE_SOURCES[
+                        confirmed.provider_code
+                    ],
                     flight_number=first_segment.flight_number,
                     scheduled_departure_local=first_segment.departure_local,
                     scheduled_arrival_local=last_segment.arrival_local,
@@ -1476,9 +1800,11 @@ class PredictionService:
         )
         fare_warning = (
             (
-                "主价格是查询时经 Google Flights 购票选项验证的一位成人单程 USD 报价；",
-                "The primary price is a one-way, one-adult USD result whose booking "
-                "option was verified through Google Flights at query time. ",
+                "主价格是查询时经已启用的严格报价来源及其二次购票验证标识确认的"
+                "一位成人单程 USD 报价；",
+                "The primary price is a one-way, one-adult USD offer confirmed at query "
+                "time by an enabled strict fare source and that source's secondary "
+                "booking-verification identifier. ",
             )
             if offers and fare_result.status == "confirmed_offers"
             else (
@@ -1518,14 +1844,15 @@ class PredictionService:
             result_status=result_status,
             strict_mode_notice=BilingualText(
                 zh=(
-                    "严格可售模式仅显示经 Google Flights 搜索及 booking token 购票选项"
-                    "二次验证的报价。系统会处理四个舱位搜索实际返回的全部候选，但免费额度或"
+                    "严格可售模式仅显示经已启用的严格报价来源搜索，并由该来源的二次购票"
+                    "验证标识确认的报价。系统会处理四个舱位搜索实际返回的全部候选，但免费额度或"
                     "供应商错误可能使验证覆盖不完整；未验证候选绝不会进入主列表。"
                     "测试数据、AirLabs 时刻、周期投影和纯模型航班都不能进入主列表。"
                 ),
                 en=(
-                    "Strict bookable mode shows only offers that pass both a Google Flights "
-                    "search and booking-token booking-option verification. Every candidate "
+                    "Strict bookable mode shows only offers confirmed by both an enabled "
+                    "strict fare source search and that source's secondary booking-verification "
+                    "identifier. Every candidate "
                     "returned by the four cabin searches is considered, but free quota or "
                     "provider errors can leave coverage incomplete; unverified candidates "
                     "never enter the main list. Test data, AirLabs "
@@ -1534,6 +1861,7 @@ class PredictionService:
                 ),
             ),
             fare_search_metadata=fare_metadata,
+            fare_reference_snapshots=fare_reference_snapshots,
             timetable_references=timetable_references,
             schedule_sample_truncated=schedule_result.sample_truncated,
             schedule_sample_limit=AIRLABS_FREE_SAMPLE_LIMIT,
@@ -1751,7 +2079,7 @@ class PredictionService:
                     included_checked_bag_quantity=(segment.included_checked_bag_quantity),
                     included_checked_bag_weight=segment.included_checked_bag_weight,
                     included_checked_bag_weight_unit=(segment.included_checked_bag_weight_unit),
-                    data_basis="serpapi_booking_confirmed",
+                    data_basis=_FARE_PROVIDER_DETAIL_BASES[offer.live_fare.provider_code],
                 )
             )
 
@@ -1813,8 +2141,9 @@ class PredictionService:
             ),
             notice=BilingualText(
                 zh=(
-                    "航班号、完整当地/UTC 时刻、舱位和主价格已通过 Google Flights "
-                    "booking token 购票选项验证。页面提供当次验证得到的 HTTPS 预订链接，"
+                    "航班号、完整当地/UTC 时刻、舱位和主价格已通过 "
+                    f"{offer.live_fare.provider_name} 的购票路径验证。"
+                    "页面提供当次验证得到的 HTTPS 预订链接，"
                     "但搜索结果及最终结账价格仍可能随时变化；"
                     "模型估价、价格曲线和准点率仍是演示模型输出，价格曲线不是历史票价。"
                     + (
@@ -1825,7 +2154,8 @@ class PredictionService:
                 ),
                 en=(
                     "Flight numbers, complete local/UTC times, cabin, and the primary fare "
-                    "passed Google Flights booking-token option verification. The page exposes "
+                    f"passed {offer.live_fare.provider_name} booking-path verification. "
+                    "The page exposes "
                     "the HTTPS booking link returned by that verification, but search results "
                     "and the final checkout price can still change at any time. The model "
                     "estimate, price curve, and on-time probability remain demo-model outputs; "

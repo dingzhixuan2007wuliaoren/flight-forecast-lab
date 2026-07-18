@@ -437,6 +437,63 @@
 
     .no-fabrication svg { flex: 0 0 auto; width: 17px; height: 17px; margin-top: 1px; }
 
+    .provider-status-panel {
+      margin-top: 18px;
+      padding: 18px;
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .provider-status-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 13px;
+    }
+
+    .provider-status-head h2 { margin: 0 0 4px; font-size: 15px; }
+    .provider-status-head p,
+    .provider-strict-policy { margin: 0; color: var(--slate-500); font-size: 10px; line-height: 1.55; }
+
+    .provider-status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .provider-status-card {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--slate-200);
+      border-radius: 11px;
+      background: var(--slate-50);
+    }
+
+    .provider-card-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+    .provider-card-name { min-width: 0; font-size: 11px; font-weight: 800; }
+    .provider-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+    .provider-badge {
+      display: inline-flex;
+      padding: 3px 6px;
+      border: 1px solid var(--slate-200);
+      border-radius: 999px;
+      color: var(--slate-600);
+      background: white;
+      font-size: 8px;
+      font-weight: 780;
+      line-height: 1.2;
+    }
+    .provider-badge.good { color: #08795f; border-color: #bde8dd; background: #edfbf7; }
+    .provider-badge.warn { color: #81560b; border-color: #efd59c; background: #fff8e8; }
+    .provider-badge.risk { color: #a62e3b; border-color: #efc0c6; background: #fff2f4; }
+    .provider-card-meta { margin-top: 8px; color: var(--slate-600); font-size: 9px; line-height: 1.45; }
+    .provider-card-notice { margin: 6px 0 0; color: var(--slate-500); font-size: 8px; line-height: 1.5; }
+    .provider-strict-policy { margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--slate-200); }
+    .provider-status-loading { grid-column: 1 / -1; color: var(--slate-500); font-size: 10px; }
+
     .results {
       display: none;
       margin-top: 24px;
@@ -1263,6 +1320,7 @@
       .hero { grid-template-columns: 1fr; gap: 24px; }
       .hero-points { grid-template-columns: repeat(3, 1fr); }
       .context-grid { grid-template-columns: 1fr; }
+      .provider-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .context-summary { min-height: 0; }
       .route-banner { grid-template-columns: 1fr auto; }
       .route-meta { grid-column: 1 / -1; grid-row: 2; }
@@ -1328,6 +1386,8 @@
       .route-meta { gap: 9px 17px; }
       .section-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
       .context-card { padding: 16px; }
+      .provider-status-head { flex-direction: column; }
+      .provider-status-grid { grid-template-columns: 1fr; }
       tbody tr { grid-template-columns: 1fr; }
       .airline-cell { grid-column: auto; }
       footer { flex-direction: column; gap: 8px; }
@@ -1439,6 +1499,20 @@
         </svg>
         <span data-i18n="integrityNotice">数据诚信提示：页面中的价格是模型估算，不是可购买报价。行李、学生优惠和退改信息只有在数据源明确确认时才标记为已确认；缺失信息显示为“未知”，不会被虚构或默认加分。</span>
       </aside>
+
+      <section class="provider-status-panel" aria-labelledby="provider-status-title">
+        <div class="provider-status-head">
+          <div>
+            <h2 id="provider-status-title" data-i18n="providerStatusTitle">数据提供商状态</h2>
+            <p data-i18n="providerStatusHint">配置状态不等于报价已验证；额度、隔离与仅参考边界会单独显示。</p>
+          </div>
+          <span id="provider-status-time" class="provider-badge">—</span>
+        </div>
+        <div id="provider-status-grid" class="provider-status-grid" aria-live="polite">
+          <span class="provider-status-loading" data-i18n="providerStatusLoading">正在读取不含密钥的提供商状态…</span>
+        </div>
+        <p id="provider-strict-policy" class="provider-strict-policy" data-i18n="providerStrictPolicy">只有完整行程、正价格和安全购票路径均通过验证的报价才能进入严格列表；额度耗尽、隔离或仅参考来源不会被用来补造航班。</p>
+      </section>
 
       <div id="initial-state" class="initial-state" data-i18n="initialState">输入航线和出发时间后，比较结果会显示在这里。</div>
 
@@ -1607,7 +1681,7 @@
         <div id="offer-panel" class="offer-panel" role="tabpanel" aria-labelledby="tab-direct_first" tabindex="0">
           <div class="table-scroll">
             <table>
-              <caption data-i18n="offersCaption">严格模式下当前排序的 Google Flights 已验证购票选项</caption>
+              <caption data-i18n="offersCaption">严格模式下当前排序的供应商已验证购票选项</caption>
               <colgroup>
                 <col style="width:11%"><col style="width:7%"><col style="width:7%"><col style="width:11%">
                 <col style="width:9%"><col style="width:8%"><col style="width:8%"><col style="width:7%">
@@ -1696,7 +1770,7 @@
           pointTwo: "实时数据失败时透明回退",
           pointThree: "绝不把预测冒充实时票价",
           searchTitle: "比较一条航线",
-          searchHint: "可输入全球机场的三字 IATA 代码，例如 YYZ、JFK、LHR；系统处理 SerpApi 四舱搜索实际返回的候选，但结果仍受 Google Flights 覆盖、免费额度和供应商响应限制，并非全球全量清单。",
+          searchHint: "可输入全球机场的三字 IATA 代码，例如 YYZ、JFK、LHR；系统处理已配置严格报价提供商实际返回的候选，但结果仍受来源覆盖、免费额度和供应商响应限制，并非全球全量清单。",
           autoContext: "自动补全外部信号",
           origin: "出发机场",
           destination: "到达机场",
@@ -1704,7 +1778,35 @@
           compare: "开始比较",
           comparing: "正在比较",
           autoNote: "无需输入距离、飞行时长、天气、机场拥堵、航司或舱位；系统将自动推算并展开比较。",
-          integrityNotice: "数据诚信提示：主价格来自 SerpApi 返回的 Google Flights 查询结果，并且只有购票选项及安全打开路径都通过验证的航班才会展示；若销售方要求 POST，链接只打开 Google Flights 结果页，而不是冒充销售方直链。来源缓存最长约 1 小时并会显示缓存年龄，税费是否包含未知，价格仍可能随时变化。模型价格曲线、80% 区间和准点率均为合成演示模型预测。缺失权益显示为“未知”，不会被虚构或默认加分。",
+          integrityNotice: "数据诚信提示：主价格必须来自允许进入严格模式的报价提供商，并且只有完整航段、正价格、购票选项及安全打开路径都通过验证的航班才会展示。额度耗尽会停止该提供商；隔离和仅参考来源绝不补造航班。来源缓存年龄与税费边界会明确标记，价格仍可能随时变化。模型价格曲线、80% 区间和准点率均为合成演示模型预测。",
+          providerStatusTitle: "数据提供商状态",
+          providerStatusHint: "配置状态不等于报价已验证；额度、隔离与仅参考边界会单独显示。",
+          providerStatusLoading: "正在读取不含密钥的提供商状态…",
+          providerStatusUnavailable: "暂时无法读取提供商状态；这不会放宽严格验证规则。",
+          providerStrictPolicy: "只有完整行程、正价格和安全购票路径均通过验证的报价才能进入严格列表；额度耗尽、隔离或仅参考来源不会被用来补造航班。",
+          providerConfigured: "已配置",
+          providerNotConfigured: "未配置",
+          providerActive: "当前启用",
+          providerQuotaAvailable: "额度可用",
+          providerQuotaExhausted: "额度耗尽",
+          providerQuotaUnknown: "额度未知",
+          providerQuarantined: "已隔离",
+          providerReferenceOnly: "仅参考",
+          providerStrictFare: "严格报价源",
+          providerStrictCandidate: "候选报价源",
+          providerQuotaUsage: "额度 {used} / {limit}（{unit}）",
+          providerQuotaLimit: "额度上限 {limit}（{unit}）",
+          providerQuotaNoCounts: "未公开可安全读取的额度计数",
+          providerUnitHour: "小时",
+          providerUnitBilling: "结算周期",
+          providerUnitCredits: "点数",
+          providerUnitManaged: "供应商周期 / 生命周期保护",
+          providerUnitBillingRequests: "每结算周期请求数",
+          providerUnitLifetimeRequests: "账户终身请求数",
+          providerUnitMonthlyCredits: "每月点数",
+          providerUnitDailyCredits: "每日 API 点数",
+          providerUnitMonthlyUnits: "每月 API 单位",
+          providerQuotaPerCall: "每次调用预留 {cost} {unit}",
           initialState: "输入航线和出发日期后，比较结果会显示在这里。",
           distance: "航线距离",
           duration: "直飞基准时长",
@@ -1724,9 +1826,9 @@
           strictMode: "严格模式",
           fareCoverage: "候选覆盖",
           strictScheduleOnly: "仅购票选项已验证",
-          strictModeDefaultNotice: "系统处理 SerpApi 四舱搜索实际返回的全部候选，但主列表只显示在免费额度与供应商响应范围内成功通过购票选项严格验证的 Google Flights 结果。已启用 deep_search 与 show_hidden，但仍不代表所有航司、航班或销售方的全球全量；来源缓存最长约 1 小时。",
-          coverageNotEvaluated: "本次未获得可评估的 SerpApi 候选覆盖统计。",
-          coverageScope: "范围：SerpApi 四舱搜索实际返回的候选。",
+          strictModeDefaultNotice: "系统处理已配置严格报价提供商实际返回的候选，但主列表只显示在额度与供应商响应范围内成功通过完整行程、正价格和安全购票路径验证的结果。隔离或仅参考来源不能进入；结果不代表全球全量。",
+          coverageNotEvaluated: "本次未获得可评估的严格报价候选覆盖统计。",
+          coverageScope: "范围：活动严格报价提供商实际返回并通过初步检查的候选。",
           coverageComplete: "所有符合初步条件的返回候选均已尝试严格验证。",
           coverageQuotaLimited: "免费额度不足，部分候选未验证，当前列表已截断。",
           coverageProviderIncomplete: "部分候选因供应商响应失败而未能完成验证，当前列表不完整。",
@@ -1735,16 +1837,19 @@
           coverageCounts: "发现 {eligible} 个候选；尝试 {attempted} 个，验证通过 {verified} 个，严格排除 {rejected} 个，供应商失败 {failed} 个，额度跳过 {skipped} 个；同航程同舱位去重 {deduplicated} 个，最终显示 {displayed} 个最低价选项。",
           quotaLimitHourly: "小时额度",
           quotaLimitMonthly: "结算周期额度",
+          quotaLimitLifetime: "账户终身额度",
+          quotaLimitProviderSpecific: "各供应商独立额度",
           quotaLimitUnknown: "免费额度",
+          strictProviderRuns: "严格报价来源",
           directFirst: "直飞优先",
           lowestPrice: "低价优先",
           studentFirst: "学生友好优先",
           cabinBranch: "按舱位筛选",
           allCabins: "全部舱位",
-          directDescription: "仅在 Google Flights 购票选项已验证的结果中优先展示直飞，并可按来源返回的舱位筛选。",
+          directDescription: "仅在严格报价来源已验证购票路径的结果中优先展示直飞，并可按来源返回的舱位筛选。",
           priceDescription: "仅在购票选项已验证的结果中按来源结果价格从低到高展示。",
-          studentDescription: "在本次成功严格验证的全部结果中，依次按来源结果价格、免费托运行李、实际学生折扣、免费退改、年龄与验证条件比较；普通 Google Flights 免费查询不能验证实际学生专属折扣，因此该项显示未知且不加分。",
-          offersCaption: "SerpApi 四舱搜索返回候选中，在免费额度与供应商响应范围内成功严格验证的 Google Flights 购票选项",
+          studentDescription: "在本次成功严格验证的全部结果中，依次按来源结果价格、免费托运行李、实际学生折扣、免费退改、年龄与验证条件比较；当前免费严格报价查询不能验证实际学生专属折扣时，该项显示未知且不加分。",
+          offersCaption: "活动严格报价提供商返回候选中，在额度与供应商响应范围内成功验证的购票选项",
           airline: "航司",
           cabin: "舱位",
           route: "航程",
@@ -1763,25 +1868,25 @@
           emptyCategoryTitle: "此分类暂无购票选项已验证的航班",
           emptyCategoryBody: "请切换舱位或排序方式查看其他已验证结果。",
           fareNotConfiguredTitle: "尚未配置真实报价服务",
-          fareNotConfiguredBody: "请配置 SERPAPI_API_KEY 后重试；系统不会显示未验证替代结果。",
+          fareNotConfiguredBody: "请至少配置一个受支持的严格报价提供商（例如 SERPAPI_API_KEY 或 SEARCHAPI_API_KEY）后重试；系统不会显示未验证替代结果。",
           fareTestRejectedTitle: "非正式来源结果不进入严格模式",
-          fareTestRejectedBody: "严格模式只接受 SerpApi 返回且包含已验证 HTTPS 购票选项的 Google Flights 结果。",
+          fareTestRejectedBody: "严格模式只接受获准报价来源返回、且完整行程、正价格与安全 HTTPS 购票路径均已验证的结果。",
           fareBudgetNotConfiguredTitle: "尚未配置报价预算",
           fareBudgetNotConfiguredBody: "请先配置生产报价查询预算；系统没有执行可能产生费用的查询。",
           fareBudgetExhaustedTitle: "本期报价预算已用完",
           fareBudgetExhaustedBody: "当前没有执行新的真实报价查询，请稍后或在预算恢复后重试。",
           fareRateLimitedTitle: "报价服务请求过于频繁",
-          fareRateLimitedBody: "SerpApi 暂时限制了请求，请稍后重试；系统不会使用旧报价冒充当前报价。",
+          fareRateLimitedBody: "当前严格报价提供商暂时限制了请求，请稍后重试；系统不会使用旧报价冒充当前报价。",
           fareAuthTitle: "报价服务身份验证失败",
-          fareAuthBody: "请检查 SERPAPI_API_KEY，修复前不会显示购票选项。",
+          fareAuthBody: "请检查当前严格报价提供商的凭据；修复前不会显示购票选项。",
           fareProcessingTitle: "报价任务仍在处理中",
-          fareProcessingBody: "SerpApi 仍在排队或处理原搜索。系统已完成限定次数的状态轮询，没有重复提交整组搜索，请稍后手动重试。",
+          fareProcessingBody: "当前严格报价提供商仍在排队或处理原搜索。系统已完成限定次数的状态轮询，没有重复提交整组搜索，请稍后手动重试。",
           fareProviderErrorTitle: "报价供应商返回错误",
-          fareProviderErrorBody: "SerpApi 返回终态、HTTP 或网络错误，因此无法验证当前价格和余位；系统没有显示未验证航班。",
+          fareProviderErrorBody: "当前严格报价提供商返回终态、HTTP 或网络错误，因此无法验证当前价格和余位；系统没有显示未验证航班。",
           fareProviderUnavailableTitle: "报价服务暂时不可用",
           fareProviderUnavailableBody: "无法验证当前价格与余位，请稍后重试。下方时刻表仅供参考。",
           fareNoResultsTitle: "未找到当前可售报价",
-          fareNoResultsBody: "Google Flights 没有返回同时满足完整航班信息和购票选项验证的结果；系统不会生成替代航班。",
+          fareNoResultsBody: "严格报价来源没有返回同时满足完整航班信息和购票路径验证的结果；系统不会生成替代航班。",
           timetableReferencesTitle: "时刻表参考（不参与比较）",
           timetableReferencesHint: "仅展示被严格模式排除的来源记录，不生成舱位、价格或详情选项。",
           timetableReferencesWarning: "所有记录均不参与比较；具体排除原因见最后一列，且没有任何记录可证明库存或可购买。",
@@ -1803,7 +1908,7 @@
           providerCacheHit: "已识别缓存复用",
           providerCacheMiss: "未识别缓存复用",
           providerCacheAge: "缓存年龄 {age}",
-          studentDiscountUnavailable: "普通 Google Flights 免费查询无法验证实际学生专属折扣；未知不加分。",
+          studentDiscountUnavailable: "当前免费严格报价查询无法验证实际学生专属折扣；未知不加分。",
           production: "生产环境",
           availability: "余位",
           seatsNotProvided: "有可售报价，余位数量未提供",
@@ -1815,9 +1920,12 @@
           directBookingLink: "打开销售方购票跳转",
           googleFlightsItineraryLink: "打开 Google Flights 结果页",
           bookingWith: "购票渠道",
-          googleFlightsProvider: "SerpApi · Google Flights",
+          googleFlightsProvider: "严格来源已验证报价",
+          serpApiGoogleFlights: "SerpApi · Google Flights",
+          searchApiGoogleFlights: "SearchAPI.io · Google Flights",
+          ignavVerifiedFares: "Ignav Verified Fares",
           flightSequence: "航班",
-          footerNote: "Google Flights 报价和购票路径仅代表页面所示来源结果时间，来源缓存最长约 1 小时且税费是否包含未知；当销售方跳转要求 POST 时，本页链接只打开 Google Flights 结果页。模型价格曲线、80% 区间、准点概率、天气、机场运行与新闻信号也可能存在误差。付款前请在购票平台重新核实最终价格、税费与条款。",
+          footerNote: "严格报价和购票路径仅代表页面所示来源结果时间，可能使用来源缓存且税费是否包含未知；当销售方跳转不能安全直接打开时，本页只使用来源确认的安全回退路径。模型价格曲线、80% 区间、准点概率、天气、机场运行与新闻信号也可能存在误差。付款前请在购票平台重新核实最终价格、税费与条款。",
           weatherAttribution: "天气数据：",
           newsAttribution: "近实时新闻数据：",
           live: "实时",
@@ -1841,6 +1949,8 @@
           modelScenario: "中转模型场景",
           liveSchedule: "AirLabs 近实时航班计划",
           recurringSchedule: "周期时刻表投影",
+          futureScheduleReference: "日期级时刻参考（仅参考）",
+          aeroDataBoxSchedule: "AeroDataBox 日期级时刻参考",
           noRealSchedule: "无真实时刻 · 模型场景",
           providerDirect: "日期级计划直达航路",
           modelOneStop: "一站式模型航路",
@@ -1891,7 +2001,7 @@
           pointTwo: "Transparent fallback when live data fails",
           pointThree: "Predictions are never presented as live fares",
           searchTitle: "Compare a route",
-          searchHint: "Use worldwide three-letter IATA airport codes such as YYZ, JFK, or LHR. The system processes candidates actually returned by the four SerpApi cabin searches, but results remain bounded by Google Flights coverage, free quota, and provider responses; they are not a complete global list.",
+          searchHint: "Use worldwide three-letter IATA airport codes such as YYZ, JFK, or LHR. The system processes candidates actually returned by configured strict-fare providers, but results remain bounded by source coverage, free quota, and provider responses; they are not a complete global list.",
           autoContext: "External signals filled automatically",
           origin: "Origin airport",
           destination: "Destination airport",
@@ -1899,7 +2009,35 @@
           compare: "Compare flights",
           comparing: "Comparing",
           autoNote: "No distance, duration, weather, congestion, airline, or cabin input is needed; the system derives and compares them automatically.",
-          integrityNotice: "Data integrity notice: the primary fare comes from a SerpApi Google Flights result, and a flight appears only when its booking option and safe opening path were verified. If the seller requires POST, the link opens a Google Flights results page instead of pretending to be a direct seller link. Provider cache can be up to about one hour old and its age is shown; whether taxes are included is unknown, and fares can still change. The price curve, 80% interval, and on-time probability remain synthetic-demo model forecasts. Missing benefits stay Unknown and are never invented or scored.",
+          integrityNotice: "Data integrity notice: the primary fare must come from a provider permitted in strict mode, and a flight appears only after its complete segments, positive fare, booking option, and safe opening path are verified. An exhausted provider stops; quarantined and reference-only sources never fabricate replacement flights. Cache age and tax boundaries remain explicit, and fares can still change. The price curve, 80% interval, and on-time probability remain synthetic-demo model forecasts.",
+          providerStatusTitle: "Data-provider status",
+          providerStatusHint: "Configuration does not mean an offer is verified; quota, quarantine, and reference-only boundaries are shown separately.",
+          providerStatusLoading: "Reading credential-safe provider status…",
+          providerStatusUnavailable: "Provider status is temporarily unavailable; strict verification rules are unchanged.",
+          providerStrictPolicy: "Only offers whose complete itinerary, positive fare, and safe booking path all pass verification may enter the strict list; exhausted, quarantined, and reference-only sources never fabricate flights.",
+          providerConfigured: "Configured",
+          providerNotConfigured: "Not configured",
+          providerActive: "Active",
+          providerQuotaAvailable: "Quota available",
+          providerQuotaExhausted: "Quota exhausted",
+          providerQuotaUnknown: "Quota unknown",
+          providerQuarantined: "Quarantined",
+          providerReferenceOnly: "Reference only",
+          providerStrictFare: "Strict fare source",
+          providerStrictCandidate: "Candidate fare source",
+          providerQuotaUsage: "Quota {used} / {limit} ({unit})",
+          providerQuotaLimit: "Quota limit {limit} ({unit})",
+          providerQuotaNoCounts: "No safely readable quota count is published",
+          providerUnitHour: "hour",
+          providerUnitBilling: "billing period",
+          providerUnitCredits: "credits",
+          providerUnitManaged: "provider cycle / lifetime fail-safe",
+          providerUnitBillingRequests: "requests / billing period",
+          providerUnitLifetimeRequests: "lifetime account requests",
+          providerUnitMonthlyCredits: "credits / month",
+          providerUnitDailyCredits: "API credits / day",
+          providerUnitMonthlyUnits: "API units / month",
+          providerQuotaPerCall: "Reserves {cost} {unit} per call",
           initialState: "Enter a route and departure date to see comparisons here.",
           distance: "Route distance",
           duration: "Direct baseline duration",
@@ -1919,9 +2057,9 @@
           strictMode: "Strict mode",
           fareCoverage: "Candidate coverage",
           strictScheduleOnly: "Verified booking options only",
-          strictModeDefaultNotice: "The system processes every candidate actually returned by the four SerpApi cabin searches, but the main list contains only Google Flights results successfully passing strict booking-option verification within the free quota and available provider responses. deep_search and show_hidden are enabled, but this is still not a globally complete list of every airline, flight, or seller. Provider cache can be up to about one hour old.",
-          coverageNotEvaluated: "No evaluable SerpApi candidate-coverage statistics were available for this response.",
-          coverageScope: "Scope: candidates actually returned by the four SerpApi cabin searches.",
+          strictModeDefaultNotice: "The system processes candidates actually returned by configured strict-fare providers, but the main list contains only results whose complete itinerary, positive fare, and safe booking path pass verification within quota and available provider responses. Quarantined and reference-only sources cannot enter; results are not globally complete.",
+          coverageNotEvaluated: "No evaluable strict-fare candidate-coverage statistics were available for this response.",
+          coverageScope: "Scope: candidates actually returned by the active strict-fare provider and passing initial checks.",
           coverageComplete: "Every returned candidate that passed initial eligibility checks was attempted for strict verification.",
           coverageQuotaLimited: "Free quota was insufficient to verify every candidate, so the current list is truncated.",
           coverageProviderIncomplete: "Some candidates could not complete verification because of provider-response failures, so the current list is incomplete.",
@@ -1930,16 +2068,19 @@
           coverageCounts: "Found {eligible} candidates; attempted {attempted}, verified {verified}, strictly rejected {rejected}, provider failed {failed}, and quota skipped {skipped}; deduplicated {deduplicated} same-itinerary/cabin results and display {displayed} lowest-price options.",
           quotaLimitHourly: "hourly quota",
           quotaLimitMonthly: "billing-period quota",
+          quotaLimitLifetime: "lifetime account quota",
+          quotaLimitProviderSpecific: "provider-specific quotas",
           quotaLimitUnknown: "free quota",
+          strictProviderRuns: "Strict fare sources",
           directFirst: "Direct first",
           lowestPrice: "Lowest price",
           studentFirst: "Student friendly",
           cabinBranch: "Filter by cabin",
           allCabins: "All cabins",
-          directDescription: "Prioritizes direct routing only among Google Flights results with a verified booking option, with filtering by the source-provided cabin.",
+          directDescription: "Prioritizes direct routing only among strict-provider results with a verified booking path, with filtering by the source-provided cabin.",
           priceDescription: "Sorts only results with a verified booking option by provider-result fare, lowest first.",
-          studentDescription: "Compares all successfully verified results in this response by provider-result fare, free checked baggage, actual student discounts, free changes/refunds, then age and verification. Ordinary free Google Flights queries cannot verify an actual student-only discount, so it stays Unknown and adds no score.",
-          offersCaption: "Google Flights booking options successfully verified, within free quota and provider responses, from candidates returned by the four SerpApi cabin searches",
+          studentDescription: "Compares all successfully verified results in this response by provider-result fare, free checked baggage, actual student discounts, free changes/refunds, then age and verification. When the current free strict-fare query cannot verify an actual student-only discount, it stays Unknown and adds no score.",
+          offersCaption: "Booking options successfully verified, within quota and provider responses, from candidates returned by the active strict-fare provider",
           airline: "Airline",
           cabin: "Cabin",
           route: "Route",
@@ -1958,25 +2099,25 @@
           emptyCategoryTitle: "No verified booking option in this category",
           emptyCategoryBody: "Choose another cabin or ranking to view other verified results.",
           fareNotConfiguredTitle: "Provider fare service is not configured",
-          fareNotConfiguredBody: "Configure SERPAPI_API_KEY and try again; no unverified substitute results are shown.",
+          fareNotConfiguredBody: "Configure at least one supported strict-fare provider, such as SERPAPI_API_KEY or SEARCHAPI_API_KEY, and try again; no unverified substitute results are shown.",
           fareTestRejectedTitle: "Unofficial-source results are excluded",
-          fareTestRejectedBody: "Strict mode accepts only SerpApi Google Flights results with a verified HTTPS booking option.",
+          fareTestRejectedBody: "Strict mode accepts only results from an allowed fare source whose complete itinerary, positive fare, and safe HTTPS booking path are verified.",
           fareBudgetNotConfiguredTitle: "Fare-query budget is not configured",
           fareBudgetNotConfiguredBody: "Configure a production quote-query budget first; no potentially billable query was made.",
           fareBudgetExhaustedTitle: "Fare-query budget is exhausted",
           fareBudgetExhaustedBody: "No new live-fare query was made. Try again later or after the budget resets.",
           fareRateLimitedTitle: "Fare service is rate limited",
-          fareRateLimitedBody: "SerpApi is temporarily limiting requests. Try again later; stale quotes are not presented as current.",
+          fareRateLimitedBody: "The active strict-fare provider is temporarily limiting requests. Try again later; stale quotes are not presented as current.",
           fareAuthTitle: "Fare service authentication failed",
-          fareAuthBody: "Check SERPAPI_API_KEY; no booking option is shown until authentication succeeds.",
+          fareAuthBody: "Check the active strict-fare provider credential; no booking option is shown until authentication succeeds.",
           fareProcessingTitle: "Fare search is still processing",
-          fareProcessingBody: "SerpApi is still queuing or processing the original search. Bounded status polling finished without resubmitting the full search; retry manually later.",
+          fareProcessingBody: "The active strict-fare provider is still queuing or processing the original search. Bounded status polling finished without resubmitting the full search; retry manually later.",
           fareProviderErrorTitle: "Fare provider returned an error",
-          fareProviderErrorBody: "SerpApi returned a terminal, HTTP, or transport error, so current price and availability could not be verified; no unverified flight is shown.",
+          fareProviderErrorBody: "The active strict-fare provider returned a terminal, HTTP, or transport error, so current price and availability could not be verified; no unverified flight is shown.",
           fareProviderUnavailableTitle: "Fare provider is temporarily unavailable",
           fareProviderUnavailableBody: "Current price and availability could not be verified. Try again later; timetable rows below are reference only.",
           fareNoResultsTitle: "No currently bookable fare found",
-          fareNoResultsBody: "Google Flights returned no result that passed both complete-flight and booking-option verification; no substitute flight was generated.",
+          fareNoResultsBody: "The strict fare sources returned no result that passed complete-flight and booking-path verification; no substitute flight was generated.",
           timetableReferencesTitle: "Timetable reference (excluded from comparison)",
           timetableReferencesHint: "Source records excluded by strict mode; no cabin, price, or detail options are generated.",
           timetableReferencesWarning: "Every row is excluded from comparison; see the final column for the specific reason. No row proves inventory or bookability.",
@@ -1998,7 +2139,7 @@
           providerCacheHit: "Cache reuse detected",
           providerCacheMiss: "No cache reuse detected",
           providerCacheAge: "Cache age {age}",
-          studentDiscountUnavailable: "Ordinary free Google Flights queries cannot verify an actual student-only discount; Unknown adds no score.",
+          studentDiscountUnavailable: "The current free strict-fare query cannot verify an actual student-only discount; Unknown adds no score.",
           production: "Production",
           availability: "Availability",
           seatsNotProvided: "Fare available; seat count not provided",
@@ -2010,9 +2151,12 @@
           directBookingLink: "Open seller booking redirect",
           googleFlightsItineraryLink: "Open Google Flights results page",
           bookingWith: "Booking channel",
-          googleFlightsProvider: "SerpApi · Google Flights",
+          googleFlightsProvider: "Strict-provider verified fare",
+          serpApiGoogleFlights: "SerpApi · Google Flights",
+          searchApiGoogleFlights: "SearchAPI.io · Google Flights",
+          ignavVerifiedFares: "Ignav Verified Fares",
           flightSequence: "Flights",
-          footerNote: "The Google Flights fare and booking path reflect only the displayed provider result time, may use provider cache up to about one hour old, and do not confirm whether taxes are included. When the seller redirect requires POST, this page links only to a Google Flights results page. The model price curve, 80% interval, punctuality, weather, airport operations, and news signals may also be inaccurate. Recheck the final price, taxes, and terms on the booking platform before payment.",
+          footerNote: "The strict fare and booking path reflect only the displayed provider result time, may use provider caching, and do not confirm whether taxes are included. When a seller redirect cannot be opened safely, this page uses only the provider-confirmed safe fallback path. The model price curve, 80% interval, punctuality, weather, airport operations, and news signals may also be inaccurate. Recheck the final price, taxes, and terms on the booking platform before payment.",
           weatherAttribution: "Weather data:",
           newsAttribution: "Near-real-time news data:",
           live: "Live",
@@ -2036,6 +2180,8 @@
           modelScenario: "Connecting model scenario",
           liveSchedule: "AirLabs near-real-time schedule",
           recurringSchedule: "Recurring timetable projection",
+          futureScheduleReference: "Dated schedule reference (reference only)",
+          aeroDataBoxSchedule: "AeroDataBox dated schedule reference",
           noRealSchedule: "No real schedule · Model scenario",
           providerDirect: "Dated-schedule direct routing",
           modelOneStop: "One-stop model routing",
@@ -2105,6 +2251,7 @@
       var activeRanking = "direct_first";
       var activeCabin = "all";
       var lastData = null;
+      var providerStatusData = null;
       var sessionKey = "flight-forecast-session-v1";
 
       function byId(id) { return document.getElementById(id); }
@@ -2265,11 +2412,17 @@
           model_scenario: "modelScenario",
           live_schedule: "liveSchedule",
           recurring_timetable_projection: "recurringSchedule",
+          future_schedule_reference: "futureScheduleReference",
           priced_offer: "priceConfirmed",
           booking_option_confirmed: "bookingOptionVerified",
           booking_option_verified: "bookingOptionVerified",
           serpapi_google_flights_booking: "googleFlightsProvider",
           serpapi_google_flights: "googleFlightsProvider",
+          searchapi_google_flights_booking: "searchApiGoogleFlights",
+          searchapi_google_flights: "searchApiGoogleFlights",
+          ignav_verified_booking: "ignavVerifiedFares",
+          ignav_verified_fares: "ignavVerifiedFares",
+          aerodatabox_schedule: "aeroDataBoxSchedule",
           production: "production",
           provider_direct: "providerDirect",
           model_one_stop: "modelOneStop",
@@ -2335,6 +2488,130 @@
       function providerCacheLabel(fare) {
         var state = fare && fare.provider_cache_hit === true ? t("providerCacheHit") : t("providerCacheMiss");
         return state + " · " + t("providerCacheAge").replace("{age}", formatCacheAge(fare && fare.provider_cache_age_seconds));
+      }
+
+      function providerQuotaUnitLabel(value) {
+        var keys = {
+          hour: "providerUnitHour",
+          billing_period: "providerUnitBilling",
+          credits: "providerUnitCredits",
+          provider_managed: "providerUnitManaged",
+          billing_period_requests: "providerUnitBillingRequests",
+          lifetime_requests: "providerUnitLifetimeRequests",
+          monthly_credits: "providerUnitMonthlyCredits",
+          daily_credits: "providerUnitDailyCredits",
+          monthly_units: "providerUnitMonthlyUnits"
+        };
+        return t(keys[normalizeKey(value)] || "providerUnitManaged");
+      }
+
+      function providerRoleLabel(value) {
+        return t(normalizeKey(value) === "strict_fare" ? "providerStrictFare" :
+          (normalizeKey(value) === "reference_only" ? "providerReferenceOnly" : "providerStrictCandidate"));
+      }
+
+      function providerState(value) {
+        var states = {
+          not_configured: ["providerNotConfigured", "warn"],
+          configured: ["providerConfigured", "good"],
+          quota_available: ["providerQuotaAvailable", "good"],
+          quota_exhausted: ["providerQuotaExhausted", "risk"],
+          quarantined: ["providerQuarantined", "warn"],
+          reference_only: ["providerReferenceOnly", "warn"]
+        };
+        return states[normalizeKey(value)] || ["providerQuotaUnknown", "warn"];
+      }
+
+      function appendProviderBadge(container, label, cssClass) {
+        var badge = document.createElement("span");
+        badge.className = "provider-badge" + (cssClass ? " " + cssClass : "");
+        badge.textContent = label;
+        container.appendChild(badge);
+      }
+
+      function renderProviderStatus(data) {
+        var grid = byId("provider-status-grid");
+        if (!grid) return;
+        var providers = data && Array.isArray(data.providers) ? data.providers : [];
+        grid.replaceChildren();
+        if (!providers.length) {
+          var unavailable = document.createElement("span");
+          unavailable.className = "provider-status-loading";
+          unavailable.textContent = t(data && data.unavailable ? "providerStatusUnavailable" : "providerStatusLoading");
+          grid.appendChild(unavailable);
+        }
+        providers.forEach(function (provider) {
+          if (!provider || typeof provider !== "object") return;
+          var card = document.createElement("article");
+          card.className = "provider-status-card";
+          card.dataset.providerCode = safeText(provider.code, "");
+          var head = document.createElement("div");
+          head.className = "provider-card-head";
+          var name = document.createElement("span");
+          name.className = "provider-card-name";
+          name.textContent = safeText(provider.display_name);
+          var badges = document.createElement("span");
+          badges.className = "provider-badges";
+          appendProviderBadge(badges, providerRoleLabel(provider.role), "");
+          var state = providerState(provider.status);
+          appendProviderBadge(badges, t(state[0]), state[1]);
+          if (normalizeKey(provider.status) !== "configured" && normalizeKey(provider.status) !== "not_configured") {
+            appendProviderBadge(badges, t(provider.configured ? "providerConfigured" : "providerNotConfigured"), provider.configured ? "good" : "warn");
+          }
+          if (provider.active === true) appendProviderBadge(badges, t("providerActive"), "good");
+          head.appendChild(name);
+          head.appendChild(badges);
+          card.appendChild(head);
+
+          var limit = asNumber(provider.quota_limit);
+          var used = asNumber(provider.quota_used);
+          var unit = providerQuotaUnitLabel(provider.quota_unit);
+          var meta = document.createElement("div");
+          meta.className = "provider-card-meta";
+          if (limit !== null && limit > 0) {
+            meta.textContent = used !== null ? fillTemplate("providerQuotaUsage", {
+              used: Math.max(0, Math.round(used)), limit: Math.round(limit), unit: unit
+            }) : fillTemplate("providerQuotaLimit", { limit: Math.round(limit), unit: unit });
+          } else if (normalizeKey(provider.quota_status) !== "not_applicable") {
+            meta.textContent = t("providerQuotaNoCounts");
+          }
+          var cost = asNumber(provider.quota_cost_per_call);
+          if (cost !== null && cost > 0) {
+            var costLine = document.createElement("div");
+            costLine.textContent = fillTemplate("providerQuotaPerCall", {
+              cost: Math.round(cost), unit: unit
+            });
+            meta.appendChild(costLine);
+          }
+          if (meta.textContent) card.appendChild(meta);
+
+          var notice = document.createElement("p");
+          notice.className = "provider-card-notice";
+          notice.textContent = localizedText(provider.notice, "");
+          if (notice.textContent) card.appendChild(notice);
+          grid.appendChild(card);
+        });
+        byId("provider-status-time").textContent = formatDate(data && data.generated_at, true);
+        byId("provider-strict-policy").textContent = localizedText(
+          data && data.strict_policy,
+          t("providerStrictPolicy")
+        );
+      }
+
+      async function loadProviderStatus() {
+        try {
+          var response = await fetch("/v1/provider-status", {
+            headers: { "Accept": "application/json" },
+            cache: "no-store"
+          });
+          if (!response.ok) throw new Error("provider status unavailable");
+          var data = await response.json();
+          if (!data || !Array.isArray(data.providers)) throw new Error("provider status invalid");
+          providerStatusData = data;
+        } catch (error) {
+          providerStatusData = { unavailable: true, providers: [] };
+        }
+        renderProviderStatus(providerStatusData);
       }
 
       function formatDepartureDate(value) {
@@ -2407,6 +2684,7 @@
         byId("lang-en").setAttribute("aria-pressed", String(currentLanguage === "en"));
         try { window.localStorage.setItem("flight-forecast-language", currentLanguage); } catch (error) { /* storage can be unavailable */ }
         updateRankingDescription();
+        renderProviderStatus(providerStatusData);
         if (lastData) renderResponse(lastData, false);
         else updateDetailLinks(null);
         saveSessionState();
@@ -2489,6 +2767,8 @@
         var normalized = normalizeKey(value);
         if (normalized === "hourly") return t("quotaLimitHourly");
         if (normalized === "monthly") return t("quotaLimitMonthly");
+        if (normalized === "lifetime") return t("quotaLimitLifetime");
+        if (normalized === "provider_specific") return t("quotaLimitProviderSpecific");
         return t("quotaLimitUnknown");
       }
 
@@ -2538,6 +2818,13 @@
           })
         ];
         if (metadata.cache_hit === true) parts.push(t("coverageCacheSnapshot"));
+        var providerRuns = Array.isArray(metadata.provider_runs) ? metadata.provider_runs : [];
+        if (providerRuns.length > 1) {
+          parts.push(t("strictProviderRuns") + ": " + providerRuns.map(function (run) {
+            return safeText(run && run.provider_name, "") + " (" +
+              localizeStatus(run && run.status) + ")";
+          }).filter(hasValue).join("; "));
+        }
         if (coverageStatus === "quota_limited" || coverageStatus === "quota_and_provider_incomplete") {
           parts.push("(" + coverageQuotaLabel(metadata.quota_limit) + ")");
         }
@@ -2698,7 +2985,7 @@
       function benefitClass(value) {
         var key = normalizeKey(value);
         if (["confirmed", "verified", "included", "free", "eligible", "available", "confirmed_free", "confirmed_included", "confirmed_discount", "program_available", "live_schedule", "priced_offer", "booking_option_confirmed", "booking_option_verified", "provider_confirmed"].indexOf(key) >= 0) return "good";
-        if (["unknown", "unavailable", "not_available", "unverified", "recurring_timetable_projection", "provider_direct"].indexOf(key) >= 0) return "caution";
+        if (["unknown", "unavailable", "not_available", "unverified", "recurring_timetable_projection", "future_schedule_reference", "provider_direct"].indexOf(key) >= 0) return "caution";
         if (["none", "no", "not_included", "confirmed_paid", "non_refundable", "nonrefundable"].indexOf(key) >= 0) return "risk";
         if (["model_scenario", "model_one_stop", "model_route_unresolved", "not_applicable"].indexOf(key) >= 0) return "caution";
         return "";
@@ -2718,6 +3005,14 @@
         var segments = Array.isArray(offer && offer.segments) ? offer.segments :
           (fare && Array.isArray(fare.segments) ? fare.segments : []);
         return segments.filter(function (segment) { return segment && typeof segment === "object"; }).slice(0, 4);
+      }
+
+      function fareProviderLabel(fare) {
+        var provider = normalizeKey(fare && fare.provider_code);
+        if (provider === "serpapi_google_flights") return t("serpApiGoogleFlights");
+        if (provider === "searchapi_google_flights") return t("searchApiGoogleFlights");
+        if (provider === "ignav_verified_fares") return t("ignavVerifiedFares");
+        return safeText(fare && fare.provider_name, t("googleFlightsProvider"));
       }
 
       function segmentValue(segment, names) {
@@ -2743,14 +3038,24 @@
 
       function hasConfirmedFareOffer(offer) {
         var fare = fareFor(offer), segments = offerSegments(offer), amount = asNumber(fare && fare.total_amount), seats = fare && fare.seats_remaining, stops = asNumber(offer && offer.stops), providerCacheAge = asNumber(fare && fare.provider_cache_age_seconds);
+        var scheduleSource = normalizeKey(offer && offer.schedule_source);
+        var providerCode = normalizeKey(fare && fare.provider_code);
+        var strictProviderSources = {
+          serpapi_google_flights: { name: "SerpApi Google Flights", source: "serpapi_google_flights_booking" },
+          searchapi_google_flights: { name: "SearchAPI.io Google Flights", source: "searchapi_google_flights_booking" },
+          ignav_verified_fares: { name: "Ignav Verified Fares", source: "ignav_verified_booking" }
+        };
+        var strictProvider = strictProviderSources[providerCode];
+        var providerSourceMatches = !!strictProvider && scheduleSource === strictProvider.source &&
+          safeText(fare && fare.provider_name, "") === strictProvider.name;
         if (normalizeKey(offer && offer.schedule_status) !== "priced_offer" ||
-            normalizeKey(offer && offer.schedule_source) !== "serpapi_google_flights_booking" ||
+            !strictProvider ||
             normalizeKey(offer && offer.bookability_status) !== "booking_option_verified" ||
             normalizeKey(offer && offer.route_status) !== "provider_confirmed" ||
             ["provider_direct", "provider_itinerary"].indexOf(normalizeKey(offer && offer.routing_status)) < 0 ||
-            normalizeKey(offer && offer.cabin_status) !== "provider_confirmed" ||
+             normalizeKey(offer && offer.cabin_status) !== "provider_confirmed" ||
              !fare || normalizeKey(fare.status) !== "booking_option_confirmed" ||
-             normalizeKey(fare.provider_code) !== "serpapi_google_flights" || normalizeKey(fare.environment) !== "production" ||
+             !providerSourceMatches || normalizeKey(fare.environment) !== "production" ||
              fare.booking_verified !== true || !safeBookingUrl(fare.booking_url) ||
              ["direct_get", "google_flights_itinerary"].indexOf(normalizeKey(fare.booking_url_kind)) < 0 ||
              normalizeKey(fare.availability_status) !== "booking_option_verified" ||
@@ -2827,7 +3132,7 @@
         var price = cell(row, "price-cell", "estimatedPrice");
         appendStrong(price, formatCurrency(fare.total_amount, fare.currency, 2));
         appendTinyBadge(price, t("bookingOptionVerified"), "good");
-        appendSubvalue(price, t("fareSource") + ": " + t("googleFlightsProvider"));
+        appendSubvalue(price, t("fareSource") + ": " + fareProviderLabel(fare));
         appendSubvalue(price, t("verifiedAt") + ": " + formatDate(fare.verified_at, true));
         appendSubvalue(price, providerCacheLabel(fare));
         price.dataset.providerCacheHit = String(fare.provider_cache_hit);
@@ -2955,7 +3260,8 @@
         var seen = new Set();
         return (Array.isArray(data && data.timetable_references) ? data.timetable_references : []).filter(function (reference) {
           var status = normalizeKey(reference && reference.schedule_status);
-          if (!reference || (status !== "recurring_timetable_projection" && status !== "live_schedule")) return false;
+          if (!reference || (status !== "recurring_timetable_projection" && status !== "live_schedule" &&
+              status !== "future_schedule_reference")) return false;
           if (!hasValue(reference.flight_number) || !hasValue(reference.scheduled_departure_local) ||
               !hasValue(reference.scheduled_arrival_local)) return false;
           var identity = referenceIdentity(reference);
@@ -3125,6 +3431,14 @@
 
       function renderResponse(data, reveal) {
         var context = data.context || {};
+        if (Array.isArray(data.provider_statuses)) {
+          providerStatusData = {
+            generated_at: data.generated_at,
+            strict_policy: providerStatusData && providerStatusData.strict_policy,
+            providers: data.provider_statuses
+          };
+          renderProviderStatus(providerStatusData);
+        }
         byId("route-origin").textContent = safeText(data.origin);
         byId("route-destination").textContent = safeText(data.destination);
         var distance = asNumber(data.distance_km);
@@ -3288,6 +3602,7 @@
       var storedLanguage = "zh";
       try { storedLanguage = window.localStorage.getItem("flight-forecast-language") || (restoredState && restoredState.language) || "zh"; } catch (error) { /* use default */ }
       applyLanguage(storedLanguage);
+      loadProviderStatus();
       window.addEventListener("pageshow", function () {
         var pageLanguage = currentLanguage;
         try { pageLanguage = window.localStorage.getItem("flight-forecast-language") || currentLanguage; } catch (error) { /* keep active language */ }

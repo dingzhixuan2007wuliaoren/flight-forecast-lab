@@ -93,9 +93,11 @@ NOAA 历史观测适合建立“天气与延误关系”的回溯基线，但预
 | --- | --- | --- |
 | 全球机场坐标 | [OurAirports public-domain data](https://ourairports.com/data/) | 内置主要全球机场目录；未知代码返回校验错误 |
 | 当前天气与预报 | [Open-Meteo](https://open-meteo.com/en/docs) 当前模型天气/小时预报与 [NOAA Aviation Weather](https://aviationweather.gov/data/api/) METAR/TAF | 同月训练平均值或季节模型先验明确标为 `proxy`，仅作展示参考；准点预测改用无天气模型 |
-| 机场运行 | 美国机场使用无需密钥的 [FAA NAS Status](https://nasstatus.faa.gov/) 当前事件；其他机场配置免费 AirLabs key 后使用 [AirLabs schedules](https://airlabs.co/docs/schedules) | [ADSB.lol](https://www.adsb.lol/docs/open-data/api/) 当前飞机密度代理；目标时刻不适用时回退训练平均值/合成先验 |
+| 机场运行 | 美国机场使用无需密钥的 [FAA NAS Status](https://nasstatus.faa.gov/) 当前事件；其他机场配置免费 AirLabs key 后使用 [AirLabs schedules](https://airlabs.co/docs/schedules) | OpenSky 匿名当前航迹密度参考，失败或额度耗尽时再用 [ADSB.lol](https://www.adsb.lol/docs/open-data/api/) 飞机密度代理；目标时刻不适用时回退训练平均值/合成先验 |
 | 时事新闻 | 无需密钥的 [GDELT DOC 2.0](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) 近七日中断类新闻（`DateDesc`）；DOC 失败时使用官方 [GAL 滚动 RSS](https://blog.gdeltproject.org/announcing-the-gdelt-article-list-rss-feed/) | 先返回不超过 6 小时、降低影响且标为 `historical` 的航线缓存；无缓存时返回中性值且不虚构文章 |
-| 严格航班比较 | [SerpApi Google Flights API](https://serpapi.com/google-flights-api) 搜索后，再使用候选的 `booking_token` 获取购票选项 | 缺失凭据、额度耗尽、二次验证失败或字段不完整时返回结构化空 offers；AirLabs 只进入参考区 |
+| 严格航班比较 | `auto` 查询所有已配置且获准参与的严格源：[SerpApi Google Flights API](https://serpapi.com/google-flights-api)、SearchAPI.io，以及仅在双开关显式发布后的 `ignav_verified_fares`；每个来源都必须独立验证购票选项 | 两个或更多来源实际运行时返回 `strict_fare_aggregate` 和逐源 `provider_runs`；相同完整航段与舱位跨源保留最低已验证价格。全部来源都没有二次验证通过的真实报价时才返回结构化空 `offers`；隔离与仅参考来源绝不补位 |
+
+免费来源的额度单位不可混用：SerpApi 按 provider 结算周期执行本地 250 次请求硬墙；SearchAPI.io 是安装/账户生命周期一次性 100 次请求，不是月度额度；Ignav 是一次性最多 1,000 次，默认身份为 `ignav_quarantine`，只有 `IGNAV_STRICT_RELEASE=1` 与 `IGNAV_FREE_ACCOUNT_ATTESTED=1` 同时成立并完成受控验证后才以独立的 `ignav_verified_fares` 身份参与；Scrape.do 每月 1,000 点数、每次参考查询预留 10 点数，只返回聚合覆盖快照；OpenSky 无凭据时默认启用匿名参考，每日 400 API 点数；AeroDataBox 只信任 RapidAPI 免费计划的限额/剩余/重置头来划分账期，没有可信重置证据时执行安装生命周期 600 单位硬墙；AirLabs 所有调用点与进程共用 SQLite 月度账本，配置 key 但没有明确有效的本地上限时 fail closed，响应中的账户月上限/已用量只能收紧硬墙。Scrape.do、OpenSky、AeroDataBox 与 AirLabs 永久只作各自的覆盖、航迹密度、时刻或运行参考，不能单独证明未来机票可售。
 
 GDELT DOC 属于近实时来源，全球数据通常约每 15 分钟更新；GAL RSS 每分钟更新并滚动保留最近约 15 分钟的链接。服务按航线缓存成功结果 15 分钟以减少重复请求。文章字段中的时间表示 GDELT 观察 / 索引时间，不保证是媒体的准确发布时间；标题保持来源语言。使用或再分发 GDELT 数据时须注明并链接 [GDELT Project](https://www.gdeltproject.org/about.html)。
 
@@ -103,13 +105,15 @@ GDELT DOC 属于近实时来源，全球数据通常约每 15 分钟更新；GAL
 
 SerpApi Google Flights 首次搜索只产生候选。系统分别搜索经济舱、超级经济舱、商务舱和头等舱，并启用 `deep_search=true` 与 `show_hidden=true`；这些参数只能扩大可见范围，仍不能保证返回所有航司、航班、舱位、销售方、私有票价或日期。候选必须带 `booking_token`，随后查询到的 `selected_flights` 必须与原始航段完全一致，并至少返回一个具有销售方、匹配航班号、正数 USD 价格和 HTTPS `booking_request.url` 的购票选项，才能标为 `booking_option_confirmed`。这证明 Google Flights 在来源结果生成时点返回了对应购票路径，不等于航空公司或销售方最终结账页仍有相同库存、规则或价格。若该请求无需 POST，`booking_url_kind=direct_get` 并可打开 Google 的销售方跳转；若请求带 `post_data`，普通 `<a>` 不能重放它，系统明确返回 `booking_url_kind=google_flights_itinerary` 的 Google Flights 结果页，不把它误称为销售方直链或“已选行程”。官方在此只保证 `google_flights_url`。当前响应不能可靠证明报价是否含税，因此 `taxes_included` 保持未知，不能写成“明确含税”。
 
-[SerpApi 免费计划](https://serpapi.com/pricing) 目前提供每个 provider 结算周期 250 次成功搜索及每小时 50 次请求；周期按账户 `plan_renewal_date` 划分，不按自然月。四舱初始搜索和 `booking_token` 查询共用额度。系统处理 SerpApi 四舱搜索实际返回的全部合格候选，并在剩余免费额度和供应商响应范围内逐个验证；同航程同舱位只保留最低已验证销售价。候选数量与验证调用数随查询变化，额度不足时允许返回已验证部分，并通过 `coverage_scope`、各候选计数、`coverage_status` 和 `quota_limit` 明确标记截断。官方当前说明缓存、错误和失败搜索不计入 provider 周期额度，但项目本地账本会在每次尝试前保守预留，连 provider 缓存请求也预留，因此本地 `monthly_calls_used` 是尝试数而不是 provider 成功计费数，可能更高并提前停止。`SERPAPI_MONTHLY_LIMIT` 和保存在忽略 Git 的 `runtime/` 目录中的单一结算周期账本共同执行硬上限：省略时默认 250，大于 250 时钳制为 250，非法或非正值也不会解除上限。部署者仍应独立检查账户用量；“严格”表示证据不降级，不表示覆盖全球所有航司、舱位、销售方或日期。
+[SerpApi 免费计划](https://serpapi.com/pricing) 目前提供每个 provider 结算周期 250 次成功搜索及每小时 50 次请求；周期按账户 `plan_renewal_date` 划分，不按自然月。四舱初始搜索和 `booking_token` 查询共用额度。系统处理 SerpApi 四舱搜索实际返回的全部合格候选，并在剩余免费额度和供应商响应范围内逐个验证。若 SerpApi 返回 `Processing/Queued`，系统只对白名单格式的同一 Search ID 做 0.5、1、1.5、2 秒有界 Archive 轮询；有界轮询仍未完成、供应商搜索错误、传输错误或 HTTP 408/425/5xx 时，只有再次原子预留额度成功后才允许受控重提一次，第二次可以轮询但不会产生第三次提交。HTTP 400、认证失败、429 与严格解析拒绝不重试；重试因额度失败由 `retry_quota_limited` 与覆盖字段报告。候选数量与验证调用数随查询变化，额度不足时允许返回已验证部分，并通过 `coverage_scope`、各候选计数、`coverage_status` 和 `quota_limit` 明确标记截断。官方当前说明缓存、错误和失败搜索不计入 provider 周期额度，但项目本地账本会在每次尝试前保守预留，连 provider 缓存请求也预留，因此本地 `monthly_calls_used` 是尝试数而不是 provider 成功计费数，可能更高并提前停止。`SERPAPI_MONTHLY_LIMIT` 和保存在忽略 Git 的 `runtime/` 目录中的单一结算周期账本共同执行硬上限：省略时默认 250，大于 250 时钳制为 250，非法或非正值也不会解除上限。部署者仍应独立检查账户用量。
+
+`auto` 不会在第一个确认报价后停止：所有已配置且获准参与的严格源都会运行并各自消耗自己的免费额度。若至少两个来源实际运行，顶层 metadata 使用 `provider_code=strict_fare_aggregate`，并以 `provider_runs` 保留逐源状态、计数、额度及脱敏诊断；聚合层只接收各来源已独立二次验证的报价。跨销售方、跨来源的去重键是完整有序航段身份与舱位，同组仅保留最低最终确认价格并保留获胜来源证据。单源结果继续使用该来源自己的 provider code。多个免费源可以减弱单一来源覆盖或额度不足的影响，但不能绕过各自额度墙，也不能证明全球全部可售库存；“严格”表示证据不降级，不表示覆盖全球所有航司、舱位、销售方或日期。
 
 SerpApi 可返回最长约 1 小时的 provider 缓存；应用另有 5 分钟严格结果缓存。`provider_cache_hit` 来自本地缓存命中或 provider 状态/时间启发式，只表示检测到缓存复用，不精确区分或证明具体来源；`provider_cache_age_seconds` 是当前响应相对 `verified_at`（SerpApi `search_metadata.created_at`，即 provider 结果生成时间）的年龄，并限制在含处理/时钟容差的 0–3900 秒。主页另外显示本次响应生成时间，不能把它与 provider 结果时间混为一谈。
 
-AirLabs 免费 `schedules` 是近实时接口，结果按当前或目标时刻前后 90 分钟筛选，并受最多 50 行、免费配额和提供方可见计划时段限制，因此是实际航班样本而不是完整机场统计。航班比较的 schedules/routes 查询也各自最多 50 行；任一响应的 `request.has_more` 为真或达到 50 行时，`schedule_sample_truncated=true`，表示参考样本可能不完整。本演示为控制免费配额和调用量不继续分页。`routes` 表达按星期重复的周期时刻表；系统可以把完整记录投影到所选日期，但必须标为 `recurring_timetable_projection`，不能称为当天已确认执行或可售航班。两类 AirLabs 记录都只进入 `timetable_references`。
+AirLabs 免费 `schedules` 是近实时接口，结果按当前或目标时刻前后 90 分钟筛选，并受最多 50 行、免费配额和提供方可见计划时段限制，因此是实际航班样本而不是完整机场统计。航班比较的 schedules/routes 查询也各自最多 50 行；任一响应的 `request.has_more` 为真或达到 50 行时，`schedule_sample_truncated=true`，表示参考样本可能不完整。本演示为控制免费配额和调用量不继续分页。`routes` 表达按星期重复的周期时刻表；系统可以把完整记录投影到所选日期，但必须标为 `recurring_timetable_projection`，不能称为当天已确认执行或可售航班。两类 AirLabs 记录都只进入 `timetable_references`。所有 AirLabs 传输在同一个跨进程 SQLite 账本中预留；没有有效的 `AIRLABS_MONTHLY_CALL_LIMIT` 时 fail closed，provider 返回的账户月上限和已用量只能进一步收紧本地硬墙。
 
-比较请求只提交 `departure_date`，且日期不得早于出发机场当地今天、并在当地今天后 370 天以内。未来日期使用当地正午作为模型、天气和新闻参考；同日若正午仍有超过 30 分钟余量则使用正午，否则沿 UTC 时间线推进 30 分钟再转换回机场当地时间。安全参考跨入次日则返回 422。`departure_time_basis` 明确区分正午与剩余同日参考，两者都不是航班钟点。严格主列表只接受完整、连续、未来、同一真实舱位且通过 SerpApi `booking_token` 购票选项验证的 1–4 个航段。非 USD/非正价格、混合舱位、技术停靠、断裂航段、航班号不一致或二次验证失败都被拒绝；无结果时不生成模型航班。AirLabs live/routes 仍只进入不参与排名的 `timetable_references`。普通 Google Flights 免费查询不能验证实际学生专属折扣；该字段显示 `unknown`，学生排序在没有报价级证据时不给该条件加分。
+比较请求只提交 `departure_date`，且日期不得早于出发机场当地今天、并在当地今天后 370 天以内。未来日期使用当地正午作为模型、天气和新闻参考；同日若正午仍有超过 30 分钟余量则使用正午，否则沿 UTC 时间线推进 30 分钟再转换回机场当地时间。安全参考跨入次日则返回 422。`departure_time_basis` 明确区分正午与剩余同日参考，两者都不是航班钟点。严格主列表只接受完整、连续、未来、同一真实舱位且通过当前来源购票选项二次验证的 1–4 个航段。非 USD/非正价格、混合舱位、技术停靠、断裂航段、航班号不一致或二次验证失败都被拒绝；所有配置并获准的严格源都查询完成后再聚合，最终无结果也不生成模型航班。AirLabs live/routes 仍只进入不参与排名的 `timetable_references`。普通免费报价查询不能验证实际学生专属折扣；该字段显示 `unknown`，学生排序在没有报价级证据时不给该条件加分。
 
 主页每个严格 live offer 都链接到 `GET /details/offer`，并通过 `POST /v1/offer-detail` 获取完整日期级 schedule、模型结果与从当前日期到起飞前的逐日价格模型预测曲线；周期参考没有详情链接。天气和新闻详情页继续使用各自的上下文接口。
 
@@ -124,9 +128,11 @@ Offer 详情初次加载发送 `force_refresh=false`，复用 5 分钟严格缓�
 在启动服务的同一个 PowerShell 窗口设置；不要把真实 key 写入文档或提交到 Git：
 
 ```powershell
-$env:FLIGHT_OFFER_PROVIDER="serpapi"
+$env:FLIGHT_OFFER_PROVIDER="auto"
 $env:SERPAPI_API_KEY="your-serpapi-key"
 $env:SERPAPI_MONTHLY_LIMIT="250"
+$env:SEARCHAPI_API_KEY="your-searchapi-key"
+$env:SEARCHAPI_LIFETIME_LIMIT="100"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
@@ -136,10 +142,12 @@ python -m flight_forecaster serve --model-dir artifacts/demo
 
 ```powershell
 $env:AIRLABS_API_KEY="your-free-key"
+$env:AIRLABS_MONTHLY_CALL_LIMIT="1000"
+$env:AIRLABS_USAGE_DB="runtime/airlabs-usage.sqlite3"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
-应用读取进程环境变量，不会自动加载 `.env`。不要把 key 写入源码、浏览器/前端、应用日志或提交到 GitHub。服务端按官方接口要求把 SerpApi key 放入发往 `https://serpapi.com` 的 HTTPS 查询参数，因此日志和错误信息不得记录完整外部请求 URL。未配置 AirLabs key 是受支持的上下文运行方式；相关机场运行信号使用明确标记的 `model_fallback`，不会伪造 provider 数据。严格报价是否可用仍取决于独立的 SerpApi 配置。
+应用读取进程环境变量，不会自动加载 `.env`。不要把 key 写入源码、浏览器/前端、应用日志或提交到 GitHub。服务端只把凭据发送给对应的 HTTPS provider，因此日志和错误信息不得记录完整外部请求 URL。未配置 AirLabs key 是受支持的上下文运行方式；配置 key 却没有有效的 `AIRLABS_MONTHLY_CALL_LIMIT` 时会在网络调用前拒绝，相关机场运行信号使用明确标记的 `model_fallback`，不会伪造 provider 数据。严格报价是否可用取决于至少一个已配置且有剩余额度的严格来源。
 
 ## 5. 建议的数据落地层
 
