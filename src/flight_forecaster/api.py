@@ -598,6 +598,11 @@ def offer_details_page() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "offer.html")
 
 
+@app.get("/details/providers", include_in_schema=False)
+def provider_details_page() -> FileResponse:
+    return FileResponse(Path(__file__).parent / "static" / "providers.html")
+
+
 @app.get("/health")
 def health() -> dict[str, str | bool]:
     artifact_exists = (model_dir() / ARTIFACT_FILENAME).exists()

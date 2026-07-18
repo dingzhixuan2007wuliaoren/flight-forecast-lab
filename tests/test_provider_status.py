@@ -397,6 +397,49 @@ def test_dashboard_renders_bilingual_provider_status_and_searchapi_attribution()
         assert fragment in dashboard
 
 
+def test_dashboard_only_shows_grouped_quota_summary_and_links_to_detail() -> None:
+    client = TestClient(app)
+    dashboard = client.get("/").text
+    details = client.get("/details/providers").text
+
+    for fragment in (
+        'id="provider-quota-summary"',
+        'href="/details/providers?lang=zh"',
+        "总剩余查询额度",
+        "Total remaining query allowance",
+        'provider.active !== true',
+        "hasValue(provider.quota_used) ? asNumber(provider.quota_used) : null",
+        "groups[unit].remaining",
+        "providerQuotaUnknownSources",
+        "flight-forecast-provider-status-v1",
+    ):
+        assert fragment in dashboard
+    assert 'id="provider-status-grid"' not in dashboard
+    assert 'class="provider-status-card"' not in dashboard
+    assert "provider-card-notice" not in dashboard
+
+    for fragment in (
+        'id="grid"',
+        'fetch("/v1/provider-status"',
+        "数据提供商状态",
+        "Data-provider status",
+        "quota_used",
+        "quota_limit",
+        "quota_cost_per_call",
+        "provider.can_supply_strict_offers",
+        "quotaState(provider.quota_status)",
+        "可提供严格报价",
+        "Can supply strict fares",
+        "额度不适用",
+        "Quota not applicable",
+        "if(!present(value))return null",
+        "flight-forecast-provider-status-v1",
+        'href="/#provider-status-title"',
+    ):
+        assert fragment in details
+    assert "innerHTML" not in details
+
+
 def test_dashboard_bounds_comparison_wait_and_preserves_request_errors() -> None:
     dashboard = TestClient(app).get("/").text
 

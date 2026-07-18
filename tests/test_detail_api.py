@@ -655,17 +655,24 @@ def test_second_level_pages_are_served() -> None:
 
     weather_page = client.get("/details/weather")
     news_page = client.get("/details/news")
+    providers_page = client.get("/details/providers")
 
     assert weather_page.status_code == 200
     assert news_page.status_code == 200
+    assert providers_page.status_code == 200
     assert "text/html" in weather_page.headers["content-type"]
     assert "text/html" in news_page.headers["content-type"]
+    assert "text/html" in providers_page.headers["content-type"]
     assert "departure_date" in weather_page.text
     assert "departure_time_basis" in weather_page.text
     assert "不是航班计划" in weather_page.text
     assert "departure_date" in news_page.text
     assert "departure_time_basis" in news_page.text
     assert "不是航班计划" in news_page.text
+    assert 'fetch("/v1/provider-status"' in providers_page.text
+    assert "数据提供商状态" in providers_page.text
+    assert "Data-provider status" in providers_page.text
+    assert "flight-forecast-provider-status-v1" in providers_page.text
 
     dashboard = client.get("/").text
     assert "departure_date: departureDate" in dashboard

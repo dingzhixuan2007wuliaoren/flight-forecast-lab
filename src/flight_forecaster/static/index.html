@@ -438,6 +438,10 @@
     .no-fabrication svg { flex: 0 0 auto; width: 17px; height: 17px; margin-top: 1px; }
 
     .provider-status-panel {
+      display: grid;
+      grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.5fr) auto;
+      align-items: center;
+      gap: 16px;
       margin-top: 18px;
       padding: 18px;
       border: 1px solid var(--slate-200);
@@ -446,35 +450,38 @@
       box-shadow: var(--shadow-sm);
     }
 
-    .provider-status-head {
+    .provider-summary-copy { min-width: 0; }
+    .provider-summary-eyebrow {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--blue-700);
+      font-size: 8px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .provider-summary-copy h2 { margin: 0 0 4px; font-size: 15px; }
+    .provider-summary-copy p { margin: 0; color: var(--slate-500); font-size: 9px; line-height: 1.55; }
+    .provider-quota-summary {
       display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: flex-start;
-      margin-bottom: 13px;
-    }
-
-    .provider-status-head h2 { margin: 0 0 4px; font-size: 15px; }
-    .provider-status-head p,
-    .provider-strict-policy { margin: 0; color: var(--slate-500); font-size: 10px; line-height: 1.55; }
-
-    .provider-status-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-    }
-
-    .provider-status-card {
       min-width: 0;
-      padding: 12px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .provider-quota-group {
+      min-width: 0;
+      flex: 1 1 150px;
+      padding: 10px 12px;
       border: 1px solid var(--slate-200);
       border-radius: 11px;
       background: var(--slate-50);
     }
-
-    .provider-card-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
-    .provider-card-name { min-width: 0; font-size: 11px; font-weight: 800; }
-    .provider-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+    .provider-quota-group span,
+    .provider-quota-group strong,
+    .provider-quota-group small { display: block; }
+    .provider-quota-group span { color: var(--slate-500); font-size: 8px; font-weight: 720; }
+    .provider-quota-group strong { margin-top: 3px; color: var(--navy-950); font-size: 18px; }
+    .provider-quota-group small { margin-top: 2px; color: var(--slate-500); font-size: 7px; }
     .provider-badge {
       display: inline-flex;
       padding: 3px 6px;
@@ -486,13 +493,25 @@
       font-weight: 780;
       line-height: 1.2;
     }
-    .provider-badge.good { color: #08795f; border-color: #bde8dd; background: #edfbf7; }
-    .provider-badge.warn { color: #81560b; border-color: #efd59c; background: #fff8e8; }
-    .provider-badge.risk { color: #a62e3b; border-color: #efc0c6; background: #fff2f4; }
-    .provider-card-meta { margin-top: 8px; color: var(--slate-600); font-size: 9px; line-height: 1.45; }
-    .provider-card-notice { margin: 6px 0 0; color: var(--slate-500); font-size: 8px; line-height: 1.5; }
-    .provider-strict-policy { margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--slate-200); }
-    .provider-status-loading { grid-column: 1 / -1; color: var(--slate-500); font-size: 10px; }
+    .provider-summary-actions { display: flex; align-items: flex-end; flex-direction: column; gap: 9px; }
+    .provider-status-detail {
+      display: inline-flex;
+      min-height: 36px;
+      align-items: center;
+      justify-content: center;
+      padding: 7px 11px;
+      color: var(--blue-700);
+      border: 1px solid var(--blue-100);
+      border-radius: 10px;
+      background: var(--blue-50);
+      font-size: 9px;
+      font-weight: 780;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .provider-status-detail:hover { border-color: var(--blue-500); }
+    .provider-status-detail:focus-visible { outline: none; box-shadow: var(--focus); }
+    .provider-status-loading { color: var(--slate-500); font-size: 10px; }
 
     .results {
       display: none;
@@ -1320,7 +1339,8 @@
       .hero { grid-template-columns: 1fr; gap: 24px; }
       .hero-points { grid-template-columns: repeat(3, 1fr); }
       .context-grid { grid-template-columns: 1fr; }
-      .provider-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .provider-status-panel { grid-template-columns: 1fr auto; }
+      .provider-quota-summary { grid-column: 1 / -1; grid-row: 2; }
       .context-summary { min-height: 0; }
       .route-banner { grid-template-columns: 1fr auto; }
       .route-meta { grid-column: 1 / -1; grid-row: 2; }
@@ -1386,8 +1406,9 @@
       .route-meta { gap: 9px 17px; }
       .section-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
       .context-card { padding: 16px; }
-      .provider-status-head { flex-direction: column; }
-      .provider-status-grid { grid-template-columns: 1fr; }
+      .provider-status-panel { grid-template-columns: 1fr; }
+      .provider-quota-summary { grid-column: auto; grid-row: auto; }
+      .provider-summary-actions { align-items: flex-start; }
       tbody tr { grid-template-columns: 1fr; }
       .airline-cell { grid-column: auto; }
       footer { flex-direction: column; gap: 8px; }
@@ -1501,17 +1522,18 @@
       </aside>
 
       <section class="provider-status-panel" aria-labelledby="provider-status-title">
-        <div class="provider-status-head">
-          <div>
-            <h2 id="provider-status-title" data-i18n="providerStatusTitle">数据提供商状态</h2>
-            <p data-i18n="providerStatusHint">配置状态不等于报价已验证；额度、隔离与仅参考边界会单独显示。</p>
-          </div>
+        <div class="provider-summary-copy">
+          <span class="provider-summary-eyebrow" data-i18n="providerQuotaSummaryEyebrow">额度概览</span>
+          <h2 id="provider-status-title" data-i18n="providerQuotaSummaryTitle">总剩余查询额度</h2>
+          <p data-i18n="providerQuotaSummaryHint">仅汇总当前启用来源，并按相同额度单位分组；未知用量不会被猜测为满额或零。</p>
+        </div>
+        <div id="provider-quota-summary" class="provider-quota-summary" aria-live="polite">
+          <span class="provider-status-loading" data-i18n="providerStatusLoading">正在读取不含密钥的额度状态…</span>
+        </div>
+        <div class="provider-summary-actions">
           <span id="provider-status-time" class="provider-badge">—</span>
+          <a id="provider-status-detail" class="provider-status-detail" href="/details/providers?lang=zh" data-i18n="providerStatusDetails">查看完整提供商状态 →</a>
         </div>
-        <div id="provider-status-grid" class="provider-status-grid" aria-live="polite">
-          <span class="provider-status-loading" data-i18n="providerStatusLoading">正在读取不含密钥的提供商状态…</span>
-        </div>
-        <p id="provider-strict-policy" class="provider-strict-policy" data-i18n="providerStrictPolicy">只有完整行程、正价格和安全购票路径均通过验证的报价才能进入严格列表；额度耗尽、隔离或仅参考来源不会被用来补造航班。</p>
       </section>
 
       <div id="initial-state" class="initial-state" data-i18n="initialState">输入航线和出发时间后，比较结果会显示在这里。</div>
@@ -1779,9 +1801,18 @@
           comparing: "正在比较",
           autoNote: "无需输入距离、飞行时长、天气、机场拥堵、航司或舱位；系统将自动推算并展开比较。",
           integrityNotice: "数据诚信提示：主价格必须来自允许进入严格模式的报价提供商，并且只有完整航段、正价格、购票选项及安全打开路径都通过验证的航班才会展示。额度耗尽会停止该提供商；隔离和仅参考来源绝不补造航班。来源缓存年龄与税费边界会明确标记，价格仍可能随时变化。模型价格曲线、80% 区间和准点率均为合成演示模型预测。",
+          providerQuotaSummaryEyebrow: "额度概览",
+          providerQuotaSummaryTitle: "总剩余查询额度",
+          providerQuotaSummaryHint: "仅汇总当前启用来源，并按相同额度单位分组；未知用量不会被猜测为满额或零。",
+          providerStatusDetails: "查看完整提供商状态 →",
+          providerQuotaKnownRemaining: "已知剩余",
+          providerQuotaUnknownSources: "{count} 个启用来源用量待确认",
+          providerQuotaExact: "全部可安全读取",
+          providerQuotaUnavailable: "暂时无法读取总剩余额度",
+          providerQuotaNoActive: "没有启用且公布额度上限的来源",
           providerStatusTitle: "数据提供商状态",
           providerStatusHint: "配置状态不等于报价已验证；额度、隔离与仅参考边界会单独显示。",
-          providerStatusLoading: "正在读取不含密钥的提供商状态…",
+          providerStatusLoading: "正在读取不含密钥的额度状态…",
           providerStatusUnavailable: "暂时无法读取提供商状态；这不会放宽严格验证规则。",
           providerStrictPolicy: "只有完整行程、正价格和安全购票路径均通过验证的报价才能进入严格列表；额度耗尽、隔离或仅参考来源不会被用来补造航班。",
           providerConfigured: "已配置",
@@ -2015,9 +2046,18 @@
           comparing: "Comparing",
           autoNote: "No distance, duration, weather, congestion, airline, or cabin input is needed; the system derives and compares them automatically.",
           integrityNotice: "Data integrity notice: the primary fare must come from a provider permitted in strict mode, and a flight appears only after its complete segments, positive fare, booking option, and safe opening path are verified. An exhausted provider stops; quarantined and reference-only sources never fabricate replacement flights. Cache age and tax boundaries remain explicit, and fares can still change. The price curve, 80% interval, and on-time probability remain synthetic-demo model forecasts.",
+          providerQuotaSummaryEyebrow: "Quota overview",
+          providerQuotaSummaryTitle: "Total remaining query allowance",
+          providerQuotaSummaryHint: "Only active sources are summarized, grouped by compatible quota units; unknown usage is never guessed as full or zero.",
+          providerStatusDetails: "View full provider status →",
+          providerQuotaKnownRemaining: "Known remaining",
+          providerQuotaUnknownSources: "Usage pending for {count} active source(s)",
+          providerQuotaExact: "All counts safely readable",
+          providerQuotaUnavailable: "Total remaining allowance is temporarily unavailable",
+          providerQuotaNoActive: "No active source publishes a quota ceiling",
           providerStatusTitle: "Data-provider status",
           providerStatusHint: "Configuration does not mean an offer is verified; quota, quarantine, and reference-only boundaries are shown separately.",
-          providerStatusLoading: "Reading credential-safe provider status…",
+          providerStatusLoading: "Reading credential-safe quota status…",
           providerStatusUnavailable: "Provider status is temporarily unavailable; strict verification rules are unchanged.",
           providerStrictPolicy: "Only offers whose complete itinerary, positive fare, and safe booking path all pass verification may enter the strict list; exhausted, quarantined, and reference-only sources never fabricate flights.",
           providerConfigured: "Configured",
@@ -2518,97 +2558,67 @@
         return t(keys[normalizeKey(value)] || "providerUnitManaged");
       }
 
-      function providerRoleLabel(value) {
-        return t(normalizeKey(value) === "strict_fare" ? "providerStrictFare" :
-          (normalizeKey(value) === "reference_only" ? "providerReferenceOnly" : "providerStrictCandidate"));
-      }
-
-      function providerState(value) {
-        var states = {
-          not_configured: ["providerNotConfigured", "warn"],
-          configured: ["providerConfigured", "good"],
-          quota_available: ["providerQuotaAvailable", "good"],
-          quota_exhausted: ["providerQuotaExhausted", "risk"],
-          quarantined: ["providerQuarantined", "warn"],
-          reference_only: ["providerReferenceOnly", "warn"]
-        };
-        return states[normalizeKey(value)] || ["providerQuotaUnknown", "warn"];
-      }
-
-      function appendProviderBadge(container, label, cssClass) {
-        var badge = document.createElement("span");
-        badge.className = "provider-badge" + (cssClass ? " " + cssClass : "");
-        badge.textContent = label;
-        container.appendChild(badge);
-      }
-
       function renderProviderStatus(data) {
-        var grid = byId("provider-status-grid");
-        if (!grid) return;
+        var summary = byId("provider-quota-summary");
+        if (!summary) return;
+        if (!data) {
+          summary.replaceChildren();
+          var loading = document.createElement("span");
+          loading.className = "provider-status-loading";
+          loading.textContent = t("providerStatusLoading");
+          summary.appendChild(loading);
+          return;
+        }
         var providers = data && Array.isArray(data.providers) ? data.providers : [];
-        grid.replaceChildren();
-        if (!providers.length) {
+        var groups = {};
+        providers.forEach(function (provider) {
+          if (!provider || typeof provider !== "object" || provider.active !== true) return;
+          var limit = hasValue(provider.quota_limit) ? asNumber(provider.quota_limit) : null;
+          var used = hasValue(provider.quota_used) ? asNumber(provider.quota_used) : null;
+          var unit = normalizeKey(provider.quota_unit);
+          if (limit === null || limit <= 0 || !unit) return;
+          if (!groups[unit]) groups[unit] = { remaining: 0, known: 0, unknown: 0 };
+          if (used !== null) {
+            groups[unit].remaining += Math.max(0, Math.round(limit) - Math.max(0, Math.round(used)));
+            groups[unit].known += 1;
+          } else if (normalizeKey(provider.quota_status) === "exhausted") {
+            groups[unit].known += 1;
+          } else {
+            groups[unit].unknown += 1;
+          }
+        });
+        summary.replaceChildren();
+        var order = ["billing_period_requests", "lifetime_requests", "monthly_credits", "daily_credits", "monthly_units", "provider_managed", "hour", "billing_period", "credits"];
+        var units = Object.keys(groups).sort(function (left, right) {
+          var leftIndex = order.indexOf(left), rightIndex = order.indexOf(right);
+          if (leftIndex < 0) leftIndex = order.length;
+          if (rightIndex < 0) rightIndex = order.length;
+          return leftIndex - rightIndex || left.localeCompare(right);
+        });
+        if (!units.length) {
           var unavailable = document.createElement("span");
           unavailable.className = "provider-status-loading";
-          unavailable.textContent = t(data && data.unavailable ? "providerStatusUnavailable" : "providerStatusLoading");
-          grid.appendChild(unavailable);
+          unavailable.textContent = t(data && data.unavailable ? "providerQuotaUnavailable" : "providerQuotaNoActive");
+          summary.appendChild(unavailable);
         }
-        providers.forEach(function (provider) {
-          if (!provider || typeof provider !== "object") return;
-          var card = document.createElement("article");
-          card.className = "provider-status-card";
-          card.dataset.providerCode = safeText(provider.code, "");
-          var head = document.createElement("div");
-          head.className = "provider-card-head";
-          var name = document.createElement("span");
-          name.className = "provider-card-name";
-          name.textContent = safeText(provider.display_name);
-          var badges = document.createElement("span");
-          badges.className = "provider-badges";
-          appendProviderBadge(badges, providerRoleLabel(provider.role), "");
-          var state = providerState(provider.status);
-          appendProviderBadge(badges, t(state[0]), state[1]);
-          if (normalizeKey(provider.status) !== "configured" && normalizeKey(provider.status) !== "not_configured") {
-            appendProviderBadge(badges, t(provider.configured ? "providerConfigured" : "providerNotConfigured"), provider.configured ? "good" : "warn");
-          }
-          if (provider.active === true) appendProviderBadge(badges, t("providerActive"), "good");
-          head.appendChild(name);
-          head.appendChild(badges);
-          card.appendChild(head);
-
-          var limit = asNumber(provider.quota_limit);
-          var used = asNumber(provider.quota_used);
-          var unit = providerQuotaUnitLabel(provider.quota_unit);
-          var meta = document.createElement("div");
-          meta.className = "provider-card-meta";
-          if (limit !== null && limit > 0) {
-            meta.textContent = used !== null ? fillTemplate("providerQuotaUsage", {
-              used: Math.max(0, Math.round(used)), limit: Math.round(limit), unit: unit
-            }) : fillTemplate("providerQuotaLimit", { limit: Math.round(limit), unit: unit });
-          } else if (normalizeKey(provider.quota_status) !== "not_applicable") {
-            meta.textContent = t("providerQuotaNoCounts");
-          }
-          var cost = asNumber(provider.quota_cost_per_call);
-          if (cost !== null && cost > 0) {
-            var costLine = document.createElement("div");
-            costLine.textContent = fillTemplate("providerQuotaPerCall", {
-              cost: Math.round(cost), unit: unit
-            });
-            meta.appendChild(costLine);
-          }
-          if (meta.textContent) card.appendChild(meta);
-
-          var notice = document.createElement("p");
-          notice.className = "provider-card-notice";
-          notice.textContent = localizedText(provider.notice, "");
-          if (notice.textContent) card.appendChild(notice);
-          grid.appendChild(card);
+        units.forEach(function (unit) {
+          var group = groups[unit], card = document.createElement("div");
+          card.className = "provider-quota-group";
+          var label = document.createElement("span");
+          label.textContent = t("providerQuotaKnownRemaining") + " · " + providerQuotaUnitLabel(unit);
+          var value = document.createElement("strong");
+          value.textContent = group.known > 0 ? group.remaining.toLocaleString(currentLanguage === "zh" ? "zh-CN" : "en-US") + (group.unknown > 0 ? "+" : "") : "—";
+          var note = document.createElement("small");
+          note.textContent = group.unknown > 0 ? fillTemplate("providerQuotaUnknownSources", { count: group.unknown }) : t("providerQuotaExact");
+          card.appendChild(label);
+          card.appendChild(value);
+          card.appendChild(note);
+          summary.appendChild(card);
         });
         byId("provider-status-time").textContent = formatDate(data && data.generated_at, true);
-        byId("provider-strict-policy").textContent = localizedText(
-          data && data.strict_policy,
-          t("providerStrictPolicy")
-        );
+        if (providers.length) {
+          try { window.sessionStorage.setItem("flight-forecast-provider-status-v1", JSON.stringify(data)); } catch (error) { /* sanitized snapshot is optional */ }
+        }
       }
 
       async function loadProviderStatus() {
@@ -2695,6 +2705,7 @@
         });
         byId("lang-zh").setAttribute("aria-pressed", String(currentLanguage === "zh"));
         byId("lang-en").setAttribute("aria-pressed", String(currentLanguage === "en"));
+        byId("provider-status-detail").href = "/details/providers?lang=" + currentLanguage;
         try { window.localStorage.setItem("flight-forecast-language", currentLanguage); } catch (error) { /* storage can be unavailable */ }
         updateRankingDescription();
         renderProviderStatus(providerStatusData);
@@ -3598,6 +3609,7 @@
       });
 
       byId("departure-time").addEventListener("change", saveSessionState);
+      byId("provider-status-detail").addEventListener("click", saveSessionState);
 
       ["weather-detail-link", "news-detail-link"].forEach(function (id) {
         byId(id).addEventListener("click", function (event) {

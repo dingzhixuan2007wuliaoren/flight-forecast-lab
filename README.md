@@ -291,6 +291,10 @@ Tax inclusion is unknown.
 
 The detail pages use the same `中文 / English` switch as the dashboard. Weather refreshes every 10 minutes and news every 15 minutes; both also provide a manual refresh button. Initial offer-detail load reuses the five-minute strict cache; only its refresh button forces a new four-cabin search and candidate verification, still bounded by free quota and provider responses. A provider result can itself be cached for up to about one hour, with cache status and age shown separately from response generation time. Offer detail explicitly reports when `weather_feature_status=ignored` and the on-time prediction used the weather-free model.
 
+主页只显示当前启用来源的剩余额度摘要，并严格按额度单位分组；不同结算周期、账户终身额度和 API 点数不会被伪装成一个可直接相加的数字，未知用量也不会被猜测为满额或零。`/details/providers` 二级页面显示完整的脱敏逐来源状态、额度周期和严格报价边界；它只读取 `/v1/provider-status` 与同一浏览器会话中的最近快照，不会调用外部供应商或消耗查询额度。
+
+The dashboard shows only a remaining-allowance summary for active sources, grouped by quota unit. Billing-period requests, lifetime allowances, and API credits are never presented as one directly additive number, and unknown usage is never guessed as full or zero. The `/details/providers` second-level page shows the full sanitized per-source status, quota window, and strict-fare boundary. It reads only `/v1/provider-status` and the latest same-session snapshot, so it makes no external provider call and consumes no provider allowance.
+
 ## 新闻如何进入预测 / How news affects predictions
 
 系统通过无需 API 密钥的 GDELT DOC 2.0 查询最近 7 天内与起点、终点及航空中断词相关的文章，并使用 `DateDesc` 按 GDELT 最新观察时间排序。DOC 请求失败时会尝试 GDELT 官方 GAL RSS：该 RSS 每分钟更新，保留最近约 15 分钟的文章。相同航线的成功结果缓存 15 分钟；实时来源暂时失败时可返回不超过 6 小时、明确标为 `historical` 且降低模型影响的旧缓存；没有可用缓存才返回值 0、状态 `neutral`，且绝不虚构标题。
