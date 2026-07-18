@@ -1803,13 +1803,13 @@
           integrityNotice: "数据诚信提示：主价格必须来自允许进入严格模式的报价提供商，并且只有完整航段、正价格、购票选项及安全打开路径都通过验证的航班才会展示。额度耗尽会停止该提供商；隔离和仅参考来源绝不补造航班。来源缓存年龄与税费边界会明确标记，价格仍可能随时变化。模型价格曲线、80% 区间和准点率均为合成演示模型预测。",
           providerQuotaSummaryEyebrow: "额度概览",
           providerQuotaSummaryTitle: "总剩余查询额度",
-          providerQuotaSummaryHint: "仅汇总当前启用来源，并按相同额度单位分组；未知用量不会被猜测为满额或零。",
+          providerQuotaSummaryHint: "仅汇总当前启用、由供应商快照或本地安全账本明确报告的剩余额度，并按相同单位分组；未公开或不可读取的额度不会被猜测为数字。",
           providerStatusDetails: "查看完整提供商状态 →",
           providerQuotaKnownRemaining: "已知剩余",
-          providerQuotaUnknownSources: "{count} 个启用来源用量待确认",
-          providerQuotaExact: "全部可安全读取",
+          providerQuotaMeasuredSources: "来自 {count} 个可测来源",
+          providerQuotaExact: "服务端明确报告的余额",
           providerQuotaUnavailable: "暂时无法读取总剩余额度",
-          providerQuotaNoActive: "没有启用且公布额度上限的来源",
+          providerQuotaNoActive: "当前没有启用且明确报告剩余额度的来源",
           providerStatusTitle: "数据提供商状态",
           providerStatusHint: "配置状态不等于报价已验证；额度、隔离与仅参考边界会单独显示。",
           providerStatusLoading: "正在读取不含密钥的额度状态…",
@@ -2048,13 +2048,13 @@
           integrityNotice: "Data integrity notice: the primary fare must come from a provider permitted in strict mode, and a flight appears only after its complete segments, positive fare, booking option, and safe opening path are verified. An exhausted provider stops; quarantined and reference-only sources never fabricate replacement flights. Cache age and tax boundaries remain explicit, and fares can still change. The price curve, 80% interval, and on-time probability remain synthetic-demo model forecasts.",
           providerQuotaSummaryEyebrow: "Quota overview",
           providerQuotaSummaryTitle: "Total remaining query allowance",
-          providerQuotaSummaryHint: "Only active sources are summarized, grouped by compatible quota units; unknown usage is never guessed as full or zero.",
+          providerQuotaSummaryHint: "Only active sources with remaining allowance explicitly reported by a provider snapshot or local safety ledger are summarized, grouped by compatible units; unpublished or unavailable values are never guessed.",
           providerStatusDetails: "View full provider status →",
           providerQuotaKnownRemaining: "Known remaining",
-          providerQuotaUnknownSources: "Usage pending for {count} active source(s)",
-          providerQuotaExact: "All counts safely readable",
+          providerQuotaMeasuredSources: "From {count} measurable source(s)",
+          providerQuotaExact: "Explicitly reported by the service",
           providerQuotaUnavailable: "Total remaining allowance is temporarily unavailable",
-          providerQuotaNoActive: "No active source publishes a quota ceiling",
+          providerQuotaNoActive: "No active source currently reports a measurable remaining allowance",
           providerStatusTitle: "Data-provider status",
           providerStatusHint: "Configuration does not mean an offer is verified; quota, quarantine, and reference-only boundaries are shown separately.",
           providerStatusLoading: "Reading credential-safe quota status…",
@@ -2570,46 +2570,44 @@
           return;
         }
         var providers = data && Array.isArray(data.providers) ? data.providers : [];
-        var groups = {};
+        var balances = [];
+        var measurableBases = ["provider_reported", "local_ledger", "provider_and_local_ledger"];
         providers.forEach(function (provider) {
           if (!provider || typeof provider !== "object" || provider.active !== true) return;
-          var limit = hasValue(provider.quota_limit) ? asNumber(provider.quota_limit) : null;
-          var used = hasValue(provider.quota_used) ? asNumber(provider.quota_used) : null;
+          var basis = normalizeKey(provider.quota_data_basis);
+          var remaining = hasValue(provider.quota_remaining) ? asNumber(provider.quota_remaining) : null;
           var unit = normalizeKey(provider.quota_unit);
-          if (limit === null || limit <= 0 || !unit) return;
-          if (!groups[unit]) groups[unit] = { remaining: 0, known: 0, unknown: 0 };
-          if (used !== null) {
-            groups[unit].remaining += Math.max(0, Math.round(limit) - Math.max(0, Math.round(used)));
-            groups[unit].known += 1;
-          } else if (normalizeKey(provider.quota_status) === "exhausted") {
-            groups[unit].known += 1;
-          } else {
-            groups[unit].unknown += 1;
-          }
+          if (measurableBases.indexOf(basis) < 0 || remaining === null || remaining < 0 || !unit) return;
+          balances.push({
+            code: normalizeKey(provider.code),
+            name: safeText(provider.display_name, normalizeKey(provider.code)),
+            unit: unit,
+            remaining: Math.max(0, Math.round(remaining))
+          });
         });
         summary.replaceChildren();
         var order = ["billing_period_requests", "lifetime_requests", "monthly_credits", "daily_credits", "monthly_units", "provider_managed", "hour", "billing_period", "credits"];
-        var units = Object.keys(groups).sort(function (left, right) {
-          var leftIndex = order.indexOf(left), rightIndex = order.indexOf(right);
+        balances.sort(function (left, right) {
+          var leftIndex = order.indexOf(left.unit), rightIndex = order.indexOf(right.unit);
           if (leftIndex < 0) leftIndex = order.length;
           if (rightIndex < 0) rightIndex = order.length;
-          return leftIndex - rightIndex || left.localeCompare(right);
+          return leftIndex - rightIndex || left.name.localeCompare(right.name) || left.code.localeCompare(right.code);
         });
-        if (!units.length) {
+        if (!balances.length) {
           var unavailable = document.createElement("span");
           unavailable.className = "provider-status-loading";
           unavailable.textContent = t(data && data.unavailable ? "providerQuotaUnavailable" : "providerQuotaNoActive");
           summary.appendChild(unavailable);
         }
-        units.forEach(function (unit) {
-          var group = groups[unit], card = document.createElement("div");
+        balances.forEach(function (balance) {
+          var card = document.createElement("div");
           card.className = "provider-quota-group";
           var label = document.createElement("span");
-          label.textContent = t("providerQuotaKnownRemaining") + " · " + providerQuotaUnitLabel(unit);
+          label.textContent = t("providerQuotaKnownRemaining") + " · " + balance.name;
           var value = document.createElement("strong");
-          value.textContent = group.known > 0 ? group.remaining.toLocaleString(currentLanguage === "zh" ? "zh-CN" : "en-US") + (group.unknown > 0 ? "+" : "") : "—";
+          value.textContent = balance.remaining.toLocaleString(currentLanguage === "zh" ? "zh-CN" : "en-US");
           var note = document.createElement("small");
-          note.textContent = group.unknown > 0 ? fillTemplate("providerQuotaUnknownSources", { count: group.unknown }) : t("providerQuotaExact");
+          note.textContent = providerQuotaUnitLabel(balance.unit) + " · " + t("providerQuotaExact");
           card.appendChild(label);
           card.appendChild(value);
           card.appendChild(note);

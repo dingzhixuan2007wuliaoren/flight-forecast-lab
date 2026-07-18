@@ -13,7 +13,6 @@ import pytest
 from flight_forecaster.alternate_fare_providers import (
     IGNAV_BOOKING_LINKS_URL,
     IGNAV_ONE_WAY_URL,
-    SEARCHAPI_ACCOUNT_URL,
     SEARCHAPI_SEARCH_URL,
     FallbackFlightOfferProvider,
     IgnavQuarantineFlightOfferProvider,
@@ -64,18 +63,10 @@ class _SearchApiClient:
     def __init__(
         self,
         *,
-        account_payload: dict[str, Any] | None = None,
-        account_status: int = 200,
         include_candidate: bool = True,
         candidate_cabins: set[str] | None = None,
         candidates_per_cabin: int = 1,
     ) -> None:
-        self.account_payload = (
-            account_payload
-            if account_payload is not None
-            else _free_searchapi_account()
-        )
-        self.account_status = account_status
         self.candidate_cabins = (
             set(candidate_cabins)
             if candidate_cabins is not None
@@ -95,8 +86,6 @@ class _SearchApiClient:
         assert headers["Authorization"] == "Bearer searchapi-test-key"
         assert timeout > 0
         self.calls.append((url, dict(params)))
-        if url == SEARCHAPI_ACCOUNT_URL:
-            return _Response(self.account_payload, self.account_status)
         assert url == SEARCHAPI_SEARCH_URL
         cabin = str(params["travel_class"])
         if "booking_token" in params:
@@ -162,6 +151,27 @@ class _PartiallyFailingSearchApiClient(_SearchApiClient):
             headers=headers,
             timeout=timeout,
         )
+
+
+class _FailingSearchApiClient(_SearchApiClient):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(include_candidate=False)
+        self.status_code = status_code
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        assert url == SEARCHAPI_SEARCH_URL
+        assert "booking_token" not in params
+        assert headers["Authorization"] == "Bearer searchapi-test-key"
+        assert timeout > 0
+        self.calls.append((url, dict(params)))
+        return _Response({"error": "provider failure"}, self.status_code)
 
 
 class _RejectingBoundedSearchApiClient(_SearchApiClient):
@@ -294,18 +304,6 @@ class _NoCallClient:
 
     def post(self, *_args: Any, **_kwargs: Any) -> _Response:
         raise AssertionError("provider network must not be called")
-
-
-def _free_searchapi_account() -> dict[str, Any]:
-    return {
-        "account": {
-            "current_month_usage": 0,
-            "monthly_allowance": 0,
-            "remaining_credits": 100,
-        },
-        "api_usage": {"searches_this_hour": 0, "hourly_rate_limit": 100},
-        "subscription": {},
-    }
 
 
 def _searchapi_parameters(cabin: str) -> dict[str, Any]:
@@ -529,6 +527,8 @@ def test_searchapi_strictly_searches_four_one_way_cabins_and_verifies_booking(
         _TRAVEL_CLASSES.values()
     )
     assert all(call["flight_type"] == "one_way" for call in cabin_calls)
+    assert len(client.calls) == 5
+    assert all(url == SEARCHAPI_SEARCH_URL for url, _ in client.calls)
 
 
 def test_searchapi_runs_cabin_and_booking_requests_with_bounded_concurrency(
@@ -620,55 +620,26 @@ def test_searchapi_partial_rejections_do_not_claim_complete_no_results(
     assert result.quota_limit == "provider_specific"
 
 
-@pytest.mark.parametrize(
-    ("account_payload", "account_status", "expected_status"),
-    [
-        (
-            {
-                **_free_searchapi_account(),
-                "subscription": {"plan": "paid"},
-            },
-            200,
-            "budget_exhausted",
-        ),
-        (
-            {
-                **_free_searchapi_account(),
-                "account": {
-                    "current_month_usage": 0,
-                    "monthly_allowance": 101,
-                    "remaining_credits": 101,
-                },
-            },
-            200,
-            "budget_exhausted",
-        ),
-        ({"account": {}, "api_usage": {}, "subscription": {}}, 200, "provider_unavailable"),
-        (_free_searchapi_account(), 401, "authentication_failed"),
-    ],
-)
-def test_searchapi_paid_or_invalid_accounts_fail_closed(
+def test_searchapi_business_authentication_failure_is_reserved(
     tmp_path: Path,
-    account_payload: dict[str, Any],
-    account_status: int,
-    expected_status: str,
 ) -> None:
-    client = _SearchApiClient(
-        account_payload=account_payload,
-        account_status=account_status,
-    )
+    client = _FailingSearchApiClient(401)
     provider = SearchApiFlightOfferProvider(
         "searchapi-test-key",
-        usage_path=tmp_path / f"usage-{expected_status}.sqlite3",
+        usage_path=tmp_path / "usage-auth.sqlite3",
         client=client,
         now_provider=lambda: NOW,
     )
 
     result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
 
-    assert result.status == expected_status
+    assert result.status == "authentication_failed"
     assert result.offers == ()
-    assert [url for url, _ in client.calls] == [SEARCHAPI_ACCOUNT_URL]
+    assert result.search_calls_used == 4
+    assert result.search_monthly_used == 4
+    assert len(client.calls) == 4
+    assert all(url == SEARCHAPI_SEARCH_URL for url, _ in client.calls)
+    assert provider._ledger.snapshot(provider.ledger_provider_code) == 4
 
 
 def test_searchapi_missing_key_fails_closed_without_network(tmp_path: Path) -> None:
@@ -705,8 +676,8 @@ def test_searchapi_lifetime_hard_limit_survives_new_searches(tmp_path: Path) -> 
     assert second.status == "budget_exhausted"
     assert second.search_calls_used == 0
     assert second.search_monthly_used == 4
-    assert len(client.calls) == calls_after_first + 1
-    assert client.calls[-1][0] == SEARCHAPI_ACCOUNT_URL
+    assert len(client.calls) == calls_after_first
+    assert all(url == SEARCHAPI_SEARCH_URL for url, _ in client.calls)
 
 
 def test_searchapi_four_cabin_reservation_is_all_or_nothing(tmp_path: Path) -> None:
@@ -729,18 +700,13 @@ def test_searchapi_four_cabin_reservation_is_all_or_nothing(tmp_path: Path) -> N
     assert result.status == "budget_exhausted"
     assert result.search_calls_used == 0
     assert provider._ledger.snapshot(provider.ledger_provider_code) == 2
-    assert [url for url, _ in client.calls] == [SEARCHAPI_ACCOUNT_URL]
+    assert client.calls == []
 
 
 def test_searchapi_hourly_wall_is_not_reported_as_lifetime_exhaustion(
     tmp_path: Path,
 ) -> None:
-    account = _free_searchapi_account()
-    account["api_usage"] = {
-        "searches_this_hour": 98,
-        "hourly_rate_limit": 100,
-    }
-    client = _SearchApiClient(account_payload=account, include_candidate=False)
+    client = _FailingSearchApiClient(429)
     provider = SearchApiFlightOfferProvider(
         "searchapi-test-key",
         usage_path=tmp_path / "usage.sqlite3",
@@ -752,9 +718,34 @@ def test_searchapi_hourly_wall_is_not_reported_as_lifetime_exhaustion(
 
     assert result.status == "rate_limited"
     assert result.quota_limit == "hourly"
-    assert result.search_calls_used == 0
-    assert result.search_monthly_used == 0
-    assert [url for url, _ in client.calls] == [SEARCHAPI_ACCOUNT_URL]
+    assert result.search_calls_used == 4
+    assert result.search_monthly_used == 4
+    assert len(client.calls) == 4
+    assert all(url == SEARCHAPI_SEARCH_URL for url, _ in client.calls)
+
+
+def test_searchapi_cache_hit_makes_no_request_or_reservation(
+    tmp_path: Path,
+) -> None:
+    client = _SearchApiClient(include_candidate=False)
+    provider = SearchApiFlightOfferProvider(
+        "searchapi-test-key",
+        usage_path=tmp_path / "usage-cache.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    first = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    calls_after_first = len(client.calls)
+    used_after_first = provider._ledger.snapshot(provider.ledger_provider_code)
+    second = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert first.status == "no_results"
+    assert second.status == "no_results"
+    assert second.cache_hit is True
+    assert second.search_calls_used == 0
+    assert len(client.calls) == calls_after_first
+    assert provider._ledger.snapshot(provider.ledger_provider_code) == used_after_first
 
 
 def test_searchapi_keeps_verified_offer_when_one_cabin_search_fails(

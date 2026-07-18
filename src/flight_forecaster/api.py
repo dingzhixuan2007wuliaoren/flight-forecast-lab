@@ -9,11 +9,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from flight_forecaster.airlabs_quota import (
-    AirLabsQuotaError,
-    AirLabsQuotaLedger,
     airlabs_usage_path,
     configured_airlabs_monthly_limit,
+    read_airlabs_quota_snapshot,
 )
+from flight_forecaster.alternate_fare_providers import (
+    read_alternate_provider_quota_snapshot,
+)
+from flight_forecaster.availability import read_serpapi_quota_snapshot
+from flight_forecaster.quota_status import QuotaLedgerSnapshot
 from flight_forecaster.route_info import RouteLookupError
 from flight_forecaster.schemas import (
     ComparisonRequest,
@@ -30,7 +34,13 @@ from flight_forecaster.schemas import (
     RuntimeProviderStatusResponse,
     WeatherDetailResponse,
 )
+from flight_forecaster.scrapedo_reference import read_scrapedo_quota_snapshot
 from flight_forecaster.service import OfferNotFoundError, PredictionService
+from flight_forecaster.supplemental_aviation import (
+    read_aerodatabox_quota_snapshot,
+    read_opensky_quota_snapshot,
+    supplemental_usage_path,
+)
 from flight_forecaster.training import ARTIFACT_FILENAME
 
 app = FastAPI(
@@ -161,50 +171,25 @@ def _environment_enabled(name: str, *, default: bool = True) -> bool:
 
 def _airlabs_quota_status(
     *, configured: bool
-) -> tuple[bool, str, int | None, int | None]:
+) -> tuple[bool, QuotaLedgerSnapshot, int | None]:
     """Return credential-safe AirLabs state without making a provider request."""
 
     if not configured:
-        return False, "not_applicable", None, None
+        return False, QuotaLedgerSnapshot.unavailable(), None
     limit = configured_airlabs_monthly_limit()
     if limit is None:
         # Credentials alone never enable a potentially overage-bearing call.
-        return False, "not_applicable", None, None
+        return False, QuotaLedgerSnapshot.unavailable(), None
 
-    quota_status = "unknown"
-    quota_used: int | None = None
-    effective_limit = limit
     usage_path = airlabs_usage_path(
         model_dir().parent / "runtime" / "airlabs-usage.sqlite3"
     )
-    if not usage_path.is_file():
-        return True, quota_status, quota_used, effective_limit
-
-    try:
-        now = datetime.now(UTC)
-        ledger = AirLabsQuotaLedger(usage_path)
-        local_used = ledger.calls_used(now=now)
-        snapshot = ledger.account_snapshot(now=now)
-        observed_used = local_used
-        provider_exhausted = False
-        if snapshot is not None:
-            observed_used = max(observed_used, snapshot.limits_total)
-            if snapshot.limits_by_month > 0:
-                effective_limit = min(effective_limit, snapshot.limits_by_month)
-            else:
-                provider_exhausted = True
-            provider_exhausted = provider_exhausted or snapshot.remaining <= 0
-        quota_used = min(observed_used, effective_limit)
-        quota_status = (
-            "exhausted"
-            if provider_exhausted or observed_used >= effective_limit
-            else "available"
-        )
-    except (AirLabsQuotaError, OSError):
-        # Never leak local exception details through the public status endpoint.
-        quota_status = "unknown"
-        quota_used = None
-    return True, quota_status, quota_used, effective_limit
+    snapshot = read_airlabs_quota_snapshot(
+        usage_path,
+        hard_limit=limit,
+        now=datetime.now(UTC),
+    )
+    return True, snapshot, limit
 
 
 def _runtime_provider_status(
@@ -228,8 +213,7 @@ def _runtime_provider_status(
     airlabs_configured = _credential_present("AIRLABS_API_KEY")
     (
         airlabs_active,
-        airlabs_quota_status,
-        airlabs_quota_used,
+        airlabs_snapshot,
         airlabs_quota_limit,
     ) = _airlabs_quota_status(configured=airlabs_configured)
     airlabs_active = airlabs_active and external_context_enabled
@@ -245,6 +229,83 @@ def _runtime_provider_status(
         ("OPENSKY_DAILY_CREDIT_LIMIT",),
         default=4_000 if opensky_registered else 400,
         maximum=4_000 if opensky_registered else 400,
+    )
+    now = datetime.now(UTC)
+    runtime_dir = model_dir().parent / "runtime"
+    serpapi_limit = _serpapi_quota_limit(serpapi_configured)
+    serpapi_snapshot = (
+        read_serpapi_quota_snapshot(
+            runtime_dir / "serpapi-usage.sqlite3",
+            hard_limit=serpapi_limit,
+            now=now,
+        )
+        if serpapi_limit is not None
+        else QuotaLedgerSnapshot.unavailable()
+    )
+    alternate_path = runtime_dir / "alternate-provider-usage.sqlite3"
+    searchapi_limit = _searchapi_quota_limit()
+    searchapi_snapshot = (
+        read_alternate_provider_quota_snapshot(
+            alternate_path,
+            provider_code="searchapi_google_flights",
+            hard_limit=searchapi_limit,
+            now=now,
+        )
+        if searchapi_configured
+        else QuotaLedgerSnapshot.unavailable()
+    )
+    ignav_limit = _ignav_quota_limit()
+    ignav_snapshot = (
+        read_alternate_provider_quota_snapshot(
+            alternate_path,
+            provider_code="ignav_quarantine",
+            hard_limit=ignav_limit,
+            now=now,
+        )
+        if ignav_configured and ignav_released
+        else QuotaLedgerSnapshot.unavailable()
+    )
+    scrape_do_limit = _scrape_do_quota_limit()
+    scrape_do_path = Path(
+        os.getenv(
+            "SCRAPE_DO_USAGE_DB",
+            str(runtime_dir / "scrapedo-reference-usage.sqlite3"),
+        )
+    )
+    scrape_do_snapshot = (
+        read_scrapedo_quota_snapshot(
+            scrape_do_path,
+            hard_limit=scrape_do_limit,
+            now=now,
+        )
+        if scrape_do_configured
+        else QuotaLedgerSnapshot.unavailable()
+    )
+    supplemental_path = supplemental_usage_path(
+        runtime_dir / "supplemental-aviation-usage.sqlite3"
+    )
+    aerodatabox_limit = _bounded_quota_limit(
+        ("AERODATABOX_MONTHLY_UNIT_LIMIT",),
+        default=600,
+        maximum=600,
+    )
+    aerodatabox_snapshot = (
+        read_aerodatabox_quota_snapshot(
+            supplemental_path,
+            hard_limit=aerodatabox_limit,
+            now=now,
+        )
+        if aerodatabox_active
+        else QuotaLedgerSnapshot.unavailable()
+    )
+    opensky_snapshot = (
+        read_opensky_quota_snapshot(
+            supplemental_path,
+            hard_limit=opensky_limit,
+            now=now,
+        )
+        if opensky_active
+        else QuotaLedgerSnapshot.unavailable()
     )
 
     strict_notice = {
@@ -269,12 +330,29 @@ def _runtime_provider_status(
         quarantined: bool = False,
         quota_limit: int | None = None,
         quota_unit: str | None = None,
+        quota_snapshot: QuotaLedgerSnapshot | None = None,
         notice: dict[str, str] | None = None,
     ) -> RuntimeProviderStatusItem:
         if quarantined:
             status = "quarantined"
+            quota_status = "not_applicable"
         else:
             status = "configured" if configured else "not_configured"
+            quota_status = "unknown" if configured else "not_applicable"
+        snapshot = quota_snapshot or QuotaLedgerSnapshot.unavailable()
+        quota_data_basis = "not_applicable" if (not configured or quarantined) else (
+            {
+                "local_hard_limit": "local_ledger",
+                "provider_snapshot": "provider_reported",
+                "conservative_minimum": "provider_and_local_ledger",
+            }.get(snapshot.data_basis, "unavailable")
+            if snapshot.available
+            else "unavailable"
+        )
+        if configured and not quarantined and snapshot.available:
+            exhausted = snapshot.remaining == 0
+            quota_status = "exhausted" if exhausted else "available"
+            status = "quota_exhausted" if exhausted else "quota_available"
         if notice is None and quarantined:
             notice = {
                 "zh": "该来源处于隔离状态；即使已配置，也不能向严格航班列表提供报价。",
@@ -298,12 +376,52 @@ def _runtime_provider_status(
             configured=configured,
             active=code in selected,
             status=status,
-            quota_status="unknown" if configured else "not_applicable",
+            quota_status=quota_status,
+            quota_used=(snapshot.used if configured and not quarantined else None),
             quota_limit=quota_limit,
+            quota_remaining=(snapshot.remaining if configured and not quarantined else None),
+            quota_data_basis=quota_data_basis,
+            quota_observed_at=(
+                snapshot.observed_at if configured and not quarantined else None
+            ),
+            quota_reset_at=(snapshot.reset_at if configured and not quarantined else None),
             quota_unit=quota_unit if quota_limit is not None else None,
             can_supply_strict_offers=eligible,
             notice=notice,
         )
+
+    def reference_quota_fields(
+        snapshot: QuotaLedgerSnapshot,
+        *,
+        applicable: bool,
+        configured_limit: int | None,
+    ) -> dict[str, object]:
+        if not applicable:
+            return {
+                "quota_status": "not_applicable",
+                "quota_limit": configured_limit,
+                "quota_data_basis": "not_applicable",
+            }
+        if not snapshot.available:
+            return {
+                "quota_status": "unknown",
+                "quota_limit": configured_limit,
+                "quota_data_basis": "unavailable",
+            }
+        basis = {
+            "local_hard_limit": "local_ledger",
+            "provider_snapshot": "provider_reported",
+            "conservative_minimum": "provider_and_local_ledger",
+        }.get(snapshot.data_basis, "unavailable")
+        return {
+            "quota_status": "exhausted" if snapshot.remaining == 0 else "available",
+            "quota_used": snapshot.used,
+            "quota_limit": snapshot.limit,
+            "quota_remaining": snapshot.remaining,
+            "quota_data_basis": basis,
+            "quota_observed_at": snapshot.observed_at,
+            "quota_reset_at": snapshot.reset_at,
+        }
 
     providers = [
         strict_item(
@@ -311,8 +429,9 @@ def _runtime_provider_status(
             name="SerpApi · Google Flights",
             configured=serpapi_configured,
             eligible=True,
-            quota_limit=_serpapi_quota_limit(serpapi_configured),
+            quota_limit=serpapi_limit,
             quota_unit="billing_period_requests",
+            quota_snapshot=serpapi_snapshot,
             notice={
                 "zh": (
                     "严格报价源；本地硬上限按提供商账户结算周期执行，不按自然月重置。"
@@ -330,8 +449,9 @@ def _runtime_provider_status(
             name="SearchAPI.io · Google Flights",
             configured=searchapi_configured,
             eligible=True,
-            quota_limit=_searchapi_quota_limit(),
+            quota_limit=searchapi_limit,
             quota_unit="lifetime_requests",
+            quota_snapshot=searchapi_snapshot,
             notice={
                 "zh": (
                     "严格后备报价源；免费注册额度为账户一次性 100 次请求，不会按月恢复。"
@@ -350,8 +470,9 @@ def _runtime_provider_status(
             configured=ignav_configured,
             eligible=ignav_released,
             quarantined=not ignav_released,
-            quota_limit=_ignav_quota_limit(),
+            quota_limit=ignav_limit,
             quota_unit="lifetime_requests",
+            quota_snapshot=ignav_snapshot,
             notice={
                 "zh": (
                     "已完成显式严格发布与无付费方式确认；该独立已验证身份可参与严格链路，"
@@ -383,8 +504,11 @@ def _runtime_provider_status(
             configured=scrape_do_configured,
             active=scrape_do_configured,
             status="reference_only",
-            quota_status="unknown" if scrape_do_configured else "not_applicable",
-            quota_limit=_scrape_do_quota_limit(),
+            **reference_quota_fields(
+                scrape_do_snapshot,
+                applicable=scrape_do_configured,
+                configured_limit=scrape_do_limit,
+            ),
             quota_unit="monthly_credits",
             quota_cost_per_call=10,
             can_supply_strict_offers=False,
@@ -407,9 +531,11 @@ def _runtime_provider_status(
             configured=airlabs_configured,
             active=airlabs_active,
             status="reference_only",
-            quota_status=airlabs_quota_status,
-            quota_used=airlabs_quota_used,
-            quota_limit=airlabs_quota_limit,
+            **reference_quota_fields(
+                airlabs_snapshot,
+                applicable=airlabs_active,
+                configured_limit=airlabs_quota_limit,
+            ),
             quota_unit=(
                 "billing_period_requests" if airlabs_quota_limit is not None else None
             ),
@@ -447,15 +573,12 @@ def _runtime_provider_status(
             configured=aerodatabox_configured,
             active=aerodatabox_active,
             status="reference_only",
-            quota_status="unknown" if aerodatabox_active else "not_applicable",
-            quota_limit=(
-                _bounded_quota_limit(
-                    ("AERODATABOX_MONTHLY_UNIT_LIMIT",),
-                    default=600,
-                    maximum=600,
-                )
-                if aerodatabox_configured
-                else None
+            **reference_quota_fields(
+                aerodatabox_snapshot,
+                applicable=aerodatabox_active,
+                configured_limit=(
+                    aerodatabox_limit if aerodatabox_configured else None
+                ),
             ),
             quota_unit="provider_managed" if aerodatabox_configured else None,
             can_supply_strict_offers=False,
@@ -480,8 +603,11 @@ def _runtime_provider_status(
             configured=opensky_registered,
             active=opensky_active,
             status="reference_only",
-            quota_status="unknown" if opensky_active else "not_applicable",
-            quota_limit=opensky_limit,
+            **reference_quota_fields(
+                opensky_snapshot,
+                applicable=opensky_active,
+                configured_limit=opensky_limit,
+            ),
             quota_unit="daily_credits",
             can_supply_strict_offers=False,
             notice={
@@ -533,29 +659,91 @@ def _runtime_provider_status(
 
         provider = providers[provider_index]
         fare_status = str(getattr(run, "status", "") or "").strip().lower()
-        coverage_status = str(
-            getattr(run, "coverage_status", "") or ""
-        ).strip().lower()
-        used = getattr(run, "monthly_calls_used", None)
-        limit = getattr(run, "monthly_call_limit", None)
-        exhausted = fare_status in {"budget_exhausted", "rate_limited"} or coverage_status in {
-            "quota_limited",
-            "quota_and_provider_incomplete",
+        rate_limit_scope = str(getattr(run, "quota_limit", "") or "").strip().lower()
+        temporarily_rate_limited = fare_status == "rate_limited" and rate_limit_scope not in {
+            "monthly",
+            "lifetime",
         }
-        succeeded = fare_status in {"confirmed_offers", "no_results"} and not exhausted
-        update: dict[str, object] = {"active": True}
+        raw_used = getattr(run, "monthly_calls_used", None)
+        raw_limit = getattr(run, "monthly_call_limit", None)
+        run_used = (
+            raw_used
+            if isinstance(raw_used, int) and not isinstance(raw_used, bool) and raw_used >= 0
+            else None
+        )
+        run_limit = (
+            raw_limit
+            if isinstance(raw_limit, int)
+            and not isinstance(raw_limit, bool)
+            and raw_limit > 0
+            else None
+        )
+        effective_limit = provider.quota_limit
+        if run_limit is not None:
+            effective_limit = (
+                min(effective_limit, run_limit)
+                if effective_limit is not None
+                else run_limit
+            )
+        effective_used = provider.quota_used
+        if run_used is not None:
+            effective_used = (
+                max(effective_used, run_used)
+                if effective_used is not None
+                else run_used
+            )
+        if effective_used is not None and effective_limit is not None:
+            effective_used = min(effective_used, effective_limit)
+
+        effective_remaining = provider.quota_remaining
+        if effective_limit is not None and effective_used is not None:
+            computed_remaining = max(0, effective_limit - effective_used)
+            effective_remaining = (
+                min(effective_remaining, computed_remaining)
+                if effective_remaining is not None
+                else computed_remaining
+            )
+        explicitly_exhausted = fare_status == "budget_exhausted" or (
+            fare_status == "rate_limited"
+            and rate_limit_scope in {"monthly", "lifetime"}
+        )
+        if explicitly_exhausted and effective_limit is not None:
+            effective_remaining = 0
+        has_measurement = (
+            effective_used is not None
+            and effective_limit is not None
+            and effective_remaining is not None
+            and (provider.quota_observed_at is not None or run_used is not None)
+        )
+        measurably_exhausted = has_measurement and effective_remaining == 0
+        exhausted = has_measurement and (explicitly_exhausted or measurably_exhausted)
+        quota_available = (
+            has_measurement and not exhausted and effective_remaining is not None
+            and effective_remaining > 0
+        )
+        update: dict[str, object] = {
+            "active": True,
+            "temporarily_rate_limited": temporarily_rate_limited,
+        }
         if exhausted:
             update.update(status="quota_exhausted", quota_status="exhausted")
-        elif succeeded and provider.status != "quarantined":
+        elif quota_available and provider.status != "quarantined":
             update.update(status="quota_available", quota_status="available")
-        if isinstance(used, int) and not isinstance(used, bool) and used >= 0:
-            update["quota_used"] = (
-                min(used, limit)
-                if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
-                else used
+        if effective_used is not None:
+            update["quota_used"] = effective_used
+        if effective_limit is not None:
+            update["quota_limit"] = effective_limit
+        if effective_remaining is not None:
+            update["quota_remaining"] = effective_remaining
+        if run_used is not None:
+            update["quota_data_basis"] = (
+                "provider_and_local_ledger"
+                if provider.quota_data_basis
+                in {"provider_reported", "provider_and_local_ledger"}
+                else "local_ledger"
             )
-        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
-            update["quota_limit"] = limit
+            update["quota_observed_at"] = now
+        if run_limit is not None:
             metadata_quota_unit = getattr(run, "quota_unit", None)
             update["quota_unit"] = metadata_quota_unit or (
                 "lifetime_requests"
@@ -572,7 +760,7 @@ def _runtime_provider_status(
         )
 
     return RuntimeProviderStatusResponse(
-        generated_at=datetime.now(UTC),
+        generated_at=now,
         strict_policy=strict_notice,
         providers=providers,
     )

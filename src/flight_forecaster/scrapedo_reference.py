@@ -7,11 +7,11 @@ The adapter therefore retains only aggregate, sanitized coverage facts and has
 no offer-construction API.
 
 Every flight-plugin attempt reserves ten credits in a durable calendar-month
-ledger before it is sent.  An unmetered account-info check must also confirm an
-active account whose provider capacity remains within the documented 1,000
-free credits.  The local ceiling is clamped to the same allowance, so
-configuration can never opt this adapter into paid usage.  Cached snapshots do
-not reserve additional credits.
+ledger before it is sent.  The local ceiling is clamped to the documented
+1,000-credit free allowance, so configuration can never opt this adapter into
+paid usage.  Provider-reported request costs above the reservation are added to
+the ledger, saturating at the local ceiling.  Cached snapshots do not reserve
+additional credits.
 """
 
 from __future__ import annotations
@@ -29,8 +29,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib import parse, request
 
+from flight_forecaster.quota_status import QuotaLedgerSnapshot
+
 SCRAPE_DO_FLIGHTS_URL = "https://api.scrape.do/plugin/google/flights"
-SCRAPE_DO_INFO_URL = "https://api.scrape.do/info"
 SCRAPE_DO_PROVIDER_CODE = "scrape_do_google_flights_reference"
 SCRAPE_DO_PROVIDER_NAME = "Scrape.do Google Flights"
 SCRAPE_DO_CREDITS_PER_CALL = 10
@@ -140,8 +141,8 @@ class ScrapeDoReferenceResult:
             self.exception_type
         ):
             raise ValueError("Scrape.do exception type is invalid")
-        if self.provider_reported_request_cost is not None and not (
-            0 <= self.provider_reported_request_cost <= SCRAPE_DO_CREDITS_PER_CALL
+        if self.provider_reported_request_cost is not None and (
+            self.provider_reported_request_cost < 0
         ):
             raise ValueError("Scrape.do reported request cost is invalid")
         if self.provider_reported_remaining_credits is not None and not (
@@ -227,6 +228,52 @@ class _ScrapeDoLedger:
             )
             connection.commit()
         return _Reservation(allowed=allowed, used_after=used_after, period_key=key)
+
+    def reconcile_reported_cost(
+        self,
+        observed_at: datetime,
+        *,
+        reported_cost: int,
+        hard_limit: int,
+    ) -> int:
+        """Atomically add any cost above the per-attempt reservation.
+
+        Reservations are never refunded when the provider reports a lower
+        cost.  If the extra charge cannot fit below the configured hard limit,
+        the ledger is saturated so no later attempt can underestimate usage.
+        """
+
+        limit = _clamp_credit_limit(hard_limit)
+        if reported_cost <= SCRAPE_DO_CREDITS_PER_CALL:
+            return min(self.snapshot(observed_at), limit)
+        extra = reported_cost - SCRAPE_DO_CREDITS_PER_CALL
+        key = _period_key(observed_at)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT reserved_credits FROM scrapedo_reference_usage "
+                "WHERE period_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                # This method is called only after reserve().  A missing row is
+                # therefore inconsistent, so fail closed at the local ceiling.
+                used_after = limit
+                connection.execute(
+                    "INSERT INTO scrapedo_reference_usage(period_key, reserved_credits) "
+                    "VALUES (?, ?)",
+                    (key, used_after),
+                )
+            else:
+                used = int(row[0])
+                used_after = min(limit, used + extra)
+                connection.execute(
+                    "UPDATE scrapedo_reference_usage SET reserved_credits = ? "
+                    "WHERE period_key = ?",
+                    (used_after, key),
+                )
+            connection.commit()
+        return used_after
 
     def cached(
         self,
@@ -336,6 +383,59 @@ class _ScrapeDoLedger:
         connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
+
+
+def read_scrapedo_quota_snapshot(
+    path: str | Path,
+    *,
+    hard_limit: int,
+    now: datetime,
+) -> QuotaLedgerSnapshot:
+    """Read the current UTC-month credit counter without provider access."""
+
+    ledger_path = Path(path)
+    if not ledger_path.is_file():
+        return QuotaLedgerSnapshot.unavailable()
+    limit = _clamp_credit_limit(hard_limit)
+    if limit < 1:
+        return QuotaLedgerSnapshot.unavailable()
+    observed = _utc(now)
+    period_key = _period_key(observed)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(ledger_path), timeout=1.0)
+        connection.execute("PRAGMA query_only = ON")
+        row = connection.execute(
+            """
+            SELECT reserved_credits FROM scrapedo_reference_usage
+            WHERE period_key = ?
+            """,
+            (period_key,),
+        ).fetchone()
+        raw_used = int(row[0]) if row is not None else 0
+        if raw_used < 0:
+            return QuotaLedgerSnapshot.unavailable()
+        used = min(raw_used, limit)
+        reset_at = (
+            datetime(observed.year + 1, 1, 1, tzinfo=UTC)
+            if observed.month == 12
+            else datetime(observed.year, observed.month + 1, 1, tzinfo=UTC)
+        )
+        return QuotaLedgerSnapshot(
+            available=True,
+            used=used,
+            limit=limit,
+            remaining=max(0, limit - used),
+            period_key=period_key,
+            data_basis="local_hard_limit",
+            observed_at=observed,
+            reset_at=reset_at,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class _UrllibResponse:
@@ -478,14 +578,6 @@ class ScrapeDoGoogleFlightsReferenceProvider:
         reported_cost: int | None = None
         reported_remaining: int | None = None
         for attempt in range(SCRAPE_DO_MAX_ATTEMPTS):
-            account_error = self._free_account_check(
-                observed_at,
-                used=used,
-                credits_reserved=credits_reserved,
-            )
-            if isinstance(account_error, ScrapeDoReferenceResult):
-                return account_error
-
             reservation = self._ledger.reserve(
                 observed_at,
                 hard_limit=self.monthly_credit_limit,
@@ -526,6 +618,12 @@ class ScrapeDoGoogleFlightsReferenceProvider:
                 response,
                 "Scrape.do-Remaining-Credits",
             )
+            if reported_cost is not None:
+                used = self._ledger.reconcile_reported_cost(
+                    observed_at,
+                    reported_cost=reported_cost,
+                    hard_limit=self.monthly_credit_limit,
+                )
             if (
                 reported_cost is not None
                 and reported_cost > SCRAPE_DO_CREDITS_PER_CALL
@@ -540,6 +638,8 @@ class ScrapeDoGoogleFlightsReferenceProvider:
                     credits_reserved=credits_reserved,
                     http_status=http_status or None,
                     exception_type="UnsafeProviderQuotaReport",
+                    provider_reported_request_cost=reported_cost,
+                    provider_reported_remaining_credits=reported_remaining,
                 )
             if http_status == 200:
                 break
@@ -612,93 +712,6 @@ class ScrapeDoGoogleFlightsReferenceProvider:
             expires_at=observed_at + timedelta(seconds=self._cache_ttl_seconds),
         )
         return result
-
-    def _free_account_check(
-        self,
-        observed_at: datetime,
-        *,
-        used: int,
-        credits_reserved: int,
-    ) -> None | ScrapeDoReferenceResult:
-        """Fail closed unless Scrape.do confirms an active free-size account."""
-
-        assert self._api_token is not None
-        try:
-            response = self._client.get(
-                SCRAPE_DO_INFO_URL,
-                params={"token": self._api_token},
-                timeout=SCRAPE_DO_REQUEST_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            return self._empty_result(
-                "provider_error",
-                observed_at,
-                used=used,
-                credits_reserved=credits_reserved,
-                exception_type="AccountTransportError",
-            )
-        http_status = _status_code(response)
-        if http_status != 200:
-            status, exception_type = _error_status(http_status)
-            return self._empty_result(
-                status,
-                observed_at,
-                used=used,
-                credits_reserved=credits_reserved,
-                http_status=http_status,
-                exception_type=f"Account{exception_type}",
-            )
-        try:
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError("invalid account payload")
-            active = payload.get("IsActive")
-            maximum = _nonnegative_int(payload.get("MaxMonthlyRequest"))
-            remaining = _nonnegative_int(payload.get("RemainingMonthlyRequest"))
-            if not isinstance(active, bool) or maximum is None or remaining is None:
-                raise ValueError("invalid account fields")
-        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-            return self._empty_result(
-                "provider_unavailable",
-                observed_at,
-                used=used,
-                credits_reserved=credits_reserved,
-                http_status=200,
-                exception_type="AccountPayloadError",
-            )
-        if not active:
-            return self._empty_result(
-                "authentication_failed",
-                observed_at,
-                used=used,
-                credits_reserved=credits_reserved,
-                http_status=200,
-                exception_type="AccountInactive",
-            )
-        if (
-            maximum <= 0
-            or maximum > SCRAPE_DO_FREE_MONTHLY_CREDITS
-            or remaining > maximum
-        ):
-            return self._empty_result(
-                "provider_unavailable",
-                observed_at,
-                used=used,
-                credits_reserved=credits_reserved,
-                http_status=200,
-                exception_type="FreePlanNotConfirmed",
-            )
-        if remaining < SCRAPE_DO_CREDITS_PER_CALL:
-            return self._empty_result(
-                "quota_exhausted",
-                observed_at,
-                used=used,
-                credits_reserved=credits_reserved,
-                http_status=200,
-                exception_type="ProviderFreeQuotaExhausted",
-                provider_reported_remaining_credits=remaining,
-            )
-        return None
 
     def _empty_result(
         self,

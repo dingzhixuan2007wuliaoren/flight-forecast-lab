@@ -69,9 +69,9 @@ from flight_forecaster.availability import (
     _utc,
     _verified_offer_preference,
 )
+from flight_forecaster.quota_status import QuotaLedgerSnapshot
 
 SEARCHAPI_SEARCH_URL = "https://www.searchapi.io/api/v1/search"
-SEARCHAPI_ACCOUNT_URL = "https://www.searchapi.io/api/v1/me"
 SEARCHAPI_FREE_CALL_LIMIT = 100
 
 IGNAV_ONE_WAY_URL = "https://ignav.com/api/fares/one-way"
@@ -346,6 +346,55 @@ class _FreeCallLedger:
             raise ValueError("unsupported free-call ledger provider")
 
 
+def read_alternate_provider_quota_snapshot(
+    path: str | Path,
+    *,
+    provider_code: str,
+    hard_limit: int,
+    now: datetime,
+) -> QuotaLedgerSnapshot:
+    """Read a lifetime reservation counter without creating or changing its DB."""
+
+    ledger_path = Path(path)
+    if provider_code not in _FREE_LEDGER_PROVIDER_CODES or not ledger_path.is_file():
+        return QuotaLedgerSnapshot.unavailable()
+    try:
+        limit = max(0, int(hard_limit))
+    except (TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    if limit < 1:
+        return QuotaLedgerSnapshot.unavailable()
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(ledger_path), timeout=1.0)
+        connection.execute("PRAGMA query_only = ON")
+        row = connection.execute(
+            """
+            SELECT reserved_calls FROM alternate_provider_free_usage
+            WHERE provider_code = ?
+            """,
+            (provider_code,),
+        ).fetchone()
+        raw_used = int(row[0]) if row is not None else 0
+        if raw_used < 0:
+            return QuotaLedgerSnapshot.unavailable()
+        used = min(raw_used, limit)
+        return QuotaLedgerSnapshot(
+            available=True,
+            used=used,
+            limit=limit,
+            remaining=max(0, limit - used),
+            period_key="lifetime",
+            data_basis="local_hard_limit",
+            observed_at=_utc(now),
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 class _Diagnostics:
     def __init__(
         self,
@@ -409,14 +458,6 @@ class _SearchApiCandidate:
     @property
     def identity(self) -> tuple[Any, ...]:
         return _segment_identity(self.segments)
-
-
-@dataclass(frozen=True, slots=True)
-class _SearchApiAccountQuota:
-    """Sanitized free-account capacity with distinct provider quota scopes."""
-
-    lifetime_remaining: int
-    hourly_remaining: int
 
 
 def _searchapi_failed_cabin_status(statuses: list[SearchStatus]) -> SearchStatus:
@@ -642,6 +683,7 @@ class _AdapterBase:
         deduplicated_verified_count: int = 0,
         coverage_status: str = "not_evaluated",
         quota_limit: str | None = None,
+        retry_quota_limited: bool = False,
     ) -> FlightOfferSearchResult:
         used = self._ledger.snapshot(self.ledger_provider_code)
         return FlightOfferSearchResult(
@@ -669,6 +711,7 @@ class _AdapterBase:
             deduplicated_verified_count=deduplicated_verified_count,
             coverage_status=coverage_status,  # type: ignore[arg-type]
             quota_limit=quota_limit,  # type: ignore[arg-type]
+            retry_quota_limited=retry_quota_limited,
             provider_code=self.provider_code,
             provider_name=self.provider_name,
         )
@@ -899,33 +942,8 @@ class SearchApiFlightOfferProvider(_AdapterBase):
         observed_at: datetime,
     ) -> FlightOfferSearchResult:
         diagnostics = _Diagnostics(self.ledger_provider_code, self._ledger, self._provider_now)
-        try:
-            account_quota = self._free_account_remaining(diagnostics)
-        except _AdapterError as exc:
-            return self._result(
-                exc.status,
-                observed_at,
-                diagnostics=diagnostics.snapshot(),
-                quota_limit=(
-                    "hourly"
-                    if exc.status == "rate_limited"
-                    else "lifetime"
-                    if exc.status == "budget_exhausted"
-                    else None
-                ),
-            )
-        except Exception:
-            return self._result(
-                "provider_unavailable",
-                observed_at,
-                diagnostics=diagnostics.snapshot(),
-            )
-
         local_used = self._ledger.snapshot(self.ledger_provider_code)
-        lifetime_capacity = min(
-            max(0, self.free_call_limit - local_used),
-            account_quota.lifetime_remaining,
-        )
+        lifetime_capacity = max(0, self.free_call_limit - local_used)
         if lifetime_capacity < len(_CABINS):
             return self._result(
                 "budget_exhausted",
@@ -933,22 +951,8 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 diagnostics=diagnostics.snapshot(),
                 quota_limit="lifetime",
             )
-        if account_quota.hourly_remaining < len(_CABINS):
-            return self._result(
-                "rate_limited",
-                observed_at,
-                diagnostics=diagnostics.snapshot(),
-                quota_limit="hourly",
-            )
-        hourly_capacity = account_quota.hourly_remaining
-        capacity = min(lifetime_capacity, hourly_capacity)
-        provider_booking_capacity = max(0, capacity - len(_CABINS))
-        comparison_capacity = min(
-            capacity,
-            len(_CABINS) + MAX_ALTERNATE_BOOKING_WORKERS,
-        )
-        hard_limit = local_used + comparison_capacity
-        limiting_quota = "hourly" if hourly_capacity < lifetime_capacity else "lifetime"
+        provider_booking_capacity = max(0, lifetime_capacity - len(_CABINS))
+        hard_limit = self.free_call_limit
         search_reservation = self._ledger.reserve(
             self.ledger_provider_code,
             len(_CABINS),
@@ -1008,6 +1012,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 if failed_count
                 else "no_results"
             )
+            rate_limited = status == "rate_limited"
             return self._result(
                 status,
                 observed_at,
@@ -1015,7 +1020,13 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 search_calls_used=len(searched_cabins),
                 diagnostics=diagnostics.snapshot(),
                 search_failed_cabin_count=failed_count,
-                coverage_status=("provider_incomplete" if failed_count else "complete"),
+                coverage_status=(
+                    "quota_and_provider_incomplete"
+                    if rate_limited
+                    else ("provider_incomplete" if failed_count else "complete")
+                ),
+                quota_limit=("hourly" if rate_limited else None),
+                retry_quota_limited=rate_limited,
             )
 
         # Verify one bounded batch only.  Candidates outside this batch remain
@@ -1099,7 +1110,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 "provider_specific"
                 if provider_booking_capacity > MAX_ALTERNATE_BOOKING_WORKERS
                 and len(attempted_candidates) >= MAX_ALTERNATE_BOOKING_WORKERS
-                else limiting_quota
+                else "lifetime"
             )
             if quota_skipped
             else None
@@ -1128,82 +1139,12 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 **common,
             )
         if quota_skipped and quota_limit != "provider_specific":
-            status: SearchStatus = (
-                "rate_limited" if limiting_quota == "hourly" else "budget_exhausted"
-            )
+            status = "budget_exhausted"
         elif provider_failures:
             status = "provider_error"
         else:
             status = "no_results"
         return self._result(status, observed_at, **common)
-
-    def _free_account_remaining(self, diagnostics: _Diagnostics) -> _SearchApiAccountQuota:
-        payload, received_at, http_status = self._request_json(
-            "GET",
-            SEARCHAPI_ACCOUNT_URL,
-            stage="account",
-            diagnostics=diagnostics,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self._api_key}",
-                "User-Agent": "flight-forecast-lab/0.2.0 (free-only strict fares)",
-            },
-        )
-        account = payload.get("account")
-        api_usage = payload.get("api_usage")
-        subscription = payload.get("subscription")
-        if not isinstance(account, dict) or not isinstance(api_usage, dict):
-            diagnostics.record(
-                stage="account",
-                http_status=http_status,
-                exception_type="PayloadError",
-                observed_at=received_at,
-            )
-            raise _PayloadError("SearchAPI account quota metadata is incomplete")
-        current = _optional_nonnegative_int(account.get("current_month_usage"))
-        # SearchAPI currently represents an un-subscribed sign-up credit grant as
-        # monthly_allowance=0 with the grant held in remaining_credits.  Zero is
-        # therefore a valid free-account value; the independent local lifetime
-        # ledger below still prevents consuming more than our configured free cap.
-        allowance = _optional_nonnegative_int(account.get("monthly_allowance"))
-        remaining = _optional_nonnegative_int(account.get("remaining_credits"))
-        hour_used = _optional_nonnegative_int(api_usage.get("searches_this_hour"))
-        hour_limit = _optional_positive_int(api_usage.get("hourly_rate_limit"))
-        # A non-empty subscription or an allowance above the documented 100
-        # sign-up requests is treated as paid capacity and is never consumed.
-        paid_subscription = isinstance(subscription, dict) and bool(subscription)
-        if any(
-            value is None
-            for value in (current, allowance, remaining, hour_used, hour_limit)
-        ):
-            diagnostics.record(
-                stage="account",
-                http_status=http_status,
-                exception_type="PayloadError",
-                observed_at=received_at,
-            )
-            raise _PayloadError("SearchAPI account quota metadata is invalid")
-        assert current is not None
-        assert allowance is not None
-        assert remaining is not None
-        assert hour_used is not None
-        assert hour_limit is not None
-        if (
-            allowance > SEARCHAPI_FREE_CALL_LIMIT
-            or current + remaining > SEARCHAPI_FREE_CALL_LIMIT
-            or paid_subscription
-        ):
-            diagnostics.record(
-                stage="account",
-                http_status=http_status,
-                exception_type="PaidCapacityRejected",
-                observed_at=received_at,
-            )
-            raise _BudgetError("SearchAPI paid capacity is disabled")
-        return _SearchApiAccountQuota(
-            lifetime_remaining=remaining,
-            hourly_remaining=max(0, hour_limit - hour_used),
-        )
 
     def _search_cabin(
         self,

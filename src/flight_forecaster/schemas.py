@@ -324,6 +324,15 @@ ProviderRuntimeStatus = Literal[
     "reference_only",
 ]
 ProviderQuotaStatus = Literal["unknown", "available", "exhausted", "not_applicable"]
+ProviderQuotaDataBasis = Literal[
+    "provider_reported",
+    "local_ledger",
+    "provider_and_local_ledger",
+    "configured_limit_only",
+    "unpublished",
+    "not_applicable",
+    "unavailable",
+]
 
 
 class RuntimeProviderStatusItem(BaseModel):
@@ -338,6 +347,11 @@ class RuntimeProviderStatusItem(BaseModel):
     quota_status: ProviderQuotaStatus = "unknown"
     quota_used: int | None = Field(default=None, ge=0)
     quota_limit: int | None = Field(default=None, ge=1)
+    quota_remaining: int | None = Field(default=None, ge=0)
+    quota_data_basis: ProviderQuotaDataBasis | None = None
+    quota_observed_at: datetime | None = None
+    quota_reset_at: datetime | None = None
+    temporarily_rate_limited: bool = Field(default=False, strict=True)
     quota_unit: (
         Literal[
             "hour",
@@ -368,6 +382,70 @@ class RuntimeProviderStatusItem(BaseModel):
         if self.quota_used is not None and self.quota_limit is not None:
             if self.quota_used > self.quota_limit:
                 raise ValueError("provider quota usage cannot exceed its limit")
+        if self.quota_remaining is not None:
+            if self.quota_limit is None or self.quota_remaining > self.quota_limit:
+                raise ValueError("provider quota remaining requires a valid limit")
+            if self.quota_used is not None and (
+                self.quota_used + self.quota_remaining > self.quota_limit
+            ):
+                raise ValueError("provider quota usage plus remaining exceeds its limit")
+        if self.quota_data_basis is None and any(
+            value is not None
+            for value in (
+                self.quota_used,
+                self.quota_remaining,
+                self.quota_observed_at,
+                self.quota_reset_at,
+            )
+        ):
+            raise ValueError("provider quota observations require a data basis")
+        measurable_bases = {
+            "provider_reported",
+            "local_ledger",
+            "provider_and_local_ledger",
+        }
+        non_observation_bases = {"not_applicable", "unpublished", "unavailable"}
+        if self.quota_data_basis in measurable_bases and any(
+            value is None
+            for value in (
+                self.quota_used,
+                self.quota_limit,
+                self.quota_remaining,
+                self.quota_observed_at,
+            )
+        ):
+            raise ValueError("measurable provider quota requires a complete observation")
+        if self.quota_data_basis == "configured_limit_only" and any(
+            value is not None
+            for value in (
+                self.quota_used,
+                self.quota_remaining,
+                self.quota_observed_at,
+                self.quota_reset_at,
+            )
+        ):
+            raise ValueError("configured-limit-only quota cannot report observations")
+        if self.quota_data_basis in non_observation_bases and any(
+            value is not None
+            for value in (
+                self.quota_used,
+                self.quota_remaining,
+                self.quota_observed_at,
+                self.quota_reset_at,
+            )
+        ):
+            raise ValueError("non-observation quota basis cannot report observations")
+        if self.quota_status in {"available", "exhausted"}:
+            if self.quota_data_basis not in measurable_bases:
+                raise ValueError("known provider quota status requires measured data")
+            if self.quota_status == "exhausted" and self.quota_remaining != 0:
+                raise ValueError("exhausted provider quota must have zero remaining")
+            if self.quota_status == "available" and self.quota_remaining == 0:
+                raise ValueError("available provider quota must have positive remaining")
+        if self.quota_observed_at is not None:
+            _require_timezone(self.quota_observed_at)
+        if self.quota_reset_at is not None:
+            _require_timezone(self.quota_reset_at)
         if (
             self.quota_used is not None or self.quota_limit is not None
         ) and self.quota_unit is None:

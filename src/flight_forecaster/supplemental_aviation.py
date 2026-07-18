@@ -22,6 +22,8 @@ from typing import Any
 from urllib import error, parse, request
 from zoneinfo import ZoneInfo
 
+from flight_forecaster.quota_status import QuotaLedgerSnapshot
+
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 OPENSKY_TOKEN_URL = (
     "https://auth.opensky-network.org/auth/realms/opensky-network/"
@@ -481,6 +483,128 @@ class SupplementalUsageLedger:
             """
         )
         return connection
+
+
+def read_opensky_quota_snapshot(
+    path: str | Path,
+    *,
+    hard_limit: int,
+    now: datetime,
+) -> QuotaLedgerSnapshot:
+    """Read today's local OpenSky credit counter without network I/O."""
+
+    ledger_path = Path(path)
+    if not ledger_path.is_file():
+        return QuotaLedgerSnapshot.unavailable()
+    observed = _as_utc(now)
+    try:
+        limit = max(1, int(hard_limit))
+    except (TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    period_key = observed.strftime("%Y-%m-%d")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(ledger_path), timeout=1.0)
+        connection.execute("PRAGMA query_only = ON")
+        row = connection.execute(
+            """
+            SELECT units FROM supplemental_aviation_usage
+            WHERE provider = 'opensky' AND period_key = ?
+            """,
+            (period_key,),
+        ).fetchone()
+        raw_used = int(row[0]) if row is not None else 0
+        if raw_used < 0:
+            return QuotaLedgerSnapshot.unavailable()
+        used = min(raw_used, limit)
+        reset_at = datetime.combine(
+            observed.date() + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
+        return QuotaLedgerSnapshot(
+            available=True,
+            used=used,
+            limit=limit,
+            remaining=max(0, limit - used),
+            period_key=period_key,
+            data_basis="local_hard_limit",
+            observed_at=observed,
+            reset_at=reset_at,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def read_aerodatabox_quota_snapshot(
+    path: str | Path,
+    *,
+    hard_limit: int,
+    now: datetime,
+) -> QuotaLedgerSnapshot:
+    """Read a trusted RapidAPI window or conservative lifetime fallback."""
+
+    ledger_path = Path(path)
+    if not ledger_path.is_file():
+        return QuotaLedgerSnapshot.unavailable()
+    observed = _as_utc(now)
+    try:
+        limit = min(max(1, int(hard_limit)), MAX_AERODATABOX_MONTHLY_UNITS)
+    except (TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(ledger_path), timeout=1.0)
+        connection.execute("PRAGMA query_only = ON")
+        window = connection.execute(
+            """
+            SELECT period_key, hard_limit, remaining, reset_at, evidence, updated_at
+            FROM supplemental_provider_quota_windows
+            WHERE provider = 'aerodatabox'
+            """
+        ).fetchone()
+        if window is not None and str(window[4]) == "trusted_headers":
+            reset_at = _stored_utc_datetime(window[3])
+            if reset_at is not None and observed < reset_at:
+                effective_limit = min(limit, max(1, int(window[1])))
+                remaining = min(effective_limit, max(0, int(window[2])))
+                updated_at = _stored_utc_datetime(window[5])
+                if updated_at is not None:
+                    return QuotaLedgerSnapshot(
+                        available=True,
+                        used=effective_limit - remaining,
+                        limit=effective_limit,
+                        remaining=remaining,
+                        period_key=str(window[0]),
+                        data_basis="conservative_minimum",
+                        observed_at=updated_at,
+                        reset_at=reset_at,
+                    )
+        rows = connection.execute(
+            """
+            SELECT period_key, units FROM supplemental_aviation_usage
+            WHERE provider = 'aerodatabox'
+            """
+        ).fetchall()
+        lifetime_used = sum(max(0, int(row[1])) for row in rows)
+        used = min(lifetime_used, limit)
+        return QuotaLedgerSnapshot(
+            available=True,
+            used=used,
+            limit=limit,
+            remaining=max(0, limit - used),
+            period_key="lifetime",
+            data_basis="local_hard_limit",
+            observed_at=observed,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class _UrllibResponse:

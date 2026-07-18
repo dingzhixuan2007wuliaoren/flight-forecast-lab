@@ -1,13 +1,41 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
-from flight_forecaster.airlabs_quota import AirLabsQuotaLedger
+from flight_forecaster.airlabs_quota import (
+    AirLabsQuotaLedger,
+    read_airlabs_quota_snapshot,
+)
+from flight_forecaster.alternate_fare_providers import (
+    read_alternate_provider_quota_snapshot,
+)
 from flight_forecaster.api import _runtime_provider_status, app
+from flight_forecaster.availability import read_serpapi_quota_snapshot
+from flight_forecaster.scrapedo_reference import read_scrapedo_quota_snapshot
+from flight_forecaster.supplemental_aviation import (
+    read_aerodatabox_quota_snapshot,
+    read_opensky_quota_snapshot,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_provider_status_runtime(monkeypatch, tmp_path) -> None:
+    runtime_dir = tmp_path / "artifacts" / "runtime"
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "artifacts" / "demo"))
+    monkeypatch.setenv("AIRLABS_USAGE_DB", str(runtime_dir / "airlabs-usage.sqlite3"))
+    monkeypatch.setenv(
+        "SCRAPE_DO_USAGE_DB", str(runtime_dir / "scrapedo-reference-usage.sqlite3")
+    )
+    monkeypatch.setenv(
+        "SUPPLEMENTAL_AVIATION_USAGE_DB",
+        str(runtime_dir / "supplemental-aviation-usage.sqlite3"),
+    )
 
 
 def _providers_by_code(payload: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -212,14 +240,32 @@ def test_supplemental_reference_statuses_respect_global_external_context_switch(
     assert opensky.quota_status == "not_applicable"
 
 
-def test_rate_limited_runtime_metadata_is_reported_as_quota_exhausted(
-    monkeypatch,
+def test_hourly_rate_limit_preserves_real_billing_balance(
+    monkeypatch, tmp_path
 ) -> None:
+    now = datetime.now(UTC)
+    runtime_dir = tmp_path / "artifacts" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "artifacts" / "demo"))
+    with sqlite3.connect(runtime_dir / "serpapi-usage.sqlite3") as connection:
+        connection.execute(
+            """
+            CREATE TABLE serpapi_quota_usage (
+                scope TEXT NOT NULL, period_key TEXT NOT NULL, calls INTEGER NOT NULL,
+                PRIMARY KEY(scope, period_key)
+            ) WITHOUT ROWID
+            """
+        )
+        connection.execute(
+            "INSERT INTO serpapi_quota_usage VALUES ('billing_cycle', ?, 170)",
+            (f"renewal:{(now + timedelta(days=30)).date().isoformat()}",),
+        )
     monkeypatch.setenv("SERPAPI_API_KEY", "configured-but-never-returned")
     metadata = SimpleNamespace(
         provider_code="serpapi_google_flights",
         status="rate_limited",
         coverage_status="provider_incomplete",
+        quota_limit="hourly",
         monthly_calls_used=12,
         monthly_call_limit=250,
         quota_unit="billing_period_requests",
@@ -230,10 +276,38 @@ def test_rate_limited_runtime_metadata_is_reported_as_quota_exhausted(
 
     assert (serpapi.active, serpapi.status, serpapi.quota_status) == (
         True,
+        "quota_available",
+        "available",
+    )
+    assert (serpapi.quota_used, serpapi.quota_limit, serpapi.quota_remaining) == (
+        170,
+        250,
+        80,
+    )
+    assert serpapi.temporarily_rate_limited is True
+
+
+def test_billing_period_rate_limit_can_mark_account_quota_exhausted(monkeypatch) -> None:
+    monkeypatch.setenv("SERPAPI_API_KEY", "configured-but-never-returned")
+    metadata = SimpleNamespace(
+        provider_code="serpapi_google_flights",
+        status="rate_limited",
+        coverage_status="provider_incomplete",
+        quota_limit="monthly",
+        monthly_calls_used=12,
+        monthly_call_limit=250,
+        quota_unit="billing_period_requests",
+    )
+
+    providers = {item.code: item for item in _runtime_provider_status(metadata).providers}
+    serpapi = providers["serpapi_google_flights"]
+
+    assert (serpapi.status, serpapi.quota_status, serpapi.quota_remaining) == (
         "quota_exhausted",
         "exhausted",
+        0,
     )
-    assert (serpapi.quota_used, serpapi.quota_limit) == (12, 250)
+    assert serpapi.temporarily_rate_limited is False
 
 
 def test_searchapi_runtime_usage_keeps_lifetime_quota_unit(monkeypatch) -> None:
@@ -397,7 +471,7 @@ def test_dashboard_renders_bilingual_provider_status_and_searchapi_attribution()
         assert fragment in dashboard
 
 
-def test_dashboard_only_shows_grouped_quota_summary_and_links_to_detail() -> None:
+def test_dashboard_only_shows_per_provider_quota_summary_and_links_to_detail() -> None:
     client = TestClient(app)
     dashboard = client.get("/").text
     details = client.get("/details/providers").text
@@ -408,9 +482,12 @@ def test_dashboard_only_shows_grouped_quota_summary_and_links_to_detail() -> Non
         "总剩余查询额度",
         "Total remaining query allowance",
         'provider.active !== true',
-        "hasValue(provider.quota_used) ? asNumber(provider.quota_used) : null",
-        "groups[unit].remaining",
-        "providerQuotaUnknownSources",
+        "hasValue(provider.quota_remaining) ? asNumber(provider.quota_remaining) : null",
+        'measurableBases = ["provider_reported", "local_ledger", "provider_and_local_ledger"]',
+        "measurableBases.indexOf(basis) < 0",
+        "balances.push({",
+        "balance.name",
+        "providerQuotaUnitLabel(balance.unit)",
         "flight-forecast-provider-status-v1",
     ):
         assert fragment in dashboard
@@ -425,19 +502,46 @@ def test_dashboard_only_shows_grouped_quota_summary_and_links_to_detail() -> Non
         "Data-provider status",
         "quota_used",
         "quota_limit",
+        "quota_remaining",
+        "quota_data_basis",
+        "quota_observed_at",
+        "quota_reset_at",
         "quota_cost_per_call",
         "provider.can_supply_strict_offers",
         "quotaState(provider.quota_status)",
+        "provider.temporarily_rate_limited===true",
+        "供应商暂时限流",
+        "Provider temporarily rate-limited",
         "可提供严格报价",
         "Can supply strict fares",
         "额度不适用",
         "Quota not applicable",
+        "供应商返回的额度快照",
+        "Provider-reported quota snapshot",
+        "本地安全账本（不是供应商账户余额）",
+        "Local safety ledger (not the provider account balance)",
+        "仅有已配置的本地硬上限；实际已用与剩余未公布",
+        "Configured local hard ceiling only; actual used and remaining are unpublished",
+        "供应商未向此接口公开可验证的用量",
+        "The provider does not publish verifiable usage to this interface",
+        "额度账本暂时不可读取",
+        "Quota ledger is temporarily unavailable",
+        'if(remaining!==null)quotaCell(quota,t(basis.remaining)',
+        'basisKey==="configured_limit_only"',
+        'if(cached){render(cached);setState("loading",t("cached"),"cached")}load()',
         "if(!present(value))return null",
         "flight-forecast-provider-status-v1",
         'href="/#provider-status-title"',
     ):
         assert fragment in details
     assert "innerHTML" not in details
+    assert "待确认" not in details
+    assert 'unknown:"Pending"' not in details
+    assert 'else{load()}' not in details
+    assert "Math.max(0,limit-used)" not in details
+    assert "Math.round(limit) - Math.max" not in dashboard
+    assert "groups[unit].remaining" not in dashboard
+    assert ".remaining +=" not in dashboard
 
 
 def test_dashboard_bounds_comparison_wait_and_preserves_request_errors() -> None:
@@ -477,6 +581,260 @@ def test_dashboard_distinguishes_quota_limited_candidate_coverage() -> None:
         "this does not prove the remaining candidates are unbookable",
     ):
         assert fragment in dashboard
+
+
+def test_provider_status_reads_exact_local_quota_ledgers(monkeypatch, tmp_path) -> None:
+    now = datetime.now(UTC)
+    runtime_dir = tmp_path / "artifacts" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "artifacts" / "demo"))
+
+    serp_path = runtime_dir / "serpapi-usage.sqlite3"
+    with sqlite3.connect(serp_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE serpapi_quota_usage (
+                scope TEXT NOT NULL, period_key TEXT NOT NULL, calls INTEGER NOT NULL,
+                PRIMARY KEY(scope, period_key)
+            ) WITHOUT ROWID
+            """
+        )
+        renewal = (now + timedelta(days=30)).date().isoformat()
+        expired = (now - timedelta(days=1)).date().isoformat()
+        connection.executemany(
+            "INSERT INTO serpapi_quota_usage VALUES ('billing_cycle', ?, ?)",
+            [(f"renewal:{renewal}", 170), (f"renewal:{expired}", 249)],
+        )
+
+    alternate_path = runtime_dir / "alternate-provider-usage.sqlite3"
+    with sqlite3.connect(alternate_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE alternate_provider_free_usage (
+                provider_code TEXT PRIMARY KEY,
+                reserved_calls INTEGER NOT NULL,
+                sent_calls INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO alternate_provider_free_usage VALUES (?, ?, ?)",
+            [
+                ("searchapi_google_flights", 100, 82),
+                ("ignav_quarantine", 0, 0),
+            ],
+        )
+
+    scrape_path = runtime_dir / "scrapedo-reference-usage.sqlite3"
+    with sqlite3.connect(scrape_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE scrapedo_reference_usage (
+                period_key TEXT PRIMARY KEY, reserved_credits INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO scrapedo_reference_usage VALUES (?, ?)",
+            (now.strftime("%Y-%m"), 40),
+        )
+
+    airlabs_path = runtime_dir / "airlabs-usage.sqlite3"
+    with sqlite3.connect(airlabs_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE airlabs_monthly_usage (
+                period_key TEXT PRIMARY KEY, calls INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE airlabs_account_snapshot (
+                period_key TEXT PRIMARY KEY,
+                limits_by_month INTEGER NOT NULL,
+                limits_total INTEGER NOT NULL,
+                remaining INTEGER NOT NULL,
+                observed_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO airlabs_monthly_usage VALUES (?, ?)",
+            (now.strftime("%Y-%m"), 1),
+        )
+        connection.execute(
+            "INSERT INTO airlabs_account_snapshot VALUES (?, ?, ?, ?, ?)",
+            (now.strftime("%Y-%m"), 1_000, 936, 64, now.isoformat()),
+        )
+
+    supplemental_path = runtime_dir / "supplemental-aviation-usage.sqlite3"
+    with sqlite3.connect(supplemental_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE supplemental_aviation_usage (
+                provider TEXT NOT NULL, period_key TEXT NOT NULL, units INTEGER NOT NULL,
+                PRIMARY KEY(provider, period_key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE supplemental_provider_quota_windows (
+                provider TEXT PRIMARY KEY, period_key TEXT NOT NULL,
+                hard_limit INTEGER NOT NULL, remaining INTEGER NOT NULL,
+                reset_at TEXT, evidence TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO supplemental_aviation_usage VALUES (?, ?, ?)",
+            [
+                ("aerodatabox", "lifetime", 20),
+                ("opensky", now.strftime("%Y-%m-%d"), 5),
+            ],
+        )
+
+    for name in (
+        "SERPAPI_API_KEY",
+        "SEARCHAPI_API_KEY",
+        "IGNAV_API_KEY",
+        "SCRAPE_DO_API_TOKEN",
+        "AIRLABS_API_KEY",
+        "AERODATABOX_API_KEY",
+    ):
+        monkeypatch.setenv(name, f"{name.lower()}-not-returned")
+    monkeypatch.setenv("AIRLABS_MONTHLY_CALL_LIMIT", "900")
+    monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "auto")
+    monkeypatch.setenv("IGNAV_STRICT_RELEASE", "1")
+    monkeypatch.setenv("IGNAV_FREE_ACCOUNT_ATTESTED", "1")
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "1")
+    monkeypatch.setenv("OPENSKY_ENABLED", "1")
+
+    providers = {item.code: item for item in _runtime_provider_status().providers}
+    expected = {
+        "serpapi_google_flights": (170, 250, 80, "provider_and_local_ledger"),
+        "searchapi_google_flights": (100, 100, 0, "local_ledger"),
+        "ignav_verified_fares": (0, 1_000, 1_000, "local_ledger"),
+        "scrape_do_google_flights_reference": (40, 1_000, 960, "local_ledger"),
+        "airlabs_reference": (900, 900, 0, "provider_and_local_ledger"),
+        "aerodatabox_reference": (20, 600, 580, "local_ledger"),
+        "opensky_reference": (5, 400, 395, "local_ledger"),
+    }
+    for code, values in expected.items():
+        provider = providers[code]
+        assert (
+            provider.quota_used,
+            provider.quota_limit,
+            provider.quota_remaining,
+            provider.quota_data_basis,
+        ) == values
+        assert provider.quota_observed_at is not None
+    # SerpApi exposes a renewal date, not an exact timestamp.  Do not invent a
+    # UTC instant that would render as the previous calendar day in some zones.
+    assert providers["serpapi_google_flights"].quota_reset_at is None
+
+
+def test_quota_snapshot_readers_fail_closed_without_creating_files(tmp_path) -> None:
+    now = datetime.now(UTC)
+
+    def readers(path):
+        return (
+            read_serpapi_quota_snapshot(path, hard_limit=250, now=now),
+            read_alternate_provider_quota_snapshot(
+                path,
+                provider_code="searchapi_google_flights",
+                hard_limit=100,
+                now=now,
+            ),
+            read_scrapedo_quota_snapshot(path, hard_limit=1_000, now=now),
+            read_airlabs_quota_snapshot(path, hard_limit=900, now=now),
+            read_aerodatabox_quota_snapshot(path, hard_limit=600, now=now),
+            read_opensky_quota_snapshot(path, hard_limit=400, now=now),
+        )
+
+    missing_path = tmp_path / "missing.sqlite3"
+    assert all(not snapshot.available for snapshot in readers(missing_path))
+    assert not missing_path.exists()
+
+    corrupt_path = tmp_path / "corrupt.sqlite3"
+    corrupt_path.write_text("not a sqlite database", encoding="utf-8")
+    assert all(not snapshot.available for snapshot in readers(corrupt_path))
+
+
+def test_aerodatabox_reader_prefers_trusted_unexpired_provider_window(tmp_path) -> None:
+    now = datetime.now(UTC)
+    observed_at = now - timedelta(minutes=5)
+    reset_at = now + timedelta(days=7)
+    usage_path = tmp_path / "supplemental.sqlite3"
+    with sqlite3.connect(usage_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE supplemental_aviation_usage (
+                provider TEXT NOT NULL, period_key TEXT NOT NULL, units INTEGER NOT NULL,
+                PRIMARY KEY(provider, period_key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE supplemental_provider_quota_windows (
+                provider TEXT PRIMARY KEY, period_key TEXT NOT NULL,
+                hard_limit INTEGER NOT NULL, remaining INTEGER NOT NULL,
+                reset_at TEXT, evidence TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO supplemental_aviation_usage VALUES ('aerodatabox', 'lifetime', 20)"
+        )
+        connection.execute(
+            "INSERT INTO supplemental_provider_quota_windows VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "aerodatabox",
+                "provider-window",
+                500,
+                123,
+                reset_at.isoformat(),
+                "trusted_headers",
+                observed_at.isoformat(),
+            ),
+        )
+
+    snapshot = read_aerodatabox_quota_snapshot(
+        usage_path,
+        hard_limit=600,
+        now=now,
+    )
+
+    assert snapshot.available is True
+    assert (snapshot.used, snapshot.limit, snapshot.remaining) == (377, 500, 123)
+    assert snapshot.data_basis == "conservative_minimum"
+    assert snapshot.observed_at == observed_at
+    assert snapshot.reset_at == reset_at
+
+
+def test_candidate_coverage_limit_does_not_claim_account_quota_exhaustion(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "artifacts" / "demo"))
+    monkeypatch.setenv("SERPAPI_API_KEY", "configured-but-never-returned")
+    metadata = SimpleNamespace(
+        provider_code="serpapi_google_flights",
+        status="confirmed_offers",
+        coverage_status="quota_limited",
+        monthly_calls_used=2,
+        monthly_call_limit=250,
+        quota_unit="billing_period_requests",
+    )
+
+    providers = {item.code: item for item in _runtime_provider_status(metadata).providers}
+    serpapi = providers["serpapi_google_flights"]
+
+    assert (serpapi.status, serpapi.quota_status) == ("quota_available", "available")
+    assert (serpapi.quota_used, serpapi.quota_remaining) == (2, 248)
+    assert serpapi.quota_data_basis == "local_ledger"
+    assert serpapi.quota_observed_at is not None
 
 
 def test_offer_detail_frontend_accepts_only_consistent_strict_provider_mappings() -> None:

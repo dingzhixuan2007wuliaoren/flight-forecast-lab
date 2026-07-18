@@ -32,12 +32,32 @@ free-only hard stops are:
 | AeroDataBox | Dated schedule reference only | Trusted RapidAPI free-plan limit/remaining/reset headers define a provider cycle; without trustworthy reset evidence, one installation-lifetime 600-unit wall applies |
 | AirLabs | Airport-operations and timetable reference only | One atomic cross-process SQLite monthly ledger is shared by every transport; an absent/invalid explicit local limit fails closed, and valid account counters can only tighten the wall |
 
-Configuration, quota, quarantine, and evidence are separate states. `GET /v1/provider-status` never
-returns credentials, request parameters, raw provider errors, booking tokens, or complete outbound
-URLs. Reference-only and quarantined providers cannot populate `offers`, even when configured.
-Ignav therefore remains `ignav_quarantine` in default and `auto` operation until both release
-controls are true; a released result uses the distinct `ignav_verified_fares` provider code rather
-than relabelling quarantined data.
+### 只读提供商状态与额度来源 / Read-only provider status and quota provenance
+
+`GET /v1/provider-status` 只读取本地已有的脱敏快照和账本；访问该端点、主页状态区或 `/details/providers` 都不会发起供应商网络请求，也不消耗额度。它不返回凭据、请求参数、原始错误、购票令牌、Search ID 或完整外部 URL。
+
+`GET /v1/provider-status` reads only existing sanitized local snapshots and ledgers. Loading it, the dashboard summary, or `/details/providers` makes no provider network request and consumes no allowance. It returns no credentials, request parameters, raw errors, booking tokens, Search IDs, or complete outbound URLs.
+
+| `quota_data_basis` | 中文含义 | English meaning |
+| --- | --- | --- |
+| `provider_reported` | 供应商快照：先前正常业务响应或受控同步已取得的脱敏计数，可能滞后 | Provider snapshot: sanitized counters already captured from a normal business response or controlled sync; it may be stale |
+| `local_ledger` | 本地账本：为防止超额而保守预留的调用，不是供应商账户余额 | Local ledger: conservatively reserved calls used to prevent overage, not the provider account balance |
+| `provider_and_local_ledger` | 组合：取供应商快照与本地账本的保守约束，不相加 | Combined: the conservative constraint from provider snapshot and local ledger, never their sum |
+
+缺少可验证计数时，状态必须保持 `unknown`，不得猜测为零或满额。配置、额度、隔离和报价证据是独立状态；仅参考或已隔离来源不能填充 `offers`。
+
+When no verifiable counter exists, status remains `unknown`; it is never guessed as zero or full. Configuration, quota, quarantine, and fare evidence remain separate states. Reference-only and quarantined providers cannot populate `offers`.
+
+Short-window throttling remains separate from account allowance. A run whose `quota_limit` is `hourly`, `provider_specific`, or otherwise narrower than the account window sets `temporarily_rate_limited=true` while preserving the measured account-window balance. Only `monthly` or `lifetime` exhaustion evidence can zero the corresponding account window.
+
+| Provider | 快照更新策略 / Snapshot refresh policy |
+| --- | --- |
+| SerpApi | [Account API](https://serpapi.com/account-api) 官方明确免费且不计入月度额度，可由独立受控后端流程刷新；当前状态页不调用 / officially free and excluded from monthly quota; a separate controlled backend workflow may refresh it, but the status views do not call it |
+| [SearchAPI.io](https://www.searchapi.io/docs/account-api) / [Scrape.do](https://scrape.do/documentation/api-response/usage-stats/) | 账户用量端点已公开，但官方未说明查询是否免额度；不自动查询 / account usage endpoints are documented, but their allowance cost is not; they are not queried automatically |
+| [AeroDataBox/RapidAPI](https://docs.rapidapi.com/docs/response-headers) / [OpenSky](https://openskynetwork.github.io/opensky-api/rest.html) | 只在正常业务响应中采集已文档化的限额响应头，不发额外探测 / documented rate-limit headers are captured only from normal business responses; no quota-only probe is sent |
+| [AirLabs](https://airlabs.co/docs/) | 使用本地账本及先前有效响应中已有的脱敏计数；状态读取不联网 / uses the local ledger and sanitized counters already present in prior valid responses; status reads are offline |
+
+Ignav remains `ignav_quarantine` in default and `auto` operation until both release controls are true; a released result uses the distinct `ignav_verified_fares` provider code rather than relabelling quarantined data.
 
 SerpApi Free currently includes 250 successful searches per
 provider billing period plus 50 requests per hour; the period boundary follows the account's
@@ -70,10 +90,11 @@ for each source. Excess candidates are reported as partial, quota-limited covera
 flights. Results are bounded by each source's cap, SerpApi coverage, provider
 responses, and the configured free quota; they are not a complete global list of airlines or flights.
 SearchAPI's local wall is the one-time 100-request signup allocation for the installation/account;
-it is never described or reset as a monthly allowance. Its free account endpoint can represent this
-as `monthly_allowance=0` with the unused grant in `remaining_credits`; that zero is accepted only
-when the subscription is absent and all returned counters remain within the 100-request free ceiling.
-The independent SQLite lifetime ledger is still authoritative. `auto` invokes every configured and released
+it is never described or reset as a monthly allowance. Its account endpoint documents usage and
+remaining-credit fields, but the official documentation does not state that checking it is free.
+The runtime therefore does not query it automatically; the independent SQLite lifetime ledger
+remains the conservative source until an already-captured sanitized provider snapshot is available.
+`auto` invokes every configured and released
 strict source concurrently, even after another source confirms offers. SearchAPI's four cabin searches
 run together and at most six booking-option checks are attempted per comparison. Only that bounded
 batch is reserved, so an interrupted process cannot pre-allocate the entire remaining account balance.
@@ -90,7 +111,8 @@ references, not to make strict offers. When a key is present, `AIRLABS_MONTHLY_C
 valid positive value or AirLabs fails closed before network I/O. Context and timetable calls share
 one atomic cross-process SQLite ledger and reserve one call before every transport. Valid response
 `request.key.limits_by_month` / `limits_total` counters are persisted without account identifiers
-and may only reduce the later local allowance; they never expand it. Missing credentials or exhausted quota are supported modes:
+and may only reduce the later local allowance; they never expand it. Provider-status reads only
+these already-persisted counters and never calls AirLabs. Missing credentials or exhausted quota are supported modes:
 context signals may still use labelled model/proxy fallbacks, while strict flight comparison
 returns a structured empty result instead of inventing flights.
 
@@ -102,27 +124,29 @@ detail page. The adapter discards booking tokens, seller URLs, individual itiner
 error bodies. Its response contains only bounded candidate counts, optional aggregate price facts,
 and sanitized HTTP/exception metadata.
 
-Every uncached Google Flights plugin attempt reserves 10 credits in a durable local ledger. Before
-that reservation, `GET https://api.scrape.do/info` must confirm `IsActive=true`,
-`MaxMonthlyRequest<=1000`, and `RemainingMonthlyRequest>=10`; this prevents a paid-capacity account
-or an exhausted free account from being used. The adapter also parses the provider's
-`Scrape.do-Request-Cost` and `Scrape.do-Remaining-Credits` response headers, while never exposing
-the token. A transient transport, 408/425/429, or 5xx failure may be retried exactly once, with a
-fresh account check and a second 10-credit reservation. Cache hits consume no credits.
+Every uncached Google Flights plugin attempt reserves 10 credits in a durable local ledger.
+Scrape.do documents an `/info` usage endpoint but does not state that checking it is free, so the
+runtime does not call it automatically. Instead, it records sanitized `Scrape.do-Request-Cost` and
+`Scrape.do-Remaining-Credits` headers only when an ordinary reference request already returns them.
+A transient transport, 408/425/429, or 5xx failure may be retried exactly once with a second local
+reservation; no account-status probe is added. Cache hits consume no credits.
 
 ### OpenSky and AeroDataBox reference boundaries
 
 OpenSky is a current trajectory-density reference, not fare, inventory, delay, or timetable proof.
 Anonymous mode works without credentials and is locally bounded to 400 daily API credits; any
 OAuth failure falls back to the anonymous ceiling rather than silently retaining a larger limit.
+The three documented OpenSky quota buckets remain separate. `X-Rate-Limit-Remaining` and exhausted
+retry headers are captured only from the normal endpoint response that consumed the applicable
+credit; the application never sends a data call solely to discover quota.
 
 AeroDataBox returns dated timetable references only. A route/date lookup pre-reserves the complete
 bounded request-unit cost before either provider transport. The ledger accepts a new quota period
 only from trustworthy RapidAPI free-plan limit, remaining, and reset headers; ambiguous generic
 rate-limit headers and paid-capacity limits are ignored. Until such a trusted reset is persisted,
 all calls share a conservative 600-unit installation-lifetime wall, which does not reset at a
-calendar-month boundary. After a trusted provider reset passes, exactly one pre-reserved probe may
-establish the next authenticated free-plan period. AeroDataBox data never enters `offers`.
+calendar-month boundary. A new period can be established only from headers on an already-needed,
+pre-reserved business request; no quota-only probe is issued. AeroDataBox data never enters `offers`.
 
 Within two hours of departure, the service uses fresh Open-Meteo current model conditions and
 can blend NOAA METAR airport observations with TAF. From two to 30 hours it blends the

@@ -24,6 +24,8 @@ from time import monotonic, sleep
 from typing import Any, Literal
 from urllib import error, parse, request
 
+from flight_forecaster.quota_status import QuotaLedgerSnapshot
+
 Cabin = Literal["economy", "premium_economy", "business", "first"]
 BookingUrlKind = Literal["direct_get", "google_flights_itinerary"]
 SearchStatus = Literal[
@@ -812,6 +814,60 @@ class _UsageLedger:
             """,
             (scope, period_key, calls),
         )
+
+
+def read_serpapi_quota_snapshot(
+    path: str | Path,
+    *,
+    hard_limit: int,
+    now: datetime,
+) -> QuotaLedgerSnapshot:
+    """Read the nearest non-expired SerpApi renewal ledger without network I/O."""
+
+    ledger_path = Path(path)
+    if not ledger_path.is_file():
+        return QuotaLedgerSnapshot.unavailable()
+    observed = _utc(now)
+    limit = min(max(int(hard_limit), 1), SERPAPI_MAX_MONTHLY_LIMIT)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(ledger_path), timeout=1.0)
+        connection.execute("PRAGMA query_only = ON")
+        rows = connection.execute(
+            """
+            SELECT period_key, calls FROM serpapi_quota_usage
+            WHERE scope = 'billing_cycle' AND period_key LIKE 'renewal:____-__-__'
+            """
+        ).fetchall()
+        candidates: list[tuple[date, int, str]] = []
+        for raw_key, raw_calls in rows:
+            key = str(raw_key)
+            try:
+                renewal = date.fromisoformat(key.removeprefix("renewal:"))
+                used = int(raw_calls)
+            except (TypeError, ValueError):
+                continue
+            days = (renewal - observed.date()).days
+            if 0 <= days <= 62 and used >= 0:
+                candidates.append((renewal, used, key))
+        if not candidates:
+            return QuotaLedgerSnapshot.unavailable()
+        renewal, raw_used, period_key = min(candidates, key=lambda item: item[0])
+        used = min(raw_used, limit)
+        return QuotaLedgerSnapshot(
+            available=True,
+            used=used,
+            limit=limit,
+            remaining=max(0, limit - used),
+            period_key=period_key,
+            data_basis="conservative_minimum",
+            observed_at=observed,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class _DiagnosticCollector:

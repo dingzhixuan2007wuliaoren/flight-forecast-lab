@@ -19,7 +19,6 @@ from flight_forecaster.scrapedo_reference import (
     SCRAPE_DO_CREDITS_PER_CALL,
     SCRAPE_DO_FLIGHTS_URL,
     SCRAPE_DO_FREE_MONTHLY_CREDITS,
-    SCRAPE_DO_INFO_URL,
     ScrapeDoGoogleFlightsReferenceProvider,
     ScrapeDoReferenceResult,
 )
@@ -65,22 +64,6 @@ class _PlannedClient:
         return planned
 
 
-def _account(
-    *,
-    active: bool = True,
-    maximum: int = SCRAPE_DO_FREE_MONTHLY_CREDITS,
-    remaining: int = SCRAPE_DO_FREE_MONTHLY_CREDITS,
-) -> _Response:
-    return _Response(
-        200,
-        {
-            "IsActive": active,
-            "MaxMonthlyRequest": maximum,
-            "RemainingMonthlyRequest": remaining,
-        },
-    )
-
-
 def _flight_payload(selected_date: date) -> dict[str, Any]:
     return {
         "search_parameters": {
@@ -120,13 +103,18 @@ def _flight_payload(selected_date: date) -> dict[str, Any]:
     }
 
 
-def _flight_response(selected_date: date) -> _Response:
+def _flight_response(
+    selected_date: date,
+    *,
+    request_cost: int = SCRAPE_DO_CREDITS_PER_CALL,
+    remaining_credits: int = 990,
+) -> _Response:
     return _Response(
         200,
         _flight_payload(selected_date),
         headers={
-            "sCrApE.Do-ReQuEsT-CoSt": "10",
-            "Scrape.do-Remaining-Credits": "990",
+            "sCrApE.Do-ReQuEsT-CoSt": str(request_cost),
+            "Scrape.do-Remaining-Credits": str(remaining_credits),
         },
     )
 
@@ -151,7 +139,7 @@ def test_one_economy_reference_call_accounts_ten_credits_and_drops_booking_data(
 ) -> None:
     selected_date = date(2026, 8, 20)
     observed_at = datetime(2026, 7, 16, 12, tzinfo=UTC)
-    client = _PlannedClient([_account(), _flight_response(selected_date)])
+    client = _PlannedClient([_flight_response(selected_date)])
     provider = _provider(tmp_path, client)
 
     result = provider.snapshot(
@@ -169,11 +157,8 @@ def test_one_economy_reference_call_accounts_ten_credits_and_drops_booking_data(
     assert result.monthly_credits_used == SCRAPE_DO_CREDITS_PER_CALL
     assert result.provider_reported_request_cost == SCRAPE_DO_CREDITS_PER_CALL
     assert result.provider_reported_remaining_credits == 990
-    assert [url for url, _params in client.calls] == [
-        SCRAPE_DO_INFO_URL,
-        SCRAPE_DO_FLIGHTS_URL,
-    ]
-    flight_params = client.calls[1][1]
+    assert [url for url, _params in client.calls] == [SCRAPE_DO_FLIGHTS_URL]
+    flight_params = client.calls[0][1]
     assert flight_params["type"] == 2
     assert flight_params["travel_class"] == 1
     serialized = json.dumps(result.__dict__ if hasattr(result, "__dict__") else str(result))
@@ -182,12 +167,12 @@ def test_one_economy_reference_call_accounts_ten_credits_and_drops_booking_data(
     assert "seller.example" not in serialized
 
 
-def test_snapshot_cache_uses_no_account_or_flight_call_and_no_new_credits(
+def test_snapshot_cache_uses_no_http_call_and_no_new_credits(
     tmp_path: Path,
 ) -> None:
     selected_date = date(2026, 8, 20)
     first_at = datetime(2026, 7, 16, 12, tzinfo=UTC)
-    client = _PlannedClient([_account(), _flight_response(selected_date)])
+    client = _PlannedClient([_flight_response(selected_date)])
     provider = _provider(tmp_path, client)
 
     first = provider.snapshot("YYZ", "LHR", selected_date, fetched_at=first_at)
@@ -197,7 +182,7 @@ def test_snapshot_cache_uses_no_account_or_flight_call_and_no_new_credits(
     assert cached.cache_hit is True
     assert cached.credits_reserved == 0
     assert cached.monthly_credits_used == SCRAPE_DO_CREDITS_PER_CALL
-    assert len(client.calls) == 2
+    assert [url for url, _params in client.calls] == [SCRAPE_DO_FLIGHTS_URL]
 
 
 def test_local_free_thousand_credit_hard_stop_prevents_any_http_call(
@@ -225,62 +210,56 @@ def test_local_free_thousand_credit_hard_stop_prevents_any_http_call(
     assert client.calls == []
 
 
-@pytest.mark.parametrize(
-    ("maximum", "remaining", "expected_exception"),
-    [
-        (1_001, 1_001, "FreePlanNotConfirmed"),
-        (1_000, 9, "ProviderFreeQuotaExhausted"),
-    ],
-)
-def test_provider_info_hard_wall_rejects_paid_capacity_or_insufficient_free_credit(
+def test_reported_cost_above_reservation_is_added_and_saturates_local_limit(
     tmp_path: Path,
-    maximum: int,
-    remaining: int,
-    expected_exception: str,
 ) -> None:
-    client = _PlannedClient([_account(maximum=maximum, remaining=remaining)])
-    provider = _provider(tmp_path, client)
+    selected_date = date(2026, 8, 20)
+    observed_at = datetime(2026, 7, 16, 12, tzinfo=UTC)
+    client = _PlannedClient(
+        [_flight_response(selected_date, request_cost=50, remaining_credits=950)]
+    )
+    provider = _provider(tmp_path, client, limit=30)
 
     result = provider.snapshot(
         "YYZ",
         "LHR",
-        date(2026, 8, 20),
-        fetched_at=datetime(2026, 7, 16, 12, tzinfo=UTC),
+        selected_date,
+        fetched_at=observed_at,
     )
 
-    assert result.status in {"quota_exhausted", "provider_unavailable"}
-    assert result.exception_type == expected_exception
-    assert result.credits_reserved == 0
-    assert result.monthly_credits_used == 0
-    assert [url for url, _params in client.calls] == [SCRAPE_DO_INFO_URL]
+    assert result.status == "provider_unavailable"
+    assert result.credits_reserved == SCRAPE_DO_CREDITS_PER_CALL
+    assert result.monthly_credits_used == 30
+    assert result.exception_type == "UnsafeProviderQuotaReport"
+    assert result.provider_reported_request_cost == 50
+    assert result.provider_reported_remaining_credits == 950
+    assert provider.credits_used(observed_at) == 30
+    assert [url for url, _params in client.calls] == [SCRAPE_DO_FLIGHTS_URL]
 
-
-def test_provider_info_hard_wall_rejects_inactive_account(tmp_path: Path) -> None:
-    client = _PlannedClient([_account(active=False)])
-    provider = _provider(tmp_path, client)
-
-    result = provider.snapshot(
+    blocked = provider.snapshot(
         "YYZ",
         "LHR",
-        date(2026, 8, 20),
-        fetched_at=datetime(2026, 7, 16, 12, tzinfo=UTC),
+        selected_date.replace(day=21),
+        fetched_at=observed_at,
     )
 
-    assert result.status == "authentication_failed"
-    assert result.exception_type == "AccountInactive"
-    assert result.credits_reserved == 0
-    assert [url for url, _params in client.calls] == [SCRAPE_DO_INFO_URL]
+    assert blocked.status == "quota_exhausted"
+    assert blocked.exception_type == "LocalFreeQuotaExhausted"
+    assert blocked.monthly_credits_used == 30
+    assert [url for url, _params in client.calls] == [SCRAPE_DO_FLIGHTS_URL]
 
 
-def test_transient_flight_error_retries_once_with_a_second_quota_check(
+def test_retry_reserves_each_plugin_attempt(
     tmp_path: Path,
 ) -> None:
     selected_date = date(2026, 8, 20)
     client = _PlannedClient(
         [
-            _account(),
-            _Response(503, {"error": "secret backend detail"}),
-            _account(remaining=990),
+            _Response(
+                503,
+                {"error": "secret backend detail"},
+                headers={"Scrape.do-Request-Cost": "10"},
+            ),
             _flight_response(selected_date),
         ]
     )
@@ -296,8 +275,10 @@ def test_transient_flight_error_retries_once_with_a_second_quota_check(
     assert result.status == "available"
     assert result.credits_reserved == 20
     assert result.monthly_credits_used == 20
-    assert [url for url, _params in client.calls].count(SCRAPE_DO_INFO_URL) == 2
-    assert [url for url, _params in client.calls].count(SCRAPE_DO_FLIGHTS_URL) == 2
+    assert [url for url, _params in client.calls] == [
+        SCRAPE_DO_FLIGHTS_URL,
+        SCRAPE_DO_FLIGHTS_URL,
+    ]
 
 
 def test_two_transport_failures_are_sanitized_and_never_retry_a_third_time(
@@ -306,9 +287,7 @@ def test_two_transport_failures_are_sanitized_and_never_retry_a_third_time(
     secret = "token=should-not-escape"
     client = _PlannedClient(
         [
-            _account(),
             RuntimeError(secret),
-            _account(remaining=990),
             RuntimeError(secret),
         ]
     )
@@ -326,7 +305,10 @@ def test_two_transport_failures_are_sanitized_and_never_retry_a_third_time(
     assert result.credits_reserved == 20
     assert result.http_status is None
     assert secret not in repr(result)
-    assert len(client.calls) == 4
+    assert [url for url, _params in client.calls] == [
+        SCRAPE_DO_FLIGHTS_URL,
+        SCRAPE_DO_FLIGHTS_URL,
+    ]
 
 
 class _StaticScheduleProvider:

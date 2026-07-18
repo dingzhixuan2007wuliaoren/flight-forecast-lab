@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from flight_forecaster.quota_status import QuotaLedgerSnapshot
+
 MAX_AIRLABS_MONTHLY_CALLS = 1_000
 AIRLABS_USAGE_DB_ENV = "AIRLABS_USAGE_DB"
 AIRLABS_MONTHLY_CALL_LIMIT_ENV = "AIRLABS_MONTHLY_CALL_LIMIT"
@@ -291,6 +293,80 @@ class AirLabsQuotaLedger:
             """
         )
         return connection
+
+
+def read_airlabs_quota_snapshot(
+    path: str | Path,
+    *,
+    hard_limit: int,
+    now: datetime,
+) -> QuotaLedgerSnapshot:
+    """Read conservative local/provider AirLabs counters without network I/O."""
+
+    ledger_path = Path(path)
+    limit = configured_airlabs_monthly_limit(hard_limit)
+    if limit is None or not ledger_path.is_file():
+        return QuotaLedgerSnapshot.unavailable()
+    observed = _as_utc(now)
+    period_key = observed.strftime("%Y-%m")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(ledger_path), timeout=1.0)
+        connection.execute("PRAGMA query_only = ON")
+        local_row = connection.execute(
+            "SELECT calls FROM airlabs_monthly_usage WHERE period_key = ?",
+            (period_key,),
+        ).fetchone()
+        local_used = max(0, int(local_row[0])) if local_row is not None else 0
+        account_row = connection.execute(
+            """
+            SELECT limits_by_month, limits_total, remaining, observed_at
+            FROM airlabs_account_snapshot WHERE period_key = ?
+            """,
+            (period_key,),
+        ).fetchone()
+        if account_row is None:
+            used = min(local_used, limit)
+            return QuotaLedgerSnapshot(
+                available=True,
+                used=used,
+                limit=limit,
+                remaining=max(0, limit - used),
+                period_key=period_key,
+                data_basis="local_hard_limit",
+                observed_at=observed,
+            )
+        provider_limit = max(0, int(account_row[0]))
+        provider_used = max(0, int(account_row[1]))
+        provider_remaining = max(0, int(account_row[2]))
+        provider_observed_at = _as_utc(datetime.fromisoformat(str(account_row[3])))
+        effective_limit = min(limit, provider_limit, MAX_AIRLABS_MONTHLY_CALLS)
+        if effective_limit < 1:
+            return QuotaLedgerSnapshot(
+                available=True,
+                used=limit,
+                limit=limit,
+                remaining=0,
+                period_key=period_key,
+                data_basis="conservative_minimum",
+                observed_at=provider_observed_at,
+            )
+        used = min(max(local_used, provider_used), effective_limit)
+        remaining = min(max(0, effective_limit - used), provider_remaining)
+        return QuotaLedgerSnapshot(
+            available=True,
+            used=used,
+            limit=effective_limit,
+            remaining=remaining,
+            period_key=period_key,
+            data_basis="conservative_minimum",
+            observed_at=provider_observed_at,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class AirLabsQuotaGate:

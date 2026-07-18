@@ -89,6 +89,14 @@ source .venv/bin/activate
 
 Every external call reserves free allowance before network I/O. The provider stops at the local hard ceiling—there is no automatic purchase or overage, and reference data is never promoted into a bookable flight. `GET /v1/provider-status` and the dashboard expose only configuration booleans, roles, sanitized quota state, and bilingual notices; they never expose credentials, raw provider errors, or complete outbound URLs.
 
+`/v1/provider-status` 是只读的本地脱敏账本：访问端点、刷新主页或刷新提供商二级页都不会请求外部提供商，因此不消耗其查询额度。每个额度数字都必须标明 `quota_data_basis`：`provider_reported` 是先前业务响应或受控同步已取得的供应商脱敏快照；`local_ledger` 是本地保守预留账本，不是供应商账户余额；`provider_and_local_ledger` 是两者的保守组合，不是相加。没有可验证数据时保持“未知”，不猜测为零或满额。
+
+`/v1/provider-status` is a read-only sanitized local ledger. Loading the endpoint or refreshing either status view makes no external-provider request and consumes no provider allowance. Every quota number carries a `quota_data_basis`: `provider_reported` is a sanitized snapshot already captured from an earlier business response or controlled sync; `local_ledger` is a conservative local reservation ledger, not the provider account balance; and `provider_and_local_ledger` is a conservative combination, never a sum. Unverifiable usage remains unknown rather than being guessed as zero or full.
+
+小时级或供应商特定的临时限流以 `temporarily_rate_limited=true` 单独显示；它不会把仍有余额的结算周期或终身额度改写成零。只有与该额度窗口一致的耗尽证据，才会显示为额度耗尽。
+
+Hourly or provider-specific throttling is exposed separately as `temporarily_rate_limited=true`; it never rewrites a still-positive billing-period or lifetime balance to zero. A provider is shown as quota-exhausted only when the evidence applies to that same quota window.
+
 | 来源 / Source | 严格角色 / Strict role | 免费硬上限语义 / Free hard-stop semantics |
 | --- | --- | --- |
 | SerpApi · Google Flights | 首个配置顺序的可聚合严格源 / first configured aggregating strict source | 每个 provider 结算周期最多 250 次本地预留请求；不是自然月 / up to 250 locally reserved requests per provider billing period, not calendar month |
@@ -98,6 +106,10 @@ Every external call reserves free allowance before network I/O. The provider sto
 | OpenSky Network | 当前航迹密度参考 / current trajectory-density reference | 无凭据时匿名模式默认启用，每日 400 API 点数；不能证明票价或库存 / anonymous access is active without credentials at 400 API credits per day; no fare or inventory proof |
 | AeroDataBox | 日期级时刻参考 / dated schedule reference | 优先采用可信 RapidAPI 免费计划账期头；没有可信重置信号时使用安装生命周期 600 单位硬墙，绝不按自然月自行重置 / trusted RapidAPI free-plan reset headers define a cycle; otherwise a 600-unit installation-lifetime wall applies |
 | AirLabs | 机场运行与时刻参考 / operations and timetable reference | 所有进程和调用点共用 SQLite 月度账本；缺少明确本地上限时拒绝调用，响应中的账户月上限/已用量只能进一步收紧硬墙 / one cross-process SQLite ledger; missing local limit fails closed and provider counters only tighten the wall |
+
+额度快照的更新策略也是免费优先：[SerpApi Account API](https://serpapi.com/account-api) 官方明确说明免费且不计入月度额度，可由独立、受控的后端流程刷新，但当前状态页不会调用它。SearchAPI.io 的账户端点与 Scrape.do 的 `/info` 虽公开了用量字段，但官方未说明查询免额度，因此系统不自动调用。AeroDataBox/RapidAPI 和 OpenSky 只在正常业务请求的响应头中采集余额信号，不发出额外探测请求。AirLabs 只读本地账本和先前有效响应中已有的脱敏计数。
+
+Quota snapshots follow the same free-first policy. The official [SerpApi Account API](https://serpapi.com/account-api) is free and excluded from monthly quota, so a separate controlled backend workflow may refresh it, but the current status views do not call it. SearchAPI.io's account endpoint and Scrape.do's `/info` publish usage fields without documenting whether those checks consume allowance, so they are not queried automatically. AeroDataBox/RapidAPI and OpenSky quota headers are captured only from normal business responses—never from an extra probe. AirLabs uses its local ledger and sanitized counters already present in prior valid responses.
 
 主比较会查询每个已配置且获准参与的严格报价源，并使用每个候选返回的二次验证令牌/标识查询购票选项。只有二次响应中的已选航段与原候选完全一致，且存在带 HTTPS
 购票请求、销售方、匹配航班号、完整航段、真实舱位和正数 USD 价格的结果才会进入 `offers`。
@@ -291,9 +303,9 @@ Tax inclusion is unknown.
 
 The detail pages use the same `中文 / English` switch as the dashboard. Weather refreshes every 10 minutes and news every 15 minutes; both also provide a manual refresh button. Initial offer-detail load reuses the five-minute strict cache; only its refresh button forces a new four-cabin search and candidate verification, still bounded by free quota and provider responses. A provider result can itself be cached for up to about one hour, with cache status and age shown separately from response generation time. Offer detail explicitly reports when `weather_feature_status=ignored` and the on-time prediction used the weather-free model.
 
-主页只显示当前启用来源的剩余额度摘要，并严格按额度单位分组；不同结算周期、账户终身额度和 API 点数不会被伪装成一个可直接相加的数字，未知用量也不会被猜测为满额或零。`/details/providers` 二级页面显示完整的脱敏逐来源状态、额度周期和严格报价边界；它只读取 `/v1/provider-status` 与同一浏览器会话中的最近快照，不会调用外部供应商或消耗查询额度。
+主页只显示当前启用来源的逐提供商剩余额度摘要；即使两个来源使用同名额度单位，也不会跨账户或跨重置周期相加。不同结算周期、账户终身额度和 API 点数不会被伪装成一个总数，未知用量也不会被猜测为满额或零。`/details/providers` 二级页面显示完整的脱敏逐来源状态、额度周期和严格报价边界；它只读取 `/v1/provider-status` 与同一浏览器会话中的最近快照，不会调用外部供应商或消耗查询额度。
 
-The dashboard shows only a remaining-allowance summary for active sources, grouped by quota unit. Billing-period requests, lifetime allowances, and API credits are never presented as one directly additive number, and unknown usage is never guessed as full or zero. The `/details/providers` second-level page shows the full sanitized per-source status, quota window, and strict-fare boundary. It reads only `/v1/provider-status` and the latest same-session snapshot, so it makes no external provider call and consumes no provider allowance.
+The dashboard shows only a per-provider remaining-allowance summary for active sources. Even providers with the same named unit are not added across accounts or reset windows. Billing-period requests, lifetime allowances, and API credits are never presented as one total, and unknown usage is never guessed as full or zero. The `/details/providers` second-level page shows the full sanitized per-source status, quota window, and strict-fare boundary. It reads only `/v1/provider-status` and the latest same-session snapshot, so it makes no external provider call and consumes no provider allowance.
 
 ## 新闻如何进入预测 / How news affects predictions
 
