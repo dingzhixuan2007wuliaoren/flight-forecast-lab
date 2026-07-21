@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import os
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 
 from flight_forecaster.airlabs_quota import (
     airlabs_usage_path,
@@ -53,6 +56,41 @@ app = FastAPI(
     ),
 )
 app.include_router(destination_router)
+
+
+@app.middleware("http")
+async def require_optional_site_access(request: Request, call_next):
+    """Protect public deployments without changing the local-development flow."""
+
+    expected_password = os.getenv("SITE_ACCESS_PASSWORD", "")
+    if not expected_password or request.url.path in {"/health", "/ready"}:
+        return await call_next(request)
+
+    expected_username = os.getenv("SITE_ACCESS_USERNAME", "flight").strip() or "flight"
+    authorization = request.headers.get("authorization", "")
+    try:
+        scheme, encoded = authorization.split(" ", 1)
+        if scheme.lower() != "basic" or len(encoded) > 4096:
+            raise ValueError("unsupported authorization header")
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        username, supplied_password = decoded.split(":", 1)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        username = ""
+        supplied_password = ""
+
+    if not (
+        hmac.compare_digest(username, expected_username)
+        and hmac.compare_digest(supplied_password, expected_password)
+    ):
+        return Response(
+            content="Authentication required",
+            status_code=401,
+            media_type="text/plain",
+            headers={
+                "WWW-Authenticate": 'Basic realm="Flight Forecast Lab", charset="UTF-8"'
+            },
+        )
+    return await call_next(request)
 
 
 def model_dir() -> Path:
@@ -819,6 +857,19 @@ def health() -> dict[str, str | bool]:
             service.flight_offer_provider.environment if service is not None else "disabled"
         ),
     }
+
+
+@app.get("/ready")
+def readiness() -> dict[str, str | bool]:
+    """Fail the deployment health check unless the committed model can load."""
+
+    if not (model_dir() / ARTIFACT_FILENAME).exists():
+        raise HTTPException(status_code=503, detail="model artifact is missing")
+    try:
+        get_service()
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="model artifact is not loadable") from exc
+    return {"status": "ready", "model_ready": True}
 
 
 @app.get("/v1/model-info")

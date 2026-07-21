@@ -10,6 +10,30 @@ from flight_forecaster.api import app, get_service
 from flight_forecaster.schemas import ComparisonResponse
 
 
+def test_optional_site_basic_auth(monkeypatch) -> None:
+    monkeypatch.setenv("SITE_ACCESS_USERNAME", "flight")
+    monkeypatch.setenv("SITE_ACCESS_PASSWORD", "test-only-password")
+    client = TestClient(app)
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code in {200, 503}
+    denied = client.get("/")
+    assert denied.status_code == 401
+    assert denied.headers["www-authenticate"].startswith("Basic ")
+    assert client.get("/", auth=("flight", "wrong-password")).status_code == 401
+    assert client.get("/", auth=("flight", "test-only-password")).status_code == 200
+
+
+def test_readiness_fails_when_model_is_missing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "missing-model"))
+    get_service.cache_clear()
+
+    response = TestClient(app).get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "model artifact is missing"
+
+
 def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     monkeypatch.setenv("MODEL_DIR", str(trained_model_dir))
     monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
@@ -18,6 +42,9 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json()["model_ready"] is True
+    ready = client.get("/ready")
+    assert ready.status_code == 200
+    assert ready.json() == {"status": "ready", "model_ready": True}
     dashboard = client.get("/").text
     assert "Flight Forecast Lab" in dashboard
     assert 'id="strict-mode-notice"' in dashboard

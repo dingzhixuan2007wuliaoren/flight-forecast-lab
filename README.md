@@ -362,6 +362,16 @@ python -m flight_forecaster train-csv `
 - NOAA、Open-Meteo、AirLabs、ADSB.lol、GDELT 和 OurAirports 的覆盖、频率、许可与可用性可能变化。
 - 不应将输出用于自动购票、拒绝退款、差别定价或无人复核的重大财务/安全决策。
 
+## 免费受保护部署 / Protected free deployment
+
+仓库根目录的 `render.yaml` 会创建一个单实例 Render Docker Web Service。镜像直接打包已验证的 `artifacts/demo`，不会在构建期间重新训练；运行时监听平台提供的 `PORT`。首次创建 Blueprint 时，Render 会要求输入 `SITE_ACCESS_PASSWORD` 与 `SERPAPI_API_KEY`，两者都只保存在托管环境变量中，绝不能写入 Git。
+
+The root `render.yaml` creates a single-instance Render Docker web service. The image packages the validated `artifacts/demo` instead of retraining during the build, and it listens on the platform-provided `PORT`. During initial Blueprint creation, Render prompts for `SITE_ACCESS_PASSWORD` and `SERPAPI_API_KEY`; both belong only in managed environment variables and must never be committed.
+
+除 `/health` 和 `/ready` 外，部署在设置 `SITE_ACCESS_PASSWORD` 后会使用 HTTP Basic Auth 保护全部页面与 API，默认用户名为 `flight`。Blueprint 初期仅启用 SerpApi 严格报价源，避免在免费临时磁盘重启后重置 SearchAPI/Ignav 的终身本地额度账本。天气、新闻和无需密钥的机场代理数据仍会自动获取。Render 免费服务会休眠且文件系统是临时的，因此适合个人演示，不应视为高可用生产部署。
+
+With `SITE_ACCESS_PASSWORD` set, every page and API except `/health` and `/ready` is protected by HTTP Basic Auth; the default username is `flight`. The Blueprint initially enables only the SerpApi strict-fare source so a free ephemeral disk cannot reset SearchAPI/Ignav lifetime ledgers. No-key weather, news, and airport proxy data remain automatic. Render's free service sleeps when idle and has an ephemeral filesystem, so this is a personal demo deployment rather than a highly available production service.
+
 ## License
 
 代码以 [MIT License](LICENSE) 发布。第三方数据不随 MIT 许可证重新授权；使用者必须遵守各来源的当前条款与署名要求。

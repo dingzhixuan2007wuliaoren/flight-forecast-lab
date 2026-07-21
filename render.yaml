@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: flight-forecast-lab
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    numInstances: 1
+    autoDeployTrigger: commit
+    healthCheckPath: /ready
+    envVars:
+      - key: MODEL_DIR
+        value: /app/artifacts/demo
+      - key: EXTERNAL_CONTEXT_ENABLED
+        value: "1"
+      - key: FLIGHT_OFFER_PROVIDER
+        value: serpapi
+      - key: SERPAPI_MONTHLY_LIMIT
+        value: "250"
+      - key: SITE_ACCESS_USERNAME
+        value: flight
+      - key: SITE_ACCESS_PASSWORD
+        sync: false
+      - key: SERPAPI_API_KEY
+        sync: false
