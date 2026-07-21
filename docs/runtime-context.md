@@ -377,6 +377,54 @@ This is deliberately conservative:
 - the synthetic training relationship is an engineering demonstration, not validated causal
   evidence that news raises a particular fare or delay probability.
 
+## Destination-guide evidence and routing
+
+`POST /v1/destination/places` accepts a destination IATA code plus `kind=attraction|hotel`. The
+service resolves the airport first, identifies its served city, and queries named, geolocated OSM
+nodes at progressive 5, 15, and 30 km city-centre radii. Expansion stops once 30 sanitized unique
+places are available. Every response carries the last successfully queried radius plus a strict
+complete/partial status and bilingual notice; only a successful 30 km query is complete. It returns at most 30 objects per list and
+keeps OSM IDs behind bounded application place IDs. Nominatim and Overpass results are sanitized and
+cached for 24 hours. They are community map observations, not proof of popularity, current opening,
+hotel availability, or complete global coverage. Missing tags remain null.
+
+Overpass discovery uses the main `overpass-api.de` endpoint and exactly one controlled fallback to
+the globally covered VK Maps (`maps.mail.ru`) public instance listed by the OpenStreetMap Wiki. A
+primary success, including a genuine empty element list, is never retried at that radius. Transport
+failures, invalid payloads, and provider `remark` failures receive at most one fallback attempt for
+the entire list operation, under a 24-second overall budget. Both
+failures remain uncached; successful source-backed aggregates use the existing 24-hour cache.
+
+`POST /v1/destination/place-detail` resolves only an ID from the corresponding sanitized place
+snapshot. It then obtains airport-to-place car, bicycle, and foot routes from the fixed HTTPS
+`routing.openstreetmap.de` endpoints. Calls are serialized to no more than one per second with a
+five-second timeout per mode. Successful routes are cached for 24 hours; transient failures are not
+cached. Distance and duration are static road-graph estimates, not live traffic. The service
+does not manufacture a public-transit duration: without a verified regional GTFS/NeTEx source, the
+transit item is `unavailable` with a bilingual coverage notice.
+
+`POST /v1/destination/hotel-prices` is the only hotel-price trigger. Merely opening either guide page
+never calls SerpApi. The explicit request validates destination, check-in/check-out, adults, and USD;
+then it synchronizes the documented free SerpApi account counters, atomically reserves one call in
+the same `serpapi-usage.sqlite3` billing/hour buckets used by Google Flights, and calls
+`engine=google_hotels` with provider caching allowed. Only sanitized local one-hour cache hits make
+no provider request and reserve no call; a provider-side cached response is still conservatively
+reserved in the local ledger. Output excludes API keys, property tokens, SerpApi internal URLs, raw
+errors, and unsafe or credential-bearing links. Returned prices are dated provider observations; taxes,
+inventory, and final checkout price are not guaranteed.
+
+The shared SerpApi HTTP client refuses redirects. Credentials are sent only to the fixed allowlisted
+HTTPS account, search, or Search Archive endpoint selected before the request.
+
+If a Google Hotels search is `Processing` or `Queued`, the provider validates the opaque Search ID
+and polls only the fixed SerpApi Search Archive URL with short bounded delays. Archive reads do not
+reserve another local business call. A still-pending search may be submitted exactly once more only
+after a fresh Account sync and a second atomic reservation in the shared ledger. A terminal failure
+stores only its safe error category and timestamps for one hour—never the Search ID, provider URL,
+API key, or raw payload—so refreshes and language changes cannot repeatedly consume the free quota.
+The hotel cache key intentionally excludes UI language; changing 中文 / English reuses the same
+stay quote while local labels are re-rendered.
+
 ## Second-level offer, weather, and news pages
 
 Every strict comparison offer links to `GET /details/offer`. The page calls

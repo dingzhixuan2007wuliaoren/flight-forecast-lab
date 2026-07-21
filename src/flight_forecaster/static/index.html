@@ -931,6 +931,74 @@
       text-transform: uppercase;
     }
 
+    .destination-guide-bars {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 20px 2px 0;
+    }
+
+    .destination-guide-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      padding: 13px 14px;
+      color: var(--navy-900);
+      border: 1px solid var(--blue-100);
+      border-radius: 14px;
+      background: linear-gradient(135deg, #fff 0%, var(--blue-50) 100%);
+      box-shadow: 0 5px 18px rgba(34, 73, 122, 0.08);
+      text-decoration: none;
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+    }
+
+    .destination-guide-bar:hover {
+      transform: translateY(-1px);
+      border-color: #9fc4f3;
+      box-shadow: 0 8px 22px rgba(34, 73, 122, 0.12);
+    }
+
+    .destination-guide-bar:focus-visible { outline: none; box-shadow: var(--focus); }
+
+    .destination-guide-icon {
+      display: grid;
+      place-items: center;
+      flex: 0 0 36px;
+      width: 36px;
+      height: 36px;
+      color: var(--blue-700);
+      border-radius: 11px;
+      background: #e6f1ff;
+      font-size: 18px;
+      font-weight: 800;
+    }
+
+    .destination-guide-copy { min-width: 0; flex: 1 1 auto; }
+
+    .destination-guide-label {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .destination-guide-place {
+      display: block;
+      overflow: hidden;
+      color: var(--slate-500);
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .destination-guide-action {
+      flex: 0 0 auto;
+      color: var(--blue-700);
+      font-size: 10px;
+      font-weight: 780;
+    }
+
     .rank-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 
     .strict-mode-badge {
@@ -1418,6 +1486,7 @@
       .brand-title { font-size: 13px; }
       .brand-mark { width: 35px; height: 35px; }
       .language-switch button { min-width: 58px; font-size: 11px; }
+      .destination-guide-bars { grid-template-columns: 1fr; }
       .route-main { gap: 7px; }
       .route-plane::before, .route-plane::after { width: 10px; }
       .airport-code { font-size: 25px; }
@@ -1674,6 +1743,25 @@
           <span id="fare-coverage-notice-text"></span>
         </aside>
 
+        <nav id="destination-guides" class="destination-guide-bars" aria-label="目的地指南">
+          <a id="destination-attractions-link" class="destination-guide-bar" href="/details/attractions?lang=zh" aria-disabled="true" tabindex="-1">
+            <span class="destination-guide-icon" aria-hidden="true">✦</span>
+            <span class="destination-guide-copy">
+              <span class="destination-guide-label" data-i18n="destinationAttractions">目的地游玩景点</span>
+              <span id="destination-attractions-place" class="destination-guide-place">—</span>
+            </span>
+            <span class="destination-guide-action" data-i18n="exploreDestination">查看</span>
+          </a>
+          <a id="destination-hotels-link" class="destination-guide-bar" href="/details/hotels?lang=zh" aria-disabled="true" tabindex="-1">
+            <span class="destination-guide-icon" aria-hidden="true">▦</span>
+            <span class="destination-guide-copy">
+              <span class="destination-guide-label" data-i18n="destinationHotels">目的地酒店</span>
+              <span id="destination-hotels-place" class="destination-guide-place">—</span>
+            </span>
+            <span class="destination-guide-action" data-i18n="exploreDestination">查看</span>
+          </a>
+        </nav>
+
         <div class="rank-toolbar">
           <div class="rank-heading">
             <div class="rank-title-line">
@@ -1853,6 +1941,10 @@
           news: "近实时航空中断新闻",
           newsSemantics: "文章时间为 GDELT 观察 / 索引时间，不一定是媒体发布时间；标题保留来源语言。",
           viewDetails: "查看详情",
+          destinationAttractions: "目的地游玩景点",
+          destinationHotels: "目的地酒店",
+          exploreDestination: "查看",
+          destinationGuidePlace: "{city} · {airport}",
           offersTitle: "严格验证航班",
           strictMode: "严格模式",
           fareCoverage: "候选覆盖",
@@ -2098,6 +2190,10 @@
           news: "Near-real-time aviation disruption news",
           newsSemantics: "Article times are GDELT observed/indexed times, not necessarily publisher timestamps; headlines remain in their source language.",
           viewDetails: "View details",
+          destinationAttractions: "Things to do",
+          destinationHotels: "Destination hotels",
+          exploreDestination: "Explore",
+          destinationGuidePlace: "{city} · {airport}",
           offersTitle: "Strictly verified flights",
           strictMode: "Strict mode",
           fareCoverage: "Candidate coverage",
@@ -2302,6 +2398,8 @@
       var activeCabin = "all";
       var lastData = null;
       var providerStatusData = null;
+      var destinationGuideSummary = null;
+      var destinationGuideRequestKey = "";
       var sessionKey = "flight-forecast-session-v1";
       var activeComparison = null;
       var comparisonTimeoutMs = 150000;
@@ -2408,6 +2506,72 @@
           link.removeAttribute("aria-disabled");
           link.tabIndex = 0;
         });
+      }
+
+      function destinationGuideParams(destination, departureDate) {
+        return new URLSearchParams({
+          destination: destination,
+          departure_date: departureDate,
+          lang: currentLanguage
+        });
+      }
+
+      function renderDestinationGuideLinks(data) {
+        var state = formState();
+        var destination = safeText(data && data.destination, state.destination).toUpperCase();
+        var departureDate = safeText(data && data.departure_date, state.departure_date).slice(0, 10);
+        var valid = Boolean(data && typeof data === "object") && /^[A-Z]{3}$/.test(destination) && /^\d{4}-\d{2}-\d{2}$/.test(departureDate);
+        var city = destinationGuideSummary && destinationGuideSummary.destination === destination ?
+          safeText(destinationGuideSummary.city, destination) :
+          destinationCityName(data && (data.destination_city || data.city), destination);
+        var placeLabel = fillTemplate("destinationGuidePlace", { city: city, airport: destination });
+        byId("destination-attractions-place").textContent = placeLabel;
+        byId("destination-hotels-place").textContent = placeLabel;
+        var params = destinationGuideParams(destination, departureDate);
+        [["destination-attractions-link", "/details/attractions"], ["destination-hotels-link", "/details/hotels"]].forEach(function (entry) {
+          var link = byId(entry[0]);
+          link.href = valid ? entry[1] + "?" + params.toString() : entry[1] + "?lang=" + currentLanguage;
+          link.setAttribute("aria-disabled", String(!valid));
+          link.tabIndex = valid ? 0 : -1;
+        });
+      }
+
+      function destinationCityName(city, fallback) {
+        if (city && typeof city === "object" && !Array.isArray(city)) {
+          return safeText(city.name || city.display_name || city.city, fallback);
+        }
+        return safeText(city, fallback);
+      }
+
+      async function loadDestinationGuideSummary(data) {
+        var destination = safeText(data && data.destination, "").toUpperCase();
+        if (!/^[A-Z]{3}$/.test(destination)) return;
+        var requestKey = destination + ":" + currentLanguage;
+        if (destinationGuideSummary && destinationGuideSummary.key === requestKey) return;
+        if (destinationGuideRequestKey === requestKey) return;
+        destinationGuideRequestKey = requestKey;
+        var controller = typeof AbortController === "function" ? new AbortController() : null;
+        var timeout = controller ? window.setTimeout(function () { controller.abort(); }, 8000) : null;
+        try {
+          var response = await fetch("/v1/destination/places", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ destination: destination, kind: "attraction", language: currentLanguage }),
+            signal: controller ? controller.signal : undefined
+          });
+          if (!response.ok) return;
+          var payload = await response.json();
+          if (!payload || typeof payload !== "object") return;
+          var cityName = destinationCityName(payload.city, "");
+          if (!hasValue(cityName)) return;
+          destinationGuideSummary = { key: requestKey, destination: destination, city: cityName };
+          if (lastData && safeText(lastData.destination, "").toUpperCase() === destination) renderDestinationGuideLinks(lastData);
+        } catch (error) {
+          /* Destination guide enrichment must never interrupt flight results. */
+        } finally {
+          if (timeout !== null) window.clearTimeout(timeout);
+          if (destinationGuideRequestKey === requestKey) destinationGuideRequestKey = "";
+        }
       }
 
       function asNumber(value) {
@@ -2708,7 +2872,10 @@
         updateRankingDescription();
         renderProviderStatus(providerStatusData);
         if (lastData) renderResponse(lastData, false);
-        else updateDetailLinks(null);
+        else {
+          updateDetailLinks(null);
+          renderDestinationGuideLinks(null);
+        }
         if (activeComparison) setLoading(true);
         saveSessionState();
       }
@@ -3512,6 +3679,8 @@
         renderContext("news", context.news);
         renderArticles(context.news && context.news.articles);
         updateDetailLinks(data);
+        renderDestinationGuideLinks(data);
+        loadDestinationGuideSummary(data);
 
         var warning = warningText(data.warnings);
         byId("response-warning-text").textContent = warning;
@@ -3609,7 +3778,7 @@
       byId("departure-time").addEventListener("change", saveSessionState);
       byId("provider-status-detail").addEventListener("click", saveSessionState);
 
-      ["weather-detail-link", "news-detail-link"].forEach(function (id) {
+      ["weather-detail-link", "news-detail-link", "destination-attractions-link", "destination-hotels-link"].forEach(function (id) {
         byId(id).addEventListener("click", function (event) {
           if (event.currentTarget.getAttribute("aria-disabled") === "true") {
             event.preventDefault();

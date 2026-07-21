@@ -17,6 +17,7 @@ from flight_forecaster.alternate_fare_providers import (
     read_alternate_provider_quota_snapshot,
 )
 from flight_forecaster.availability import read_serpapi_quota_snapshot
+from flight_forecaster.destination_routes import router as destination_router
 from flight_forecaster.quota_status import QuotaLedgerSnapshot
 from flight_forecaster.route_info import RouteLookupError
 from flight_forecaster.schemas import (
@@ -51,6 +52,7 @@ app = FastAPI(
         "airport-operations, and current-news context."
     ),
 )
+app.include_router(destination_router)
 
 
 def model_dir() -> Path:
@@ -435,12 +437,14 @@ def _runtime_provider_status(
             notice={
                 "zh": (
                     "严格报价源；本地硬上限按提供商账户结算周期执行，不按自然月重置。"
-                    "每个报价仍须通过完整行程、价格和购票路径验证。"
+                    "严格机票查询与用户主动发起的酒店实时价格查询共用同一额度池；"
+                    "每个机票报价仍须通过完整行程、价格和购票路径验证。"
                 ),
                 "en": (
                     "Strict fare source. Its local hard stop follows the provider account billing "
-                    "period, not a calendar month; every offer still requires full itinerary, "
-                    "fare, and booking-path verification."
+                    "period, not a calendar month. Strict flight searches and explicit live hotel-"
+                    "price searches share this quota; every flight offer still requires full "
+                    "itinerary, fare, and booking-path verification."
                 ),
             },
         ),

@@ -550,8 +550,26 @@ class _UrllibResponse:
         return json.loads(self.text) if self.content else {}
 
 
+class _NoRedirectHandler(request.HTTPRedirectHandler):
+    """Refuse redirects so provider credentials never leave the fixed endpoint."""
+
+    def redirect_request(
+        self,
+        req: request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 class _UrllibClient:
     """Minimal sync client matching the subset of httpx used by the adapter."""
+
+    def __init__(self, opener: Any | None = None) -> None:
+        self._opener = opener or request.build_opener(_NoRedirectHandler())
 
     def get(
         self,
@@ -565,7 +583,7 @@ class _UrllibClient:
         target = f"{url}?{query}" if query else url
         outbound = request.Request(target, headers=headers or {}, method="GET")
         try:
-            with request.urlopen(outbound, timeout=timeout) as response:  # noqa: S310
+            with self._opener.open(outbound, timeout=timeout) as response:
                 response_body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
                 status = int(response.status)
         except error.HTTPError as exc:
