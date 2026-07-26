@@ -544,12 +544,12 @@ def test_dashboard_only_shows_per_provider_quota_summary_and_links_to_detail() -
     assert ".remaining +=" not in dashboard
 
 
-def test_dashboard_bounds_comparison_wait_and_preserves_request_errors() -> None:
+def test_dashboard_allows_full_candidate_verification_and_preserves_request_errors() -> None:
     dashboard = TestClient(app).get("/").text
 
     for fragment in (
         "var activeComparison = null;",
-        "var comparisonTimeoutMs = 150000;",
+        "var comparisonTimeoutMs = 600000;",
         "var slowComparisonThresholdMs = 30000;",
         "state.elapsedTimer = window.setInterval(updateLoadingMessage, 1000);",
         "state.controller.abort();",
@@ -557,14 +557,14 @@ def test_dashboard_bounds_comparison_wait_and_preserves_request_errors() -> None
         "window.clearTimeout(state.timeoutTimer)",
         "window.clearInterval(state.elapsedTimer)",
         "state.controller = null;",
-        "仍在验证报价供应商返回的航班与购票选项",
-        "Still verifying provider flights and booking options",
-        "比较已超过 150 秒",
-        "The comparison exceeded 150 seconds",
+        "仍在验证报价供应商返回的全部合格航班与购票选项",
+        "Still verifying all eligible provider flights and booking options",
+        "比较已超过 10 分钟",
+        "The comparison exceeded 10 minutes",
     ):
         assert fragment in dashboard
     assert 'setMessage(loading ? "loading"' not in dashboard
-    assert "360000" not in dashboard
+    assert "150000" not in dashboard
 
 
 def test_dashboard_distinguishes_quota_limited_candidate_coverage() -> None:
@@ -575,9 +575,9 @@ def test_dashboard_distinguishes_quota_limited_candidate_coverage() -> None:
             'fare_provider_coverage_limited: ["fareProviderCoverageLimitedTitle", '
             '"fareProviderCoverageLimitedBody"]'
         ),
-        "本次已找到候选，但每个严格来源最多只验证 6 个",
+        "本次已找到候选，但实际免费额度不足",
         "不能据此断言其余候选不可购买",
-        "Candidates were found, but each strict source verifies at most six per comparison",
+        "Candidates were found, but actual free quota did not permit every candidate",
         "this does not prove the remaining candidates are unbookable",
     ):
         assert fragment in dashboard

@@ -74,8 +74,10 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 ACCOUNT_REQUEST_TIMEOUT_SECONDS = 8.0
 SEARCH_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 2.0
 MAX_CACHE_ENTRIES = 128
+# This bounds parallel network pressure only. It is not a candidate-count cap:
+# every eligible provider-returned candidate for which quota can be reserved is
+# submitted through this worker pool.
 MAX_BOOKING_WORKERS = 6
-MAX_BOOKING_CANDIDATES_PER_COMPARISON = 6
 SERPAPI_MAX_HOURLY_LIMIT = 50
 MAX_PROVIDER_CACHE_AGE_SECONDS = 65 * 60
 MAX_PROVIDER_FUTURE_SKEW_SECONDS = 5 * 60
@@ -1286,10 +1288,11 @@ class SerpApiFlightOfferProvider:
 
         confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
         booking_failures: list[BaseException] = []
-        requested_booking_calls = min(
-            len(candidates),
-            MAX_BOOKING_CANDIDATES_PER_COMPARISON,
-        )
+        # Ask the atomic ledger for every eligible returned candidate.  The
+        # reservation may still be smaller when the provider/account billing-
+        # cycle or hourly quota is genuinely exhausted, but there is no
+        # application-defined per-comparison candidate ceiling.
+        requested_booking_calls = len(candidates)
         try:
             booking_reservation = self._ledger.synchronize_and_reserve(
                 account.billing_cycle_key,
@@ -1407,11 +1410,7 @@ class SerpApiFlightOfferProvider:
         )
         quota_limit: QuotaLimit | None = None
         if quota_skipped_candidate_count:
-            quota_limit = (
-                booking_reservation.limiting_quota
-                if booking_reservation.reserved_calls < requested_booking_calls
-                else "provider_specific"
-            )
+            quota_limit = booking_reservation.limiting_quota
         if retry_quota_limited:
             quota_limit = (
                 "hourly"
@@ -1420,9 +1419,10 @@ class SerpApiFlightOfferProvider:
             )
 
         # A single itinerary can be returned through multiple booking tokens and
-        # sellers. The bounded, fairly ordered subset is verified first; only
-        # then is each flight-and-cabin group reduced to its cheapest confirmed
-        # price. Candidates outside the subset remain explicitly unverified.
+        # sellers. Every quota-reserved candidate is verified first; only then
+        # is each flight-and-cabin group reduced to its cheapest confirmed
+        # price. Candidates skipped because actual provider/account quota was
+        # unavailable remain explicitly unverified.
         best_by_group: dict[tuple[Any, ...], tuple[int, ConfirmedFlightOffer]] = {}
         for position in range(booking_calls):
             offer = confirmed_by_position.get(position)
@@ -1977,9 +1977,10 @@ class SerpApiFlightOfferProvider:
                 )
             )
 
-        # Give each returned cabin one chance first, then spend the remaining
-        # per-comparison capacity in provider-price order. Candidates beyond the
-        # bounded subset remain explicitly unverified.
+        # Give each returned cabin one chance first, then order the remainder by
+        # provider price. This ordering matters only if the real provider/account
+        # quota cannot cover every eligible candidate; it is not an application
+        # candidate-count limit.
         selected: list[_SearchCandidate] = []
         for cabin in _CABINS:
             if by_cabin[cabin]:

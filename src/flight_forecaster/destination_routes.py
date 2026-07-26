@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import UTC, date, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from flight_forecaster.destination_guide import (
     DestinationAirportNotFound,
@@ -19,6 +19,7 @@ from flight_forecaster.destination_guide import (
     DestinationPlaceNotFound,
     DestinationValidationError,
     build_destination_guide_service,
+    validate_transit_departure_at,
 )
 from flight_forecaster.hotel_prices import (
     HotelPriceError,
@@ -68,6 +69,7 @@ class DestinationPlaceDetailRequest(_RequestModel):
         pattern=r"^osm_(?:attraction|hotel)_(?:node|way|relation)_[1-9][0-9]{0,18}$",
     )
     language: Language = "zh"
+    transit_departure_at: AwareDatetime | None = None
 
 
 class HotelPricesRequest(_RequestModel):
@@ -79,12 +81,22 @@ class HotelPricesRequest(_RequestModel):
 
 
 class HotelPriceDetailRequest(HotelPricesRequest):
-    hotel_id: str = Field(pattern=r"^gh_[a-f0-9]{32}$")
+    hotel_id: str | None = Field(
+        default=None,
+        pattern=r"^gh_[a-f0-9]{32}$",
+    )
     place_id: str | None = Field(
         default=None,
         max_length=80,
         pattern=r"^osm_hotel_(?:node|way|relation)_[1-9][0-9]{0,18}$",
     )
+    transit_departure_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def requires_one_hotel_identity(self) -> HotelPriceDetailRequest:
+        if (self.hotel_id is None) == (self.place_id is None):
+            raise ValueError("provide exactly one of hotel_id or place_id")
+        return self
 
 
 def _runtime_dir() -> Path:
@@ -176,6 +188,15 @@ def _destination_error(exc: Exception) -> HTTPException:
     )
 
 
+def _validate_transit_time_before_external_calls(value: datetime | None) -> None:
+    """Reject semantically invalid transit times before any provider call."""
+
+    try:
+        validate_transit_departure_at(value, observed_at=datetime.now(UTC))
+    except DestinationValidationError as exc:
+        raise _destination_error(exc) from exc
+
+
 def _hotel_error(exc: HotelPriceError) -> HTTPException:
     status = {
         "validation_error": 422,
@@ -245,6 +266,7 @@ def destination_places(request: DestinationPlacesRequest) -> dict[str, object]:
 def destination_place_detail(
     request: DestinationPlaceDetailRequest,
 ) -> dict[str, object]:
+    _validate_transit_time_before_external_calls(request.transit_departure_at)
     expected_prefix = f"osm_{request.kind}_"
     if not request.place_id.startswith(expected_prefix):
         raise HTTPException(status_code=422, detail="place_id does not match kind")
@@ -252,6 +274,7 @@ def destination_place_detail(
         detail = get_destination_guide_service().get_place_detail(
             request.destination,
             request.place_id,
+            transit_departure_at=request.transit_departure_at,
         )
     except (
         DestinationValidationError,
@@ -269,7 +292,9 @@ def destination_place_detail(
             "transport": transport,
             "routes": routes,
             "transit_notice": transit_notice,
-            "source": "openstreetmap_overpass+routing_openstreetmap_de",
+            "source": (
+                "openstreetmap_overpass+routing_openstreetmap_de+transitous_motis"
+            ),
             "observed_at": observed_at.isoformat(),
         }
     )
@@ -338,6 +363,7 @@ def destination_hotel_prices(request: HotelPricesRequest) -> dict[str, object]:
 def destination_hotel_price_detail(
     request: HotelPriceDetailRequest,
 ) -> dict[str, object]:
+    _validate_transit_time_before_external_calls(request.transit_departure_at)
     guide = get_destination_guide_service()
     try:
         city = guide.resolve_city(request.destination)
@@ -347,44 +373,117 @@ def destination_hotel_price_detail(
         DestinationDataUnavailable,
     ) as exc:
         raise _destination_error(exc) from exc
-    try:
-        offer = get_hotel_price_provider().detail(
-            request.hotel_id,
-            city.city_query,
-            city.destination_airport,
-            request.check_in,
-            request.check_out,
-            adults=request.adults,
-            language=_language(request.language),
+    osm_place = None
+    route_result = None
+    if request.place_id is not None:
+        try:
+            osm_detail = guide.get_place_detail(
+                city.destination_airport,
+                request.place_id,
+                transit_departure_at=request.transit_departure_at,
+            )
+        except (
+            DestinationValidationError,
+            DestinationAirportNotFound,
+            DestinationPlaceNotFound,
+            DestinationDataUnavailable,
+        ) as exc:
+            raise _destination_error(exc) from exc
+        osm_place = osm_detail.place
+        route_result = osm_detail.transport
+        hotel_names = tuple(
+            dict.fromkeys(
+                name
+                for name in (osm_place.name, osm_place.name_en)
+                if isinstance(name, str) and name.strip()
+            )
         )
-    except (HotelPriceValidationError, HotelPriceError) as exc:
-        raise _hotel_error(exc) from exc
-    if offer is None:
-        raise HTTPException(
-            status_code=404,
-            detail="The requested hotel quote is not present in the one-hour sanitized cache.",
-        )
-    try:
-        route_result = guide.get_routes(
-            city.destination_airport,
-            offer.latitude,
-            offer.longitude,
-        )
-    except (
-        DestinationValidationError,
-        DestinationAirportNotFound,
-        DestinationDataUnavailable,
-    ) as exc:
-        raise _destination_error(exc) from exc
+        try:
+            offer = get_hotel_price_provider().exact_property_detail(
+                hotel_names,
+                osm_place.latitude,
+                osm_place.longitude,
+                city.city_query,
+                city.destination_airport,
+                request.check_in,
+                request.check_out,
+                adults=request.adults,
+                language=_language(request.language),
+                explicit=True,
+            )
+        except (HotelPriceValidationError, HotelPriceError) as exc:
+            raise _hotel_error(exc) from exc
+        if offer is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "The provider did not return exactly one hotel whose name and "
+                    "coordinates match this OpenStreetMap property."
+                ),
+            )
+    else:
+        assert request.hotel_id is not None
+        try:
+            offer = get_hotel_price_provider().detail(
+                request.hotel_id,
+                city.city_query,
+                city.destination_airport,
+                request.check_in,
+                request.check_out,
+                adults=request.adults,
+                language=_language(request.language),
+                explicit=True,
+            )
+        except (HotelPriceValidationError, HotelPriceError) as exc:
+            raise _hotel_error(exc) from exc
+        if offer is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "The requested hotel quote is not present in the one-hour "
+                    "sanitized cache."
+                ),
+            )
+    if route_result is None:
+        try:
+            route_result = guide.get_routes(
+                city.destination_airport,
+                offer.latitude,
+                offer.longitude,
+                transit_departure_at=request.transit_departure_at,
+            )
+        except (
+            DestinationValidationError,
+            DestinationAirportNotFound,
+            DestinationDataUnavailable,
+        ) as exc:
+            raise _destination_error(exc) from exc
     transport, routes, transit_notice = _transport_payload(route_result)
     price = _safe_offer(offer, language=_language(request.language))
-    hotel = {
-        **price,
-        "place_id": None,
-        "kind": "hotel",
-        "address": None,
-        "opening_hours": None,
-    }
+    if osm_place is None:
+        hotel = {
+            **price,
+            "place_id": None,
+            "kind": "hotel",
+            "address": None,
+            "opening_hours": None,
+        }
+        source = "serpapi_google_hotels+routing_openstreetmap_de+transitous_motis"
+    else:
+        hotel = {
+            **price,
+            "place_id": osm_place.place_id,
+            "kind": "hotel",
+            "name_en": osm_place.name_en,
+            "address": osm_place.address,
+            "opening_hours": osm_place.opening_hours,
+            "phone": osm_place.phone,
+            "source_url": osm_place.source_url,
+        }
+        source = (
+            "openstreetmap_overpass+serpapi_google_hotels+"
+            "routing_openstreetmap_de+transitous_motis"
+        )
     return {
         "city": city.model_dump(mode="json"),
         "destination_airport": city.destination_airport,
@@ -397,8 +496,10 @@ def destination_hotel_price_detail(
         "transit_notice": transit_notice,
         "provider": "SerpApi Google Hotels",
         "provider_name": "SerpApi Google Hotels",
-        "source": "serpapi_google_hotels+routing_openstreetmap_de",
-        "observed_at": offer.observed_at.isoformat(),
+        "source": source,
+        "observed_at": (
+            offer.detail_observed_at or offer.observed_at
+        ).isoformat(),
         "warning": (
             "价格和空房仅代表查询时刻；税费、最终金额与退改规则以提供商结账页为准。"
             if request.language != "en"

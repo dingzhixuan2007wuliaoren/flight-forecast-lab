@@ -4,10 +4,12 @@ The module deliberately keeps destination discovery independent from airfare and
 hotel-price providers.  It uses OurAirports only to resolve the destination airport
 and its served municipality, Nominatim to resolve the served-city centre, Overpass
 for OpenStreetMap places, and the public routing.openstreetmap.de OSRM instances for
-estimated car, bicycle, and walking routes.
+estimated car, bicycle, and walking routes.  Public-transport itineraries come from
+Transitous' public MOTIS endpoint and are shown only when its open timetable data
+returns a complete, parseable itinerary.
 
 All network dependencies are injectable.  Provider payloads are bounded, cached for
-24 hours, and converted into strict Pydantic models; missing OSM tags remain ``None``
+the source-specific TTL, and converted into strict Pydantic models; missing OSM tags remain ``None``
 instead of being inferred.
 """
 
@@ -60,6 +62,25 @@ ListCategory = Literal[
     "apartment",
 ]
 TransportMode = Literal["car", "bike", "foot", "public_transit"]
+TransitLegMode = Literal[
+    "WALK",
+    "TRAM",
+    "SUBWAY",
+    "FERRY",
+    "SUBURBAN",
+    "BUS",
+    "COACH",
+    "RAIL",
+    "HIGHSPEED_RAIL",
+    "LONG_DISTANCE",
+    "NIGHT_RAIL",
+    "REGIONAL_FAST_RAIL",
+    "REGIONAL_RAIL",
+    "CABLE_CAR",
+    "FUNICULAR",
+    "AERIAL_LIFT",
+    "OTHER",
+]
 
 ATTRACTION_CATEGORIES = frozenset(
     {"landmark", "museum", "nature", "entertainment", "shopping"}
@@ -89,8 +110,12 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OVERPASS_FALLBACK_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 OVERPASS_ENDPOINTS = (OVERPASS_URL, OVERPASS_FALLBACK_URL)
 ROUTING_BASE_URL = "https://routing.openstreetmap.de"
+TRANSITOUS_PLAN_URL = "https://api.transitous.org/api/v5/plan"
+TRANSITOUS_SOURCES_URL = "https://transitous.org/sources/"
 OPENSTREETMAP_BASE_URL = "https://www.openstreetmap.org"
 DESTINATION_CACHE_TTL = timedelta(hours=24)
+TRANSIT_CACHE_TTL = timedelta(minutes=30)
+TRANSIT_CACHE_MAX_ENTRIES = 512
 DESTINATION_RADIUS_METERS = 30_000
 OVERPASS_RADIUS_METERS = (5_000, 15_000, DESTINATION_RADIUS_METERS)
 MAX_PLACES_PER_KIND = 30
@@ -99,12 +124,19 @@ MAX_OVERPASS_ELEMENTS = 100
 MAX_NOMINATIM_BYTES = 1_000_000
 MAX_OVERPASS_BYTES = 5_000_000
 MAX_ROUTING_BYTES = 1_000_000
+MAX_TRANSITOUS_BYTES = 2_000_000
 MAX_OURAIRPORTS_BYTES = 30_000_000
 DEFAULT_TIMEOUT_SECONDS = 10.0
 OVERPASS_REQUEST_TIMEOUT_SECONDS = 6.0
 OVERPASS_QUERY_TIMEOUT_SECONDS = 5
 OVERPASS_OPERATION_BUDGET_SECONDS = 24.0
 ROUTING_REQUEST_TIMEOUT_SECONDS = 5.0
+TRANSITOUS_REQUEST_TIMEOUT_SECONDS = 8.0
+TRANSITOUS_TRANSIT_MODES = (
+    "TRAM,SUBWAY,FERRY,SUBURBAN,BUS,COACH,REGIONAL_RAIL,"
+    "REGIONAL_FAST_RAIL,HIGHSPEED_RAIL,LONG_DISTANCE,NIGHT_RAIL,"
+    "CABLE_CAR,FUNICULAR,AERIAL_LIFT,OTHER"
+)
 USER_AGENT = (
     "flight-forecast-lab/0.2 destination-guide "
     "(https://github.com/dingzhixuan2007wuliaoren/flight-forecast-lab)"
@@ -262,17 +294,75 @@ class DestinationPlaceList(_StrictModel):
         return self
 
 
+class DestinationTransitLeg(_StrictModel):
+    """One provider-returned leg in a public-transport itinerary."""
+
+    mode: TransitLegMode
+    from_name: str = Field(min_length=1, max_length=300)
+    to_name: str = Field(min_length=1, max_length=300)
+    from_timezone: str | None = Field(default=None, min_length=1, max_length=100)
+    to_timezone: str | None = Field(default=None, min_length=1, max_length=100)
+    departure_at: datetime
+    arrival_at: datetime
+    scheduled_departure_at: datetime
+    scheduled_arrival_at: datetime
+    duration_minutes: int = Field(ge=1, le=10_000)
+    distance_km: float | None = Field(default=None, ge=0, le=10_000)
+    line_name: str | None = Field(default=None, min_length=1, max_length=300)
+    headsign: str | None = Field(default=None, min_length=1, max_length=300)
+    agency_name: str | None = Field(default=None, min_length=1, max_length=300)
+    intermediate_stops: tuple[str, ...] = Field(default=(), max_length=100)
+    realtime: bool
+    scheduled: bool
+
+    @model_validator(mode="after")
+    def leg_is_chronological(self) -> DestinationTransitLeg:
+        if (
+            self.departure_at.tzinfo is None
+            or self.arrival_at.tzinfo is None
+            or self.scheduled_departure_at.tzinfo is None
+            or self.scheduled_arrival_at.tzinfo is None
+            or self.departure_at.utcoffset() is None
+            or self.arrival_at.utcoffset() is None
+            or self.scheduled_departure_at.utcoffset() is None
+            or self.scheduled_arrival_at.utcoffset() is None
+        ):
+            raise ValueError("transit leg timestamps must include timezone information")
+        if self.arrival_at <= self.departure_at:
+            raise ValueError("transit leg arrival must be after departure")
+        if self.scheduled_arrival_at <= self.scheduled_departure_at:
+            raise ValueError("scheduled transit leg arrival must be after departure")
+        return self
+
+
 class DestinationTransportOption(_StrictModel):
     mode: TransportMode
     status: Literal["available", "unavailable"]
     distance_km: float | None = Field(default=None, ge=0, le=10_000)
     duration_minutes: int | None = Field(default=None, ge=1, le=100_000)
-    duration_basis: Literal["estimated_route_no_live_traffic"] | None = None
+    duration_basis: Literal[
+        "estimated_route_no_live_traffic",
+        "transit_schedule_or_realtime",
+    ] | None = None
+    requested_departure_at: datetime | None = None
+    departure_time_basis: Literal["user_supplied", "request_time"] | None = None
+    departure_at: datetime | None = None
+    arrival_at: datetime | None = None
+    transfers: int | None = Field(default=None, ge=0, le=20)
+    realtime: bool | None = None
+    legs: tuple[DestinationTransitLeg, ...] = Field(default=(), max_length=20)
+    coverage_status: Literal[
+        "covered",
+        "no_itinerary",
+        "provider_unavailable",
+    ] | None = None
     notice: str = Field(min_length=1, max_length=600)
     data_source: Literal[
         "routing_openstreetmap_de_osrm",
+        "transitous_motis",
         "open_transit_coverage_unavailable",
     ]
+    source_url: str | None = Field(default=None, min_length=20, max_length=300)
     observed_at: datetime
     expires_at: datetime
 
@@ -284,18 +374,86 @@ class DestinationTransportOption(_StrictModel):
             raise ValueError("expires_at must be later than observed_at")
         if self.status == "available":
             if self.mode == "public_transit":
-                raise ValueError("public transit cannot be marked available without transit data")
-            if self.distance_km is None or self.duration_minutes is None:
-                raise ValueError("available route requires distance and duration")
-            if self.duration_basis != "estimated_route_no_live_traffic":
-                raise ValueError("available route requires an explicit estimated duration basis")
-            if self.data_source != "routing_openstreetmap_de_osrm":
-                raise ValueError("available route must come from the OSRM source")
+                if self.duration_minutes is None:
+                    raise ValueError("available public transit requires a duration")
+                if self.duration_basis != "transit_schedule_or_realtime":
+                    raise ValueError("available public transit requires a timetable duration basis")
+                if (
+                    self.requested_departure_at is None
+                    or self.departure_time_basis is None
+                    or self.departure_at is None
+                    or self.arrival_at is None
+                    or self.transfers is None
+                    or self.realtime is None
+                    or not self.legs
+                ):
+                    raise ValueError("available public transit requires complete itinerary data")
+                if self.arrival_at <= self.departure_at:
+                    raise ValueError("public-transit arrival must be after departure")
+                if not any(leg.mode != "WALK" for leg in self.legs):
+                    raise ValueError("public transit requires at least one transit leg")
+                if self.data_source != "transitous_motis":
+                    raise ValueError("available public transit must come from Transitous")
+                if (
+                    self.coverage_status != "covered"
+                    or self.source_url != TRANSITOUS_SOURCES_URL
+                ):
+                    raise ValueError("available public transit requires source and coverage")
+            else:
+                if self.distance_km is None or self.duration_minutes is None:
+                    raise ValueError("available route requires distance and duration")
+                if self.duration_basis != "estimated_route_no_live_traffic":
+                    raise ValueError(
+                        "available route requires an explicit estimated duration basis"
+                    )
+                if self.data_source != "routing_openstreetmap_de_osrm":
+                    raise ValueError("available route must come from the OSRM source")
+                if any(
+                    value is not None
+                    for value in (
+                        self.requested_departure_at,
+                        self.departure_time_basis,
+                        self.departure_at,
+                        self.arrival_at,
+                        self.transfers,
+                        self.realtime,
+                        self.coverage_status,
+                        self.source_url,
+                    )
+                ) or self.legs:
+                    raise ValueError("street routes cannot contain public-transit data")
         elif any(
             value is not None
-            for value in (self.distance_km, self.duration_minutes, self.duration_basis)
+            for value in (
+                self.distance_km,
+                self.duration_minutes,
+                self.duration_basis,
+                self.departure_at,
+                self.arrival_at,
+                self.transfers,
+                self.realtime,
+            )
         ):
             raise ValueError("unavailable routes cannot contain invented route metrics")
+        elif self.legs:
+            raise ValueError("unavailable routes cannot contain itinerary legs")
+        if self.mode == "public_transit" and self.status == "unavailable":
+            if self.data_source == "transitous_motis":
+                if (
+                    self.requested_departure_at is None
+                    or self.departure_time_basis is None
+                    or self.coverage_status not in {"no_itinerary", "provider_unavailable"}
+                    or self.source_url != TRANSITOUS_SOURCES_URL
+                ):
+                    raise ValueError("Transitous unavailability requires query coverage")
+            elif (
+                self.data_source != "open_transit_coverage_unavailable"
+                or self.requested_departure_at is not None
+                or self.departure_time_basis is not None
+                or self.coverage_status is not None
+                or self.source_url is not None
+            ):
+                raise ValueError("public-transit unavailability source is invalid")
         return self
 
 
@@ -529,8 +687,20 @@ class _OneRequestPerSecond:
 
 
 class _TtlCache:
-    def __init__(self, clock: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], float],
+        *,
+        ttl: timedelta = DESTINATION_CACHE_TTL,
+        max_entries: int | None = None,
+    ) -> None:
+        if ttl <= timedelta(0):
+            raise ValueError("cache TTL must be positive")
+        if max_entries is not None and max_entries < 1:
+            raise ValueError("cache max_entries must be positive")
         self._clock = clock
+        self._ttl_seconds = ttl.total_seconds()
+        self._max_entries = max_entries
         self._values: dict[tuple[Any, ...], tuple[float, Any]] = {}
         self._lock = threading.Lock()
 
@@ -548,8 +718,19 @@ class _TtlCache:
 
     def set(self, key: tuple[Any, ...], value: Any) -> None:
         with self._lock:
+            now = self._clock()
+            expired = [
+                existing_key
+                for existing_key, (expires_at, _) in self._values.items()
+                if now >= expires_at
+            ]
+            for existing_key in expired:
+                self._values.pop(existing_key, None)
+            self._values.pop(key, None)
+            while self._max_entries is not None and len(self._values) >= self._max_entries:
+                self._values.pop(next(iter(self._values)))
             self._values[key] = (
-                self._clock() + DESTINATION_CACHE_TTL.total_seconds(),
+                now + self._ttl_seconds,
                 value,
             )
 
@@ -586,9 +767,18 @@ class DestinationGuideService:
         self._nominatim_limiter = _OneRequestPerSecond(clock=monotonic_clock, sleeper=sleeper)
         self._overpass_limiter = _OneRequestPerSecond(clock=monotonic_clock, sleeper=sleeper)
         self._routing_limiter = _OneRequestPerSecond(clock=monotonic_clock, sleeper=sleeper)
+        self._transitous_limiter = _OneRequestPerSecond(
+            clock=monotonic_clock,
+            sleeper=sleeper,
+        )
         self._city_cache = _TtlCache(monotonic_clock)
         self._place_cache = _TtlCache(monotonic_clock)
         self._route_cache = _TtlCache(monotonic_clock)
+        self._transit_cache = _TtlCache(
+            monotonic_clock,
+            ttl=TRANSIT_CACHE_TTL,
+            max_entries=TRANSIT_CACHE_MAX_ENTRIES,
+        )
 
     def resolve_city(self, destination_airport: str) -> DestinationCity:
         code = _normalize_iata(destination_airport)
@@ -651,6 +841,7 @@ class DestinationGuideService:
         self,
         destination_airport: str,
         place_id: str,
+        transit_departure_at: datetime | None = None,
     ) -> DestinationPlaceDetail:
         code = _normalize_iata(destination_airport)
         match = PLACE_ID_PATTERN.fullmatch(str(place_id).strip())
@@ -665,7 +856,12 @@ class DestinationGuideService:
         return DestinationPlaceDetail(
             city=city,
             place=place,
-            transport=self.get_routes(code, place.latitude, place.longitude),
+            transport=self.get_routes(
+                code,
+                place.latitude,
+                place.longitude,
+                transit_departure_at=transit_departure_at,
+            ),
         )
 
     def get_routes(
@@ -673,6 +869,8 @@ class DestinationGuideService:
         destination_airport: str,
         latitude: float,
         longitude: float,
+        *,
+        transit_departure_at: datetime | None = None,
     ) -> DestinationTransport:
         code = _normalize_iata(destination_airport)
         airport = self._resolve_airport(code)
@@ -687,17 +885,11 @@ class DestinationGuideService:
             )
             for mode in ("car", "bike", "foot")
         )
-        now = _aware_utc(self._wall_clock())
-        transit = DestinationTransportOption(
-            mode="public_transit",
-            status="unavailable",
-            notice=(
-                "No globally consistent open transit itinerary is available for this airport and "
-                "place; public-transit time is not inferred. Check the local transit operator."
-            ),
-            data_source="open_transit_coverage_unavailable",
-            observed_at=now,
-            expires_at=now + DESTINATION_CACHE_TTL,
+        transit = self._transit_option(
+            airport,
+            destination_latitude,
+            destination_longitude,
+            transit_departure_at=transit_departure_at,
         )
         return DestinationTransport(
             destination_airport=airport.iata,
@@ -990,6 +1182,86 @@ class DestinationGuideService:
             )
         if result.status == "available":
             self._route_cache.set(key, result)
+        return result
+
+    def _transit_option(
+        self,
+        airport: Airport,
+        latitude: float,
+        longitude: float,
+        *,
+        transit_departure_at: datetime | None,
+    ) -> DestinationTransportOption:
+        observed_at = _aware_utc(self._wall_clock())
+        requested_departure_at, departure_time_basis = _transit_departure(
+            transit_departure_at,
+            observed_at,
+        )
+        key = (
+            airport.iata,
+            "public_transit",
+            round(latitude, 5),
+            round(longitude, 5),
+            requested_departure_at.isoformat(),
+        )
+        cached = self._transit_cache.get(key)
+        if isinstance(cached, DestinationTransportOption):
+            return cached
+        expires_at = observed_at + TRANSIT_CACHE_TTL
+        params = {
+            "fromPlace": f"{airport.latitude:.6f},{airport.longitude:.6f}",
+            "toPlace": f"{latitude:.6f},{longitude:.6f}",
+            "time": requested_departure_at.isoformat(),
+            "transitModes": TRANSITOUS_TRANSIT_MODES,
+            # Disable the default direct WALK result. MOTIS can otherwise prune
+            # slower transit itineraries in favour of walking, creating a false
+            # "no public-transit itinerary" result.
+            "directModes": "",
+            "preTransitModes": "WALK",
+            "postTransitModes": "WALK",
+            "maxTransfers": "4",
+            "maxTravelTime": "360",
+            "searchWindow": "3600",
+            "language": "en",
+        }
+        try:
+            self._transitous_limiter.wait()
+            payload = self.client.request_json(
+                "GET",
+                TRANSITOUS_PLAN_URL,
+                params=params,
+                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                timeout_seconds=min(
+                    self.timeout_seconds,
+                    TRANSITOUS_REQUEST_TIMEOUT_SECONDS,
+                ),
+                max_response_bytes=MAX_TRANSITOUS_BYTES,
+            )
+            result = _parse_transitous_option(
+                payload,
+                requested_departure_at=requested_departure_at,
+                departure_time_basis=departure_time_basis,
+                observed_at=observed_at,
+                expires_at=expires_at,
+            )
+        except DestinationGuideError:
+            result = DestinationTransportOption(
+                mode="public_transit",
+                status="unavailable",
+                requested_departure_at=requested_departure_at,
+                departure_time_basis=departure_time_basis,
+                coverage_status="provider_unavailable",
+                notice=(
+                    "Transitous could not return a valid itinerary for the requested departure "
+                    "time. A public-transport route or duration is not inferred."
+                ),
+                data_source="transitous_motis",
+                source_url=TRANSITOUS_SOURCES_URL,
+                observed_at=observed_at,
+                expires_at=expires_at,
+            )
+        if result.coverage_status != "provider_unavailable":
+            self._transit_cache.set(key, result)
         return result
 
 
@@ -1596,6 +1868,280 @@ def _parse_osrm_route(payload: Any) -> tuple[float, int]:
     return round(distance_meters / 1_000, 1), max(1, math.ceil(duration_seconds / 60))
 
 
+def validate_transit_departure_at(
+    requested: datetime | None,
+    *,
+    observed_at: datetime,
+) -> datetime | None:
+    """Validate and normalize a requested transit instant to UTC minute precision."""
+
+    reference = _aware_utc(observed_at)
+    if requested is None:
+        return None
+    if (
+        not isinstance(requested, datetime)
+        or requested.tzinfo is None
+        or requested.utcoffset() is None
+    ):
+        raise DestinationValidationError(
+            "transit_departure_at must be a timezone-aware datetime"
+        )
+    normalized = requested.astimezone(UTC).replace(second=0, microsecond=0)
+    if normalized < reference - timedelta(days=1):
+        raise DestinationValidationError(
+            "transit_departure_at cannot be more than one day in the past"
+        )
+    if normalized > reference + timedelta(days=370):
+        raise DestinationValidationError(
+            "transit_departure_at must be within 370 days"
+        )
+    return normalized
+
+
+def _transit_departure(
+    requested: datetime | None,
+    observed_at: datetime,
+) -> tuple[datetime, Literal["user_supplied", "request_time"]]:
+    normalized = validate_transit_departure_at(requested, observed_at=observed_at)
+    if normalized is None:
+        return observed_at.replace(second=0, microsecond=0), "request_time"
+    return normalized, "user_supplied"
+
+
+def _parse_transit_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) > 80:
+        return None
+    try:
+        parsed_value = value.strip().replace("Z", "+00:00")
+        result = datetime.fromisoformat(parsed_value)
+    except ValueError:
+        return None
+    if result.tzinfo is None or result.utcoffset() is None:
+        return None
+    return result.astimezone(UTC)
+
+
+def _bounded_int(value: object, minimum: int, maximum: int) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number < minimum or number > maximum:
+        return None
+    return number
+
+
+def _transit_place_name(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    return _clean_text(value.get("name"), 300)
+
+
+def _transit_place_timezone(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    return _clean_text(value.get("tz"), 100)
+
+
+def _transit_intermediate_stops(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    names: list[str] = []
+    for raw in value[:100]:
+        name = _transit_place_name(raw)
+        if name is not None:
+            names.append(name)
+    return tuple(names)
+
+
+def _parse_transit_leg(value: object) -> DestinationTransitLeg | None:
+    if not isinstance(value, Mapping):
+        return None
+    mode = str(value.get("mode") or "").strip().upper()
+    allowed_modes = {
+        "WALK",
+        "TRAM",
+        "SUBWAY",
+        "FERRY",
+        "SUBURBAN",
+        "BUS",
+        "COACH",
+        "RAIL",
+        "HIGHSPEED_RAIL",
+        "LONG_DISTANCE",
+        "NIGHT_RAIL",
+        "REGIONAL_FAST_RAIL",
+        "REGIONAL_RAIL",
+        "CABLE_CAR",
+        "FUNICULAR",
+        "AERIAL_LIFT",
+        "OTHER",
+    }
+    if mode not in allowed_modes or value.get("cancelled") is True:
+        return None
+    from_name = _transit_place_name(value.get("from"))
+    to_name = _transit_place_name(value.get("to"))
+    departure_at = _parse_transit_datetime(value.get("startTime"))
+    arrival_at = _parse_transit_datetime(value.get("endTime"))
+    scheduled_departure_at = _parse_transit_datetime(value.get("scheduledStartTime"))
+    scheduled_arrival_at = _parse_transit_datetime(value.get("scheduledEndTime"))
+    duration_seconds = _safe_float(value.get("duration"), 1, 600_000)
+    if (
+        from_name is None
+        or to_name is None
+        or departure_at is None
+        or arrival_at is None
+        or scheduled_departure_at is None
+        or scheduled_arrival_at is None
+        or duration_seconds is None
+        or not isinstance(value.get("realTime"), bool)
+        or not isinstance(value.get("scheduled"), bool)
+    ):
+        return None
+    distance_meters = _safe_float(value.get("distance"), 0, 10_000_000)
+    line_name = (
+        _clean_text(value.get("displayName"), 300)
+        or _clean_text(value.get("routeShortName"), 300)
+        or _clean_text(value.get("routeLongName"), 300)
+        or _clean_text(value.get("tripShortName"), 300)
+    )
+    try:
+        return DestinationTransitLeg(
+            mode=mode,
+            from_name=from_name,
+            to_name=to_name,
+            from_timezone=_transit_place_timezone(value.get("from")),
+            to_timezone=_transit_place_timezone(value.get("to")),
+            departure_at=departure_at,
+            arrival_at=arrival_at,
+            scheduled_departure_at=scheduled_departure_at,
+            scheduled_arrival_at=scheduled_arrival_at,
+            duration_minutes=max(1, math.ceil(duration_seconds / 60)),
+            distance_km=(
+                round(distance_meters / 1_000, 1)
+                if distance_meters is not None
+                else None
+            ),
+            line_name=line_name,
+            headsign=_clean_text(value.get("headsign"), 300),
+            agency_name=_clean_text(value.get("agencyName"), 300),
+            intermediate_stops=_transit_intermediate_stops(
+                value.get("intermediateStops")
+            ),
+            realtime=value["realTime"],
+            scheduled=value["scheduled"],
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_transitous_option(
+    payload: Any,
+    *,
+    requested_departure_at: datetime,
+    departure_time_basis: Literal["user_supplied", "request_time"],
+    observed_at: datetime,
+    expires_at: datetime,
+) -> DestinationTransportOption:
+    if not isinstance(payload, Mapping):
+        raise DestinationDataUnavailable("Transitous response is not an object")
+    raw_itineraries = payload.get("itineraries")
+    if not isinstance(raw_itineraries, list):
+        raise DestinationDataUnavailable("Transitous response is missing itineraries")
+    candidates: list[
+        tuple[int, int, datetime, datetime, tuple[DestinationTransitLeg, ...], bool]
+    ] = []
+    for raw_itinerary in raw_itineraries[:20]:
+        if not isinstance(raw_itinerary, Mapping):
+            continue
+        duration_seconds = _safe_float(raw_itinerary.get("duration"), 1, 6_000_000)
+        start_time = _parse_transit_datetime(raw_itinerary.get("startTime"))
+        end_time = _parse_transit_datetime(raw_itinerary.get("endTime"))
+        transfers = _bounded_int(raw_itinerary.get("transfers"), 0, 20)
+        raw_legs = raw_itinerary.get("legs")
+        if (
+            duration_seconds is None
+            or start_time is None
+            or end_time is None
+            or end_time <= start_time
+            or transfers is None
+            or not isinstance(raw_legs, list)
+            or not 1 <= len(raw_legs) <= 20
+        ):
+            continue
+        parsed_legs = tuple(_parse_transit_leg(raw) for raw in raw_legs)
+        if any(leg is None for leg in parsed_legs):
+            continue
+        legs = tuple(leg for leg in parsed_legs if leg is not None)
+        transit_legs = tuple(leg for leg in legs if leg.mode != "WALK")
+        if not transit_legs:
+            continue
+        duration_minutes = max(1, math.ceil(duration_seconds / 60))
+        candidates.append(
+            (
+                duration_minutes,
+                transfers,
+                start_time,
+                end_time,
+                legs,
+                any(leg.realtime for leg in transit_legs),
+            )
+        )
+    if not raw_itineraries:
+        return DestinationTransportOption(
+            mode="public_transit",
+            status="unavailable",
+            requested_departure_at=requested_departure_at,
+            departure_time_basis=departure_time_basis,
+            coverage_status="no_itinerary",
+            notice=(
+                "Transitous returned no complete public-transport itinerary for the requested "
+                "departure time and coordinates. A route or duration is not inferred."
+            ),
+            data_source="transitous_motis",
+            source_url=TRANSITOUS_SOURCES_URL,
+            observed_at=observed_at,
+            expires_at=expires_at,
+        )
+    if not candidates:
+        raise DestinationDataUnavailable(
+            "Transitous returned itineraries but none passed strict validation"
+        )
+    (
+        duration_minutes,
+        transfers,
+        departure_at,
+        arrival_at,
+        legs,
+        realtime,
+    ) = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+    return DestinationTransportOption(
+        mode="public_transit",
+        status="available",
+        duration_minutes=duration_minutes,
+        duration_basis="transit_schedule_or_realtime",
+        requested_departure_at=requested_departure_at,
+        departure_time_basis=departure_time_basis,
+        departure_at=departure_at,
+        arrival_at=arrival_at,
+        transfers=transfers,
+        realtime=realtime,
+        legs=legs,
+        coverage_status="covered",
+        notice=(
+            "Transitous MOTIS returned this itinerary for the requested departure time. "
+            "Times follow published open timetables and provider realtime flags where present; "
+            "coverage depends on the underlying local feeds."
+        ),
+        data_source="transitous_motis",
+        source_url=TRANSITOUS_SOURCES_URL,
+        observed_at=observed_at,
+        expires_at=expires_at,
+    )
+
+
 def _assert_allowed_outbound_url(url: str) -> None:
     try:
         parsed = parse.urlsplit(url)
@@ -1618,6 +2164,7 @@ def _assert_allowed_outbound_url(url: str) -> None:
         ("overpass-api.de", "/api/interpreter"),
         ("maps.mail.ru", "/osm/tools/overpass/api/interpreter"),
         ("davidmegginson.github.io", "/ourairports-data/airports.csv"),
+        ("api.transitous.org", "/api/v5/plan"),
     }
     if (host, parsed.path) in exact_paths:
         return

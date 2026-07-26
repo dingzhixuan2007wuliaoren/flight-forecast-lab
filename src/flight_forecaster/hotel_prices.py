@@ -38,6 +38,12 @@ from flight_forecaster.availability import (
 )
 
 HotelPriceStatus = Literal["available", "no_results"]
+HotelDetailEvidenceStatus = Literal[
+    "not_requested",
+    "available",
+    "source_not_provided",
+    "temporarily_unavailable",
+]
 HotelPriceErrorCode = Literal[
     "validation_error",
     "not_configured",
@@ -97,6 +103,143 @@ class HotelPriceValidationError(HotelPriceError):
 
 
 @dataclass(frozen=True, slots=True)
+class HotelRoomRate:
+    """One source-backed room/rate row returned for the exact stay."""
+
+    room_name: str
+    source: str
+    nightly_price: float | None
+    total_price: float | None
+    nightly_before_taxes: float | None
+    total_before_taxes: float | None
+    currency: Literal["USD"]
+    guests: int | None
+    official: bool | None
+    free_cancellation: bool | None
+    free_cancellation_until: str | None
+    breakfast_included: bool | None
+    beds: tuple[str, ...]
+    inclusions: tuple[str, ...]
+    booking_url: str | None
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "beds", tuple(self.beds))
+        object.__setattr__(self, "inclusions", tuple(self.inclusions))
+        object.__setattr__(self, "observed_at", _as_utc(self.observed_at))
+        if _safe_text(self.room_name, 200) is None or _safe_text(self.source, 160) is None:
+            raise ValueError("hotel room identity is invalid")
+        values = (
+            self.nightly_price,
+            self.total_price,
+            self.nightly_before_taxes,
+            self.total_before_taxes,
+        )
+        if all(value is None for value in values):
+            raise ValueError("hotel room rate requires price evidence")
+        if any(
+            value is not None and (not math.isfinite(value) or value <= 0)
+            for value in values
+        ):
+            raise ValueError("hotel room price is invalid")
+        if self.currency != _SAFE_CURRENCY:
+            raise ValueError("hotel room currency is invalid")
+        if self.guests is not None and not 1 <= self.guests <= 50:
+            raise ValueError("hotel room guest count is invalid")
+        if self.booking_url is not None and _safe_public_url(self.booking_url) is None:
+            raise ValueError("hotel room booking URL is invalid")
+        if len(self.beds) > 12 or any(_safe_text(item, 100) is None for item in self.beds):
+            raise ValueError("hotel room beds are invalid")
+        if len(self.inclusions) > 20 or any(
+            _safe_text(item, 160) is None for item in self.inclusions
+        ):
+            raise ValueError("hotel room inclusions are invalid")
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "room_name": self.room_name,
+            "source": self.source,
+            "nightly_price": self.nightly_price,
+            "total_price": self.total_price,
+            "nightly_before_taxes": self.nightly_before_taxes,
+            "total_before_taxes": self.total_before_taxes,
+            "currency": self.currency,
+            "guests": self.guests,
+            "official": self.official,
+            "free_cancellation": self.free_cancellation,
+            "free_cancellation_until": self.free_cancellation_until,
+            "breakfast_included": self.breakfast_included,
+            "beds": list(self.beds),
+            "inclusions": list(self.inclusions),
+            "booking_url": self.booking_url,
+            "observed_at": self.observed_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HotelReviewSource:
+    """Rating and optional review excerpt tied to one named review platform."""
+
+    source: str
+    score: float | None
+    max_score: float | None
+    review_count: int | None
+    sample_author: str | None
+    sample_date: str | None
+    sample_score: float | None
+    sample_max_score: float | None
+    sample_comment: str | None
+    review_url: str | None
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observed_at", _as_utc(self.observed_at))
+        if _safe_text(self.source, 160) is None:
+            raise ValueError("hotel review source is invalid")
+        if (self.score is None) != (self.max_score is None):
+            raise ValueError("hotel review rating is incomplete")
+        if self.score is not None and (
+            not math.isfinite(self.score)
+            or not math.isfinite(self.max_score or 0)
+            or self.max_score is None
+            or self.max_score <= 0
+            or self.score < 0
+            or self.score > self.max_score
+        ):
+            raise ValueError("hotel review rating is invalid")
+        if self.review_count is not None and self.review_count < 0:
+            raise ValueError("hotel review count is invalid")
+        if (self.sample_score is None) != (self.sample_max_score is None):
+            raise ValueError("hotel sample review rating is incomplete")
+        if self.sample_score is not None and (
+            not math.isfinite(self.sample_score)
+            or not math.isfinite(self.sample_max_score or 0)
+            or self.sample_max_score is None
+            or self.sample_max_score <= 0
+            or self.sample_score < 0
+            or self.sample_score > self.sample_max_score
+        ):
+            raise ValueError("hotel sample review rating is invalid")
+        if self.review_url is not None and _safe_public_url(self.review_url) is None:
+            raise ValueError("hotel review URL is invalid")
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "score": self.score,
+            "max_score": self.max_score,
+            "review_count": self.review_count,
+            "sample_author": self.sample_author,
+            "sample_date": self.sample_date,
+            "sample_score": self.sample_score,
+            "sample_max_score": self.sample_max_score,
+            "sample_comment": self.sample_comment,
+            "review_url": self.review_url,
+            "observed_at": self.observed_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class HotelPriceOffer:
     """Sanitized, cache-safe price evidence for one Google Hotels property."""
 
@@ -117,10 +260,24 @@ class HotelPriceOffer:
     amenities: tuple[str, ...]
     website_url: str
     observed_at: datetime
+    room_rates: tuple[HotelRoomRate, ...] = ()
+    review_sources: tuple[HotelReviewSource, ...] = ()
+    room_rates_status: HotelDetailEvidenceStatus = "not_requested"
+    review_sources_status: HotelDetailEvidenceStatus = "not_requested"
+    detail_observed_at: datetime | None = None
+    detail_fetch_complete: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "amenities", tuple(self.amenities))
+        object.__setattr__(self, "room_rates", tuple(self.room_rates))
+        object.__setattr__(self, "review_sources", tuple(self.review_sources))
         object.__setattr__(self, "observed_at", _as_utc(self.observed_at))
+        if self.detail_observed_at is not None:
+            object.__setattr__(
+                self,
+                "detail_observed_at",
+                _as_utc(self.detail_observed_at),
+            )
         if not _HOTEL_ID_PATTERN.fullmatch(self.hotel_id):
             raise ValueError("hotel ID is invalid")
         if _safe_text(self.name, 200) is None or _safe_text(self.property_type, 80) is None:
@@ -144,6 +301,23 @@ class HotelPriceOffer:
             _safe_text(item, 100) is None for item in self.amenities
         ):
             raise ValueError("hotel amenities are invalid")
+        valid_detail_statuses = {
+            "not_requested",
+            "available",
+            "source_not_provided",
+            "temporarily_unavailable",
+        }
+        if (
+            self.room_rates_status not in valid_detail_statuses
+            or self.review_sources_status not in valid_detail_statuses
+        ):
+            raise ValueError("hotel detail evidence status is invalid")
+        if bool(self.room_rates) != (self.room_rates_status == "available"):
+            raise ValueError("hotel room evidence status is inconsistent")
+        if bool(self.review_sources) != (self.review_sources_status == "available"):
+            raise ValueError("hotel review evidence status is inconsistent")
+        if self.detail_fetch_complete and self.detail_observed_at is None:
+            raise ValueError("completed hotel detail requires an observation time")
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +338,16 @@ class HotelPriceOffer:
             "amenities": list(self.amenities),
             "website_url": self.website_url,
             "observed_at": self.observed_at.isoformat(),
+            "room_rates": [item.as_safe_dict() for item in self.room_rates],
+            "review_sources": [item.as_safe_dict() for item in self.review_sources],
+            "room_rates_status": self.room_rates_status,
+            "review_sources_status": self.review_sources_status,
+            "detail_observed_at": (
+                self.detail_observed_at.isoformat()
+                if self.detail_observed_at is not None
+                else None
+            ),
+            "detail_fetch_complete": self.detail_fetch_complete,
         }
 
 
@@ -404,6 +588,52 @@ class _HotelCache:
             if connection is not None:
                 connection.close()
 
+    def store_detail(
+        self,
+        query_key: str,
+        offer: HotelPriceOffer,
+        *,
+        expires_at: datetime,
+    ) -> None:
+        """Replace one sanitized detail row without retaining provider tokens."""
+
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._connect(create=True)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO serpapi_hotel_detail_cache(
+                    query_key, hotel_id, observed_at, expires_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(query_key, hotel_id) DO UPDATE SET
+                    observed_at = excluded.observed_at,
+                    expires_at = excluded.expires_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    query_key,
+                    offer.hotel_id,
+                    offer.observed_at.isoformat(),
+                    expires_at.isoformat(),
+                    _safe_cache_json(offer.as_safe_dict()),
+                ),
+            )
+            connection.commit()
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise HotelPriceError(
+                "quota_ledger_unavailable",
+                "The local hotel detail cache is unavailable.",
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
     def store_failure(
         self,
         query_key: str,
@@ -546,6 +776,10 @@ class SerpApiHotelPriceProvider:
         self._sleep_provider = sleep_provider or sleep
         self._ledger = _UsageLedger(self._usage_path)
         self._cache = _HotelCache(self._usage_path)
+        # Property tokens are opaque provider identifiers.  They are kept only
+        # in this bounded process-local map so a deliberate detail click can
+        # retrieve exact-property evidence without writing tokens to disk.
+        self._property_tokens: dict[tuple[str, str], str] = {}
 
     @property
     def configured(self) -> bool:
@@ -565,6 +799,7 @@ class SerpApiHotelPriceProvider:
         adults: int,
         language: str,
         explicit: bool = False,
+        refresh_local_cache: bool = False,
     ) -> HotelPriceSearchResult:
         """Fetch prices only after an explicit user action.
 
@@ -585,7 +820,7 @@ class SerpApiHotelPriceProvider:
         if explicit is not True:
             raise HotelPriceValidationError("Hotel prices require an explicit user request.")
         cached = self._cache.load_search(stay.cache_key, now=now)
-        if cached is not None:
+        if cached is not None and refresh_local_cache is not True:
             return replace(
                 cached,
                 cache_hit=True,
@@ -648,6 +883,7 @@ class SerpApiHotelPriceProvider:
                     )
             _validate_search_echo(payload, stay)
             offers = _parse_offers(payload, stay, observed_at)
+            self._remember_property_tokens(payload, stay, offers)
             raw_properties = payload.get("properties")
             if (
                 isinstance(raw_properties, list)
@@ -697,8 +933,14 @@ class SerpApiHotelPriceProvider:
         *,
         adults: int,
         language: str,
+        explicit: bool = False,
     ) -> HotelPriceOffer | None:
-        """Read an exact-stay hotel detail from the sanitized cache only."""
+        """Read or explicitly enrich an exact-stay hotel from the safe cache.
+
+        The default remains a zero-network cache lookup.  ``explicit=True`` is
+        reserved for a user's hotel-detail action and may consume one shared
+        SerpApi search credit.  The opaque property token is never persisted.
+        """
 
         now = self._now()
         if not isinstance(hotel_id, str) or not _HOTEL_ID_PATTERN.fullmatch(hotel_id):
@@ -712,7 +954,211 @@ class SerpApiHotelPriceProvider:
             language=language,
             today=now.date(),
         )
-        return self._cache.load_detail(stay.cache_key, hotel_id, now=now)
+        cached = self._cache.load_detail(stay.cache_key, hotel_id, now=now)
+        if cached is None or explicit is not True:
+            return cached
+        if cached.detail_fetch_complete:
+            return cached
+        token = self._property_tokens.get((stay.cache_key, hotel_id))
+        if token is None:
+            exact_query = _exact_property_query(cached.name, stay.city_query)
+            if exact_query is None:
+                return _detail_temporarily_unavailable(cached)
+            reacquired = self.search(
+                exact_query,
+                stay.destination_iata,
+                stay.check_in,
+                stay.check_out,
+                adults=stay.adults,
+                language=stay.language,
+                explicit=True,
+                refresh_local_cache=True,
+            )
+            matches = [
+                offer
+                for offer in reacquired.offers
+                if _same_hotel_identity(offer, cached)
+            ]
+            if len(matches) != 1:
+                return _detail_temporarily_unavailable(cached)
+            exact_stay = _validate_stay(
+                exact_query,
+                stay.destination_iata,
+                stay.check_in,
+                stay.check_out,
+                adults=stay.adults,
+                language=stay.language,
+                today=now.date(),
+            )
+            token = self._property_tokens.get(
+                (exact_stay.cache_key, matches[0].hotel_id)
+            )
+            if token is None:
+                return _detail_temporarily_unavailable(cached)
+            self._property_tokens[(stay.cache_key, hotel_id)] = token
+        if not self.configured:
+            raise HotelPriceError(
+                "not_configured",
+                "Live hotel details are not configured.",
+            )
+        account = self._account_quota()
+        self._reserve_one(account)
+        params: dict[str, Any] = {
+            "engine": "google_hotels",
+            "property_token": token,
+            "check_in_date": stay.check_in.isoformat(),
+            "check_out_date": stay.check_out.isoformat(),
+            "adults": stay.adults,
+            "currency": _SAFE_CURRENCY,
+            "hl": stay.language,
+            "api_key": self._api_key,
+        }
+        payload, observed_at = self._request_json(
+            SERPAPI_SEARCH_URL,
+            params=params,
+            account_request=False,
+            allow_pending=True,
+        )
+        if _search_status(payload) in {"processing", "queued"}:
+            payload, observed_at = self._poll_pending_search(payload)
+        if _search_status(payload) in {"processing", "queued"}:
+            return _detail_temporarily_unavailable(cached)
+        _validate_detail_echo(payload, stay, token)
+        detail_row = _verified_property_detail(payload, token, cached)
+        room_rates = _parse_room_rates(detail_row, observed_at)
+        review_sources = _parse_review_sources(detail_row, observed_at)
+        enriched = replace(
+            cached,
+            description=_safe_text(detail_row.get("description"), 1_200)
+            or cached.description,
+            rating=_bounded_float(detail_row.get("overall_rating"), 0, 5)
+            if detail_row.get("overall_rating") is not None
+            else cached.rating,
+            review_count=_nonnegative_int(detail_row.get("reviews"))
+            if detail_row.get("reviews") is not None
+            else cached.review_count,
+            amenities=(
+                _safe_text_list(
+                    detail_row.get("amenities"),
+                    limit=40,
+                    item_limit=100,
+                )
+                if isinstance(detail_row.get("amenities"), list)
+                else cached.amenities
+            ),
+            room_rates=room_rates,
+            review_sources=review_sources,
+            room_rates_status="available" if room_rates else "source_not_provided",
+            review_sources_status=(
+                "available" if review_sources else "source_not_provided"
+            ),
+            detail_observed_at=observed_at,
+            detail_fetch_complete=True,
+        )
+        self._cache.store_detail(
+            stay.cache_key,
+            enriched,
+            expires_at=observed_at + timedelta(seconds=HOTEL_PRICE_CACHE_TTL_SECONDS),
+        )
+        return enriched
+
+    def exact_property_detail(
+        self,
+        hotel_names: tuple[str, ...],
+        latitude: float,
+        longitude: float,
+        city_query: str,
+        destination_iata: str,
+        check_in: date | str,
+        check_out: date | str,
+        *,
+        adults: int,
+        language: str,
+        explicit: bool = False,
+    ) -> HotelPriceOffer | None:
+        """Resolve an OSM hotel only with exact-name and tight-coordinate proof.
+
+        This deliberately refuses fuzzy matching.  A successful explicit call
+        can use one property search plus one property-detail search, both
+        protected by the same SerpApi quota ledger as flight searches.
+        """
+
+        names = tuple(
+            dict.fromkeys(
+                text
+                for text in (
+                    _safe_text(item, 200)
+                    for item in tuple(hotel_names)[:4]
+                )
+                if text is not None
+            )
+        )
+        expected_names = {_normalized_hotel_name(item) for item in names}
+        expected_latitude = _coordinate(latitude, -90, 90)
+        expected_longitude = _coordinate(longitude, -180, 180)
+        city = _safe_text(city_query, 160)
+        if (
+            not expected_names
+            or expected_latitude is None
+            or expected_longitude is None
+            or city is None
+        ):
+            raise HotelPriceValidationError("Exact hotel identity is invalid.")
+        exact_query = _exact_property_query(names[0], city)
+        if exact_query is None:
+            raise HotelPriceValidationError("Exact hotel query is invalid.")
+        result = self.search(
+            exact_query,
+            destination_iata,
+            check_in,
+            check_out,
+            adults=adults,
+            language=language,
+            explicit=explicit,
+        )
+        matches = [
+            offer
+            for offer in result.offers
+            if _normalized_hotel_name(offer.name) in expected_names
+            and abs(offer.latitude - expected_latitude) <= 0.0015
+            and abs(offer.longitude - expected_longitude) <= 0.0015
+        ]
+        if len(matches) != 1:
+            return None
+        return self.detail(
+            matches[0].hotel_id,
+            exact_query,
+            destination_iata,
+            check_in,
+            check_out,
+            adults=adults,
+            language=language,
+            explicit=explicit,
+        )
+
+    def _remember_property_tokens(
+        self,
+        payload: dict[str, Any],
+        stay: _Stay,
+        offers: tuple[HotelPriceOffer, ...],
+    ) -> None:
+        properties = payload.get("properties")
+        if properties is None:
+            properties = [payload] if _safe_top_level_property(payload) else []
+        elif not isinstance(properties, list):
+            return
+        known_ids = {offer.hotel_id for offer in offers}
+        for row in properties[:HOTEL_PRICE_MAX_RESULTS]:
+            if not isinstance(row, dict):
+                continue
+            token = _safe_text(row.get("property_token"), 2_000)
+            if token is None:
+                continue
+            hotel_id = _hotel_id(row, stay)
+            if hotel_id in known_ids:
+                self._property_tokens[(stay.cache_key, hotel_id)] = token
+        while len(self._property_tokens) > 300:
+            del self._property_tokens[next(iter(self._property_tokens))]
 
     def _account_quota(self) -> _AccountQuota:
         payload, received_at = self._request_json(
@@ -985,6 +1431,32 @@ def _validate_search_echo(payload: dict[str, Any], stay: _Stay) -> None:
         )
 
 
+def _validate_detail_echo(
+    payload: dict[str, Any],
+    stay: _Stay,
+    property_token: str,
+) -> None:
+    parameters = payload.get("search_parameters")
+    if not isinstance(parameters, dict):
+        raise HotelPriceError(
+            "response_invalid",
+            "The hotel detail provider did not confirm the stay parameters.",
+        )
+    checks = (
+        str(parameters.get("engine", "")).strip() == "google_hotels",
+        _safe_text(parameters.get("property_token"), 2_000) == property_token,
+        str(parameters.get("check_in_date", "")).strip() == stay.check_in.isoformat(),
+        str(parameters.get("check_out_date", "")).strip() == stay.check_out.isoformat(),
+        _positive_int(parameters.get("adults")) == stay.adults,
+        str(parameters.get("currency", "")).strip().upper() == _SAFE_CURRENCY,
+    )
+    if not all(checks):
+        raise HotelPriceError(
+            "response_invalid",
+            "The hotel detail provider returned a mismatched stay response.",
+        )
+
+
 def _parse_offers(
     payload: dict[str, Any],
     stay: _Stay,
@@ -992,7 +1464,7 @@ def _parse_offers(
 ) -> tuple[HotelPriceOffer, ...]:
     properties = payload.get("properties")
     if properties is None:
-        return ()
+        properties = [payload] if _safe_top_level_property(payload) else []
     if not isinstance(properties, list):
         raise HotelPriceError(
             "response_invalid",
@@ -1022,6 +1494,14 @@ def _safe_property_identity(row: Any) -> bool:
     )
 
 
+def _safe_top_level_property(payload: Any) -> bool:
+    return bool(
+        _safe_property_identity(payload)
+        and isinstance(payload, dict)
+        and _safe_text(payload.get("property_token"), 2_000)
+    )
+
+
 def _parse_offer(
     row: Any,
     stay: _Stay,
@@ -1038,15 +1518,7 @@ def _parse_offer(
     longitude = _coordinate(coordinates.get("longitude"), -180, 180)
     if latitude is None or longitude is None:
         return None
-    token = _safe_text(row.get("property_token"), 2_000)
-    identity = token or json.dumps(
-        [stay.destination_iata, name.casefold(), property_type.casefold(), latitude, longitude],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    hotel_id = "gh_" + hashlib.sha256(
-        ("serpapi-google-hotels-v1\0" + identity).encode("utf-8")
-    ).hexdigest()[:32]
+    hotel_id = _hotel_id(row, stay)
     selected_price = _selected_price(row)
     if selected_price is not None:
         # A price source is an indivisible evidence row. Never fill a missing
@@ -1071,6 +1543,8 @@ def _parse_offer(
     description = _safe_text(row.get("description"), 1_200)
     amenities = _safe_text_list(row.get("amenities"), limit=40, item_limit=100)
     public_link = _safe_public_url(row.get("link")) or _google_hotels_url(name, stay.city_query)
+    room_rates = _parse_room_rates(row, observed_at)
+    review_sources = _parse_review_sources(row, observed_at)
     return HotelPriceOffer(
         hotel_id=hotel_id,
         name=name,
@@ -1089,7 +1563,44 @@ def _parse_offer(
         amenities=amenities,
         website_url=public_link,
         observed_at=observed_at,
+        room_rates=room_rates,
+        review_sources=review_sources,
+        room_rates_status="available" if room_rates else "not_requested",
+        review_sources_status="available" if review_sources else "not_requested",
+        detail_observed_at=None,
+        detail_fetch_complete=False,
     )
+
+
+def _hotel_id(row: dict[str, Any], stay: _Stay) -> str:
+    name = _safe_text(row.get("name"), 200) or ""
+    property_type = _safe_text(row.get("type"), 80) or ""
+    coordinates = row.get("gps_coordinates")
+    latitude = (
+        _coordinate(coordinates.get("latitude"), -90, 90)
+        if isinstance(coordinates, dict)
+        else None
+    )
+    longitude = (
+        _coordinate(coordinates.get("longitude"), -180, 180)
+        if isinstance(coordinates, dict)
+        else None
+    )
+    token = _safe_text(row.get("property_token"), 2_000)
+    identity = token or json.dumps(
+        [
+            stay.destination_iata,
+            name.casefold(),
+            property_type.casefold(),
+            latitude,
+            longitude,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "gh_" + hashlib.sha256(
+        ("serpapi-google-hotels-v1\0" + identity).encode("utf-8")
+    ).hexdigest()[:32]
 
 
 def _selected_price(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -1113,6 +1624,337 @@ def _selected_price(row: dict[str, Any]) -> dict[str, Any] | None:
             _nested_price(item, "rate_per_night") or math.inf,
         ),
         default=None,
+    )
+
+
+def _verified_property_detail(
+    payload: dict[str, Any],
+    expected_token: str,
+    expected_offer: HotelPriceOffer,
+) -> dict[str, Any]:
+    """Return only a property-detail row that proves the same hotel identity."""
+
+    candidates: list[dict[str, Any]] = []
+    if isinstance(payload.get("property"), dict):
+        candidates.append(payload["property"])
+    if isinstance(payload.get("properties"), list):
+        candidates.extend(
+            item for item in payload["properties"][:10] if isinstance(item, dict)
+        )
+    if _safe_text(payload.get("name"), 200) is not None:
+        candidates.append(payload)
+    expected_name = _normalized_hotel_name(expected_offer.name)
+    for row in candidates:
+        if _safe_text(row.get("property_token"), 2_000) != expected_token:
+            continue
+        if _normalized_hotel_name(_safe_text(row.get("name"), 200) or "") != expected_name:
+            continue
+        coordinates = row.get("gps_coordinates")
+        if not isinstance(coordinates, dict):
+            continue
+        latitude = _coordinate(coordinates.get("latitude"), -90, 90)
+        longitude = _coordinate(coordinates.get("longitude"), -180, 180)
+        if latitude is None or longitude is None:
+            continue
+        if abs(latitude - expected_offer.latitude) > 0.0015:
+            continue
+        if abs(longitude - expected_offer.longitude) > 0.0015:
+            continue
+        return row
+    raise HotelPriceError(
+        "response_invalid",
+        "The hotel detail provider did not prove the same property identity.",
+    )
+
+
+def _parse_room_rates(
+    row: dict[str, Any],
+    observed_at: datetime,
+) -> tuple[HotelRoomRate, ...]:
+    featured = row.get("featured_prices")
+    if not isinstance(featured, list):
+        return ()
+    deduplicated: dict[tuple[Any, ...], HotelRoomRate] = {}
+    for seller in featured[:20]:
+        if not isinstance(seller, dict):
+            continue
+        source = _safe_text(seller.get("source"), 160)
+        rooms = seller.get("rooms")
+        if source is None or not isinstance(rooms, list):
+            continue
+        seller_link = _safe_public_url(seller.get("link"))
+        official = _optional_bool(seller.get("official"))
+        for room in rooms[:30]:
+            if not isinstance(room, dict):
+                continue
+            room_name = _safe_text(room.get("name"), 200)
+            if room_name is None:
+                continue
+            room_link = _safe_public_url(room.get("link")) or seller_link
+            raw_rates = room.get("rates")
+            nested_rates = (
+                [item for item in raw_rates[:20] if isinstance(item, dict)]
+                if isinstance(raw_rates, list)
+                else []
+            )
+            priced_nested_rates = [
+                item
+                for item in nested_rates
+                if any(
+                    value is not None
+                    for value in (
+                        _nested_price(item, "rate_per_night"),
+                        _nested_price(item, "total_rate"),
+                        _nested_before_taxes(item, "rate_per_night"),
+                        _nested_before_taxes(item, "total_rate"),
+                    )
+                )
+            ]
+            # A room-level amount is a separate aggregate. Never attach it to
+            # a nested rate's cancellation/breakfast terms when that rate did
+            # not return its own price evidence.
+            rate_rows = priced_nested_rates or [room]
+            for rate in rate_rows:
+                nightly = _nested_price(rate, "rate_per_night")
+                total = _nested_price(rate, "total_rate")
+                nightly_before = _nested_before_taxes(rate, "rate_per_night")
+                total_before = _nested_before_taxes(rate, "total_rate")
+                if all(
+                    value is None
+                    for value in (nightly, total, nightly_before, total_before)
+                ):
+                    continue
+                guests = (
+                    _bounded_positive_int(rate.get("num_guests"), 50)
+                    or _bounded_positive_int(room.get("num_guests"), 50)
+                    or _bounded_positive_int(seller.get("num_guests"), 50)
+                )
+                cancellation_date = _safe_text(
+                    rate.get("free_cancellation_until_date"),
+                    80,
+                )
+                cancellation_time = _safe_text(
+                    rate.get("free_cancellation_until_time"),
+                    80,
+                )
+                cancellation_until = " ".join(
+                    item for item in (cancellation_date, cancellation_time) if item
+                ) or None
+                beds = _parse_beds(rate.get("beds"))
+                inclusions = _safe_text_list(
+                    rate.get("inclusions"),
+                    limit=20,
+                    item_limit=160,
+                )
+                booking_url = _safe_public_url(rate.get("link")) or room_link
+                parsed = HotelRoomRate(
+                    room_name=room_name,
+                    source=source,
+                    nightly_price=nightly,
+                    total_price=total,
+                    nightly_before_taxes=nightly_before,
+                    total_before_taxes=total_before,
+                    currency=_SAFE_CURRENCY,
+                    guests=guests,
+                    official=official,
+                    free_cancellation=_optional_bool(rate.get("free_cancellation")),
+                    free_cancellation_until=cancellation_until,
+                    breakfast_included=_optional_bool(rate.get("breakfast_included")),
+                    beds=beds,
+                    inclusions=inclusions,
+                    booking_url=booking_url,
+                    observed_at=observed_at,
+                )
+                key = (
+                    parsed.source.casefold(),
+                    parsed.room_name.casefold(),
+                    parsed.nightly_price,
+                    parsed.total_price,
+                    parsed.guests,
+                    parsed.free_cancellation,
+                    parsed.breakfast_included,
+                )
+                deduplicated[key] = parsed
+    return tuple(
+        sorted(
+            deduplicated.values(),
+            key=lambda item: (
+                item.room_name.casefold(),
+                item.total_price or math.inf,
+                item.nightly_price or math.inf,
+                item.source.casefold(),
+            ),
+        )[:120]
+    )
+
+
+def _parse_review_sources(
+    row: dict[str, Any],
+    observed_at: datetime,
+) -> tuple[HotelReviewSource, ...]:
+    sources: list[HotelReviewSource] = []
+    google_score = _bounded_float(row.get("overall_rating"), 0, 5)
+    google_count = _nonnegative_int(row.get("reviews"))
+    if google_score is not None or google_count is not None:
+        sources.append(
+            HotelReviewSource(
+                source="Google",
+                score=google_score,
+                max_score=5.0 if google_score is not None else None,
+                review_count=google_count,
+                sample_author=None,
+                sample_date=None,
+                sample_score=None,
+                sample_max_score=None,
+                sample_comment=None,
+                review_url=None,
+                observed_at=observed_at,
+            )
+        )
+    other_reviews = row.get("other_reviews")
+    if not isinstance(other_reviews, list):
+        return tuple(sources)
+    for item in other_reviews[:20]:
+        if not isinstance(item, dict):
+            continue
+        source = _safe_text(item.get("source"), 160)
+        if source is None or source.casefold() == "google":
+            continue
+        source_rating = item.get("source_rating")
+        score = (
+            _nonnegative_float(source_rating.get("score"))
+            if isinstance(source_rating, dict)
+            else None
+        )
+        max_score = (
+            _positive_float(source_rating.get("max_score"))
+            if isinstance(source_rating, dict)
+            else None
+        )
+        if score is None or max_score is None or score > max_score or max_score > 100:
+            score = None
+            max_score = None
+        user_review = item.get("user_review")
+        if not isinstance(user_review, dict):
+            user_review = {}
+        sample_rating = user_review.get("rating")
+        sample_score = (
+            _nonnegative_float(sample_rating.get("score"))
+            if isinstance(sample_rating, dict)
+            else None
+        )
+        sample_max = (
+            _positive_float(sample_rating.get("max_score"))
+            if isinstance(sample_rating, dict)
+            else None
+        )
+        if (
+            sample_score is None
+            or sample_max is None
+            or sample_score > sample_max
+            or sample_max > 100
+        ):
+            sample_score = None
+            sample_max = None
+        comment = _safe_text(user_review.get("comment"), 800)
+        review_count = _nonnegative_int(item.get("reviews"))
+        if score is None and review_count is None and comment is None:
+            continue
+        sources.append(
+            HotelReviewSource(
+                source=source,
+                score=score,
+                max_score=max_score,
+                review_count=review_count,
+                sample_author=_safe_text(user_review.get("username"), 160),
+                sample_date=_safe_text(user_review.get("date"), 100),
+                sample_score=sample_score,
+                sample_max_score=sample_max,
+                sample_comment=comment,
+                review_url=_safe_public_url(user_review.get("link")),
+                observed_at=observed_at,
+            )
+        )
+    deduplicated: dict[str, HotelReviewSource] = {}
+    for item in sources:
+        current = deduplicated.get(item.source.casefold())
+        if current is None or _review_evidence_rank(item) > _review_evidence_rank(current):
+            deduplicated[item.source.casefold()] = item
+    return tuple(deduplicated.values())
+
+
+def _parse_beds(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    beds: list[str] = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        bed_type = _safe_text(item.get("type"), 80)
+        count = _bounded_positive_int(item.get("count"), 20)
+        if bed_type is None:
+            continue
+        beds.append(f"{count} × {bed_type}" if count is not None else bed_type)
+    return tuple(dict.fromkeys(beds))
+
+
+def _nested_before_taxes(container: dict[str, Any], key: str) -> float | None:
+    value = container.get(key)
+    if not isinstance(value, dict):
+        return None
+    return _positive_float(value.get("extracted_before_taxes_fees"))
+
+
+def _review_evidence_rank(item: HotelReviewSource) -> tuple[int, int, int]:
+    return (
+        int(item.sample_comment is not None),
+        int(item.score is not None),
+        item.review_count or 0,
+    )
+
+
+def _normalized_hotel_name(value: str) -> str:
+    return " ".join(re.sub(r"[^\w]+", " ", value.casefold()).split())
+
+
+def _exact_property_query(name: str, city_query: str) -> str | None:
+    hotel_name = _safe_text(name, 120)
+    city = _safe_text(city_query, 120)
+    if hotel_name is None or city is None:
+        return None
+    if city.casefold() == hotel_name.casefold() or city.casefold().startswith(
+        f"{hotel_name.casefold()},"
+    ):
+        return city
+    combined = f"{hotel_name}, {city}"
+    return combined if len(combined) <= 120 else hotel_name
+
+
+def _same_hotel_identity(
+    candidate: HotelPriceOffer,
+    expected: HotelPriceOffer,
+) -> bool:
+    return bool(
+        _normalized_hotel_name(candidate.name)
+        == _normalized_hotel_name(expected.name)
+        and abs(candidate.latitude - expected.latitude) <= 0.0015
+        and abs(candidate.longitude - expected.longitude) <= 0.0015
+    )
+
+
+def _detail_temporarily_unavailable(offer: HotelPriceOffer) -> HotelPriceOffer:
+    return replace(
+        offer,
+        room_rates_status=(
+            offer.room_rates_status
+            if offer.room_rates_status != "not_requested"
+            else "temporarily_unavailable"
+        ),
+        review_sources_status=(
+            offer.review_sources_status
+            if offer.review_sources_status != "not_requested"
+            else "temporarily_unavailable"
+        ),
     )
 
 
@@ -1390,6 +2232,89 @@ def _offer_from_dict(payload: Any) -> HotelPriceOffer:
         amenities=tuple(payload.get("amenities") or ()),
         website_url=str(payload.get("website_url", "")),
         observed_at=_datetime_value(payload.get("observed_at")),
+        room_rates=tuple(
+            _room_rate_from_dict(item)
+            for item in (payload.get("room_rates") or ())
+        ),
+        review_sources=tuple(
+            _review_source_from_dict(item)
+            for item in (payload.get("review_sources") or ())
+        ),
+        room_rates_status=str(payload.get("room_rates_status", "not_requested")),
+        review_sources_status=str(
+            payload.get("review_sources_status", "not_requested")
+        ),
+        detail_observed_at=(
+            _datetime_value(payload.get("detail_observed_at"))
+            if payload.get("detail_observed_at") is not None
+            else None
+        ),
+        detail_fetch_complete=payload.get("detail_fetch_complete") is True,
+    )
+
+
+def _room_rate_from_dict(payload: Any) -> HotelRoomRate:
+    if not isinstance(payload, dict):
+        raise ValueError("cached hotel room rate is invalid")
+    return HotelRoomRate(
+        room_name=str(payload.get("room_name", "")),
+        source=str(payload.get("source", "")),
+        nightly_price=_optional_float(payload.get("nightly_price")),
+        total_price=_optional_float(payload.get("total_price")),
+        nightly_before_taxes=_optional_float(payload.get("nightly_before_taxes")),
+        total_before_taxes=_optional_float(payload.get("total_before_taxes")),
+        currency=str(payload.get("currency", "")),
+        guests=_optional_int(payload.get("guests")),
+        official=_optional_bool(payload.get("official")),
+        free_cancellation=_optional_bool(payload.get("free_cancellation")),
+        free_cancellation_until=(
+            str(payload["free_cancellation_until"])
+            if payload.get("free_cancellation_until") is not None
+            else None
+        ),
+        breakfast_included=_optional_bool(payload.get("breakfast_included")),
+        beds=tuple(payload.get("beds") or ()),
+        inclusions=tuple(payload.get("inclusions") or ()),
+        booking_url=(
+            str(payload["booking_url"])
+            if payload.get("booking_url") is not None
+            else None
+        ),
+        observed_at=_datetime_value(payload.get("observed_at")),
+    )
+
+
+def _review_source_from_dict(payload: Any) -> HotelReviewSource:
+    if not isinstance(payload, dict):
+        raise ValueError("cached hotel review source is invalid")
+    return HotelReviewSource(
+        source=str(payload.get("source", "")),
+        score=_optional_float(payload.get("score")),
+        max_score=_optional_float(payload.get("max_score")),
+        review_count=_optional_int(payload.get("review_count")),
+        sample_author=(
+            str(payload["sample_author"])
+            if payload.get("sample_author") is not None
+            else None
+        ),
+        sample_date=(
+            str(payload["sample_date"])
+            if payload.get("sample_date") is not None
+            else None
+        ),
+        sample_score=_optional_float(payload.get("sample_score")),
+        sample_max_score=_optional_float(payload.get("sample_max_score")),
+        sample_comment=(
+            str(payload["sample_comment"])
+            if payload.get("sample_comment") is not None
+            else None
+        ),
+        review_url=(
+            str(payload["review_url"])
+            if payload.get("review_url") is not None
+            else None
+        ),
+        observed_at=_datetime_value(payload.get("observed_at")),
     )
 
 
@@ -1441,6 +2366,11 @@ def _positive_float(value: Any) -> float | None:
     return round(number, 2) if number is not None and number > 0 else None
 
 
+def _nonnegative_float(value: Any) -> float | None:
+    number = _optional_float(value)
+    return round(number, 2) if number is not None and number >= 0 else None
+
+
 def _bounded_float(value: Any, low: float, high: float) -> float | None:
     number = _optional_float(value)
     return round(number, 2) if number is not None and low <= number <= high else None
@@ -1464,6 +2394,11 @@ def _nonnegative_int(value: Any) -> int | None:
 def _positive_int(value: Any) -> int | None:
     parsed = _optional_int(value)
     return parsed if parsed is not None and parsed > 0 else None
+
+
+def _bounded_positive_int(value: Any, high: int) -> int | None:
+    parsed = _positive_int(value)
+    return parsed if parsed is not None and parsed <= high else None
 
 
 def _optional_int(value: Any) -> int | None:

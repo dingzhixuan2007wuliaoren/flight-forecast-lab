@@ -308,26 +308,26 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
         "business",
         "first",
     }
-    assert result.calls_used == 10
+    assert result.calls_used == 12
     assert result.search_calls_used == 4
-    assert result.pricing_calls_used == 6
+    assert result.pricing_calls_used == 8
     assert result.search_monthly_limit == 250
     assert result.pricing_monthly_limit is None
-    assert result.search_monthly_used == 10
+    assert result.search_monthly_used == 12
     assert len(client.account_calls) == 1
     assert len(client.search_calls) == 4
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
     assert result.coverage_scope == "provider_returned_booking_verification_candidates"
     assert result.eligible_candidate_count == 8
-    assert result.verification_attempted_count == 6
+    assert result.verification_attempted_count == 8
     assert result.verified_candidate_count == 4
-    assert result.strictly_rejected_candidate_count == 2
+    assert result.strictly_rejected_candidate_count == 4
     assert result.provider_failed_candidate_count == 0
     assert result.search_failed_cabin_count == 0
-    assert result.quota_skipped_candidate_count == 2
+    assert result.quota_skipped_candidate_count == 0
     assert result.deduplicated_verified_count == 0
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
     assert client.account_calls[0]["timeout"] == 8.0
     for call in client.search_calls:
         assert call["params"]["type"] == 2
@@ -377,18 +377,18 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
         offer.fingerprint
     )
 
-    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 10
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 12
     assert (
         _ledger_calls(
             tmp_path / "private" / "usage.sqlite3",
             scope="hour",
             period_key=_HOUR_BUCKET_KEY,
         )
-        == 10
+        == 12
     )
 
 
-def test_booking_verification_is_bounded_but_examines_all_options_in_each_response(
+def test_booking_verification_attempts_all_candidates_and_options_in_each_response(
     tmp_path: Path,
 ) -> None:
     class _LargeResultClient(_Client):
@@ -435,17 +435,17 @@ def test_booking_verification_is_bounded_but_examines_all_options_in_each_respon
     )
 
     assert result.status == "confirmed_offers"
-    assert len(client.booking_calls) == 6
-    assert result.calls_used == 10
+    assert len(client.booking_calls) == 41
+    assert result.calls_used == 45
     assert result.eligible_candidate_count == 41
-    assert result.verification_attempted_count == 6
-    assert result.verified_candidate_count == 6
+    assert result.verification_attempted_count == 41
+    assert result.verified_candidate_count == 41
     assert result.strictly_rejected_candidate_count == 0
     assert result.provider_failed_candidate_count == 0
-    assert result.quota_skipped_candidate_count == 35
-    assert result.deduplicated_verified_count == 5
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
+    assert result.quota_skipped_candidate_count == 0
+    assert result.deduplicated_verified_count == 40
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
     assert len(result.offers) == 1
     assert result.offers[0].total_amount_usd == 199
     assert result.offers[0].booking_provider == "Seller 41"
@@ -576,13 +576,13 @@ def test_booking_endpoint_bad_request_remains_a_provider_error(tmp_path: Path) -
 
     assert result.status == "provider_error"
     assert result.offers == ()
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
     assert result.eligible_candidate_count == 8
-    assert result.verification_attempted_count == 6
-    assert result.provider_failed_candidate_count == 6
-    assert result.quota_skipped_candidate_count == 2
-    assert result.coverage_status == "quota_and_provider_incomplete"
-    assert result.quota_limit == "provider_specific"
+    assert result.verification_attempted_count == 8
+    assert result.provider_failed_candidate_count == 8
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "provider_incomplete"
+    assert result.quota_limit is None
     assert any(
         diagnostic.stage == "booking_options"
         and diagnostic.http_status == 400
@@ -680,10 +680,10 @@ def test_processing_cabin_search_polls_archive_without_resubmitting_or_using_quo
     )
 
     assert result.status == "confirmed_offers"
-    assert result.calls_used == 10
+    assert result.calls_used == 12
     assert result.archive_poll_count == 1
     assert len(client.search_calls) == 4
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
     assert len(client.archive_calls) == 1
     assert client.archive_calls[0]["params"] == {"api_key": "serpapi-key"}
     assert client.archive_calls[0]["timeout"] == 2.0
@@ -692,7 +692,7 @@ def test_processing_cabin_search_polls_archive_without_resubmitting_or_using_quo
         for diagnostic in result.diagnostics
     )
     ledger_path = tmp_path / "private" / "usage.sqlite3"
-    assert _ledger_calls(ledger_path) == 10
+    assert _ledger_calls(ledger_path) == 12
     rows = _diagnostic_rows(ledger_path)
     assert ("cabin_search", 200, "ProviderPending", search_id) in rows
     persisted = json.dumps(rows)
@@ -747,16 +747,16 @@ def test_pending_after_archive_poll_resubmits_once_then_succeeds(
     )
 
     assert result.status == "confirmed_offers"
-    assert result.calls_used == 11
+    assert result.calls_used == 13
     assert result.search_calls_used == 5
-    assert result.pricing_calls_used == 6
-    assert result.search_monthly_used == 11
+    assert result.pricing_calls_used == 8
+    assert result.search_monthly_used == 13
     assert result.archive_poll_count == 1
     assert client.economy_submissions == 2
     assert len(client.search_calls) == 5
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
     assert client.archive_calls == 1
-    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 11
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 13
 
 
 def test_queued_booking_option_polls_until_success_without_new_search(
@@ -811,10 +811,10 @@ def test_queued_booking_option_polls_until_success_without_new_search(
     ).search("YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT)
 
     assert result.status == "confirmed_offers"
-    assert result.calls_used == 10
+    assert result.calls_used == 12
     assert result.archive_poll_count == 2
     assert len(client.search_calls) == 4
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
     assert client.archive_calls == 2
 
 
@@ -846,11 +846,11 @@ def test_transient_booking_supplier_error_is_resubmitted_once_and_recovers(
     )
 
     assert result.status == "confirmed_offers"
-    assert result.calls_used == 11
+    assert result.calls_used == 13
     assert result.search_calls_used == 4
-    assert result.pricing_calls_used == 7
-    assert result.search_monthly_used == 11
-    assert len(client.booking_calls) == 7
+    assert result.pricing_calls_used == 9
+    assert result.search_monthly_used == 13
+    assert len(client.booking_calls) == 9
     assert client.target_submissions == 2
     assert result.archive_poll_count == 0
     assert any(
@@ -859,7 +859,7 @@ def test_transient_booking_supplier_error_is_resubmitted_once_and_recovers(
         and diagnostic.exception_type == "TransientProviderHttpError"
         for diagnostic in result.diagnostics
     )
-    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 11
+    assert _ledger_calls(tmp_path / "private" / "usage.sqlite3") == 13
 
 
 def test_partial_confirmed_result_exposes_booking_retry_quota_limit(
@@ -1194,12 +1194,12 @@ def test_candidate_requires_booking_token_and_booking_response_requires_evidence
     assert result.status == "no_results"
     assert result.offers == ()
     assert result.eligible_candidate_count == 8
-    assert result.verification_attempted_count == 6
+    assert result.verification_attempted_count == 8
     assert result.verified_candidate_count == 0
-    assert result.strictly_rejected_candidate_count == 6
-    assert result.quota_skipped_candidate_count == 2
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
+    assert result.strictly_rejected_candidate_count == 8
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
 
     class _NoTokenClient(_Client):
         def get(self, url: str, **kwargs: Any) -> _Response:
@@ -1409,8 +1409,8 @@ def test_billing_cycle_uses_provider_renewal_date_not_calendar_month(
     assert first_result.status == "confirmed_offers"
     assert second_result.status == "confirmed_offers"
     ledger_path = tmp_path / "private" / "usage.sqlite3"
-    assert _ledger_calls(ledger_path, period_key="renewal:2026-08-01") == 10
-    assert _ledger_calls(ledger_path, period_key="renewal:2026-09-01") == 10
+    assert _ledger_calls(ledger_path, period_key="renewal:2026-08-01") == 12
+    assert _ledger_calls(ledger_path, period_key="renewal:2026-09-01") == 12
     with sqlite3.connect(ledger_path) as connection:
         natural_month = connection.execute(
             """
@@ -1605,13 +1605,13 @@ def test_five_minute_cache_and_force_refresh(tmp_path: Path) -> None:
     assert all(offer.provider_cache_hit for offer in cached.offers)
     assert all(offer.provider_cache_age_seconds == 240 for offer in cached.offers)
     assert refreshed.cache_hit is False
-    assert refreshed.calls_used == 10
+    assert refreshed.calls_used == 12
     assert len(client.search_calls) == 8
-    assert len(client.booking_calls) == 12
+    assert len(client.booking_calls) == 16
     assert all("no_cache" not in call["params"] for call in client.search_calls[:4])
     assert all(call["params"]["no_cache"] == "true" for call in client.search_calls[4:])
-    assert all("no_cache" not in call["params"] for call in client.booking_calls[:6])
-    assert all(call["params"]["no_cache"] == "true" for call in client.booking_calls[6:])
+    assert all("no_cache" not in call["params"] for call in client.booking_calls[:8])
+    assert all(call["params"]["no_cache"] == "true" for call in client.booking_calls[8:])
 
 
 @pytest.mark.parametrize(
@@ -1665,7 +1665,7 @@ def test_explicit_cached_search_metadata_is_accepted_and_marked_exactly(
     )
 
     assert result.status == "confirmed_offers"
-    assert result.search_monthly_used == 10
+    assert result.search_monthly_used == 12
     assert result.offers
     assert all(offer.provider_cache_hit for offer in result.offers)
     assert all(offer.provider_cache_age_seconds == 0 for offer in result.offers)
@@ -1726,7 +1726,7 @@ def test_chosen_booking_option_baggage_is_parsed_conservatively(
     )
 
 
-def test_bounded_batch_keeps_cabin_fairness_then_lowest_remaining_prices(
+def test_all_candidates_are_attempted_after_cabin_fair_ordering(
     tmp_path: Path,
 ) -> None:
     class _DiverseClient(_Client):
@@ -1764,13 +1764,13 @@ def test_bounded_batch_keeps_cabin_fairness_then_lowest_remaining_prices(
     assert result.status == "confirmed_offers"
     tokens = {call["params"]["booking_token"] for call in client.booking_calls}
     assert {"booking-token-1-ua", "booking-token-1-ba"} <= tokens
-    assert "booking-token-1-high" not in tokens
-    assert len(client.booking_calls) == 6
+    assert "booking-token-1-high" in tokens
+    assert len(client.booking_calls) == 10
     assert result.eligible_candidate_count == 10
-    assert result.verification_attempted_count == 6
-    assert result.quota_skipped_candidate_count == 4
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
+    assert result.verification_attempted_count == 10
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
 
 
 def test_booking_token_verification_runs_in_parallel(tmp_path: Path) -> None:
@@ -1799,7 +1799,7 @@ def test_booking_token_verification_runs_in_parallel(tmp_path: Path) -> None:
 
     assert result.status == "confirmed_offers"
     assert len(client.thread_ids) == 6
-    assert len(client.booking_calls) == 6
+    assert len(client.booking_calls) == 8
 
 
 @pytest.mark.parametrize(

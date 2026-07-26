@@ -84,11 +84,13 @@ requires the server to include the key in the HTTPS query sent to `https://serpa
 outbound provider URLs must not be logged.
 `SERPAPI_MONTHLY_LIMIT` defaults to 250 when omitted. Values above 250 are clamped to 250, and an
 invalid or non-positive value does not disable the safety ceiling. One comparison performs the four
-SerpApi cabin searches and attempts booking-option validation for at most six eligible
-`booking_token` candidates. SearchAPI and released Ignav apply the same six-candidate cap independently
-for each source. Excess candidates are reported as partial, quota-limited coverage rather than no
-flights. Results are bounded by each source's cap, SerpApi coverage, provider
-responses, and the configured free quota; they are not a complete global list of airlines or flights.
+SerpApi cabin searches and requests booking-option validation for every eligible `booking_token`
+candidate returned by the provider. SearchAPI and released Ignav do the same independently for each
+source. The atomic ledger admits only calls covered by the account's actual remaining quota; candidates
+skipped for that reason are reported as partial, quota-limited coverage rather than no flights. Worker
+concurrency is bounded to protect providers but is not a candidate-count cap. Results remain bounded by
+provider coverage, provider responses, and the configured free quota; they are not a complete global
+list of airlines or flights.
 SearchAPI's local wall is the one-time 100-request signup allocation for the installation/account;
 it is never described or reset as a monthly allowance. Its account endpoint documents usage and
 remaining-credit fields, but the official documentation does not state that checking it is free.
@@ -96,9 +98,10 @@ The runtime therefore does not query it automatically; the independent SQLite li
 remains the conservative source until an already-captured sanitized provider snapshot is available.
 `auto` invokes every configured and released
 strict source concurrently, even after another source confirms offers. SearchAPI's four cabin searches
-run together and at most six booking-option checks are attempted per comparison. Only that bounded
-batch is reserved, so an interrupted process cannot pre-allocate the entire remaining account balance.
-Unused candidates are reported as quota-limited coverage rather than silently treated as no results.
+run together, then the ledger atomically reserves as many returned eligible booking-option checks as
+the real lifetime balance permits. All reserved candidates are processed through a bounded worker pool.
+Candidates not admitted because the balance is exhausted are reported as quota-limited coverage rather
+than silently treated as no results.
 One actually attempted source keeps its own
 provider identity; two or more attempted sources produce `strict_fare_aggregate` with non-nested
 `provider_runs` containing each source's status, coverage, quota, and sanitized diagnostics. Only
@@ -220,10 +223,11 @@ future-departure validation. AirLabs rows may show those fields only inside the 
 reference list.
 
 Strict mode uses an evidence chain, not a schedule projection. An active strict adapter searches its
-fare source for each of the four requested travel classes, then attempts at most six eligible candidates
-per source and comparison when they carry the source's opaque booking-verification token or identifier,
-subject to the remaining free quota and provider availability. SerpApi, SearchAPI, and released Ignav
-each apply this cap independently; unattempted candidates produce partial, `quota_limited` coverage.
+fare source for each of the four requested travel classes, then requests secondary validation for every
+eligible candidate carrying that source's opaque booking-verification token or identifier, subject to
+the remaining free quota and provider availability. SerpApi, SearchAPI, and released Ignav each reserve
+their own real quota independently; candidates skipped only because that quota is exhausted produce
+partial, `quota_limited` coverage.
 Where supported, `deep_search=true` and `show_hidden=true`
 broaden visible results but do not
 guarantee all airlines, flights, cabins, sellers, or private fares. Each attempted candidate is
@@ -272,8 +276,8 @@ fallback. `fare_search_metadata` also exposes `coverage_scope`,
 and `retry_quota_limited`. For `strict_fare_aggregate`, these top-level counts are the sums across
 attempted runs before cross-source deduplication, while `provider_runs` preserves every individual
 source snapshot. `coverage_status` is `complete`, `quota_limited`, `provider_incomplete`,
-`quota_and_provider_incomplete`, or `not_evaluated`; `quota_limit` identifies the provider ceiling or
-the provider-specific six-candidate comparison cap when validation is truncated. A response may therefore contain a useful partial set of
+`quota_and_provider_incomplete`, or `not_evaluated`; `quota_limit` identifies the actual provider
+account ceiling that truncated validation. A response may therefore contain a useful partial set of
 strictly verified offers while clearly reporting which eligible candidates were not verified.
 On a five-minute strict-cache hit, per-response call counts are zero while the candidate coverage
 counts describe the original search; `cache_hit=true` and the bilingual notice make that distinction
@@ -399,12 +403,25 @@ failures remain uncached; successful source-backed aggregates use the existing 2
 snapshot. It then obtains airport-to-place car, bicycle, and foot routes from the fixed HTTPS
 `routing.openstreetmap.de` endpoints. Calls are serialized to no more than one per second with a
 five-second timeout per mode. Successful routes are cached for 24 hours; transient failures are not
-cached. Distance and duration are static road-graph estimates, not live traffic. The service
-does not manufacture a public-transit duration: without a verified regional GTFS/NeTEx source, the
-transit item is `unavailable` with a bilingual coverage notice.
+cached. Distance and duration are static road-graph estimates, not live traffic.
 
-`POST /v1/destination/hotel-prices` is the only hotel-price trigger. Merely opening either guide page
-never calls SerpApi. The explicit request validates destination, check-in/check-out, adults, and USD;
+Public transit is queried through the fixed `https://api.transitous.org/api/v5/plan` endpoint with an
+identifying User-Agent and a visible link to `https://transitous.org/sources/`. The request sends an
+empty `directModes` value so MOTIS does not prune a real transit itinerary merely because direct
+walking is faster. The optional `transit_departure_at` must be timezone-aware; when absent, the
+request-time minute is used and labelled. User-supplied instants are normalized to UTC minutes for
+the provider/cache key while the page preserves the original offset-bearing input for display.
+Only a complete itinerary containing at least one transit leg can be `available`. The safe response
+contains provider times, transfers, line/operator names, endpoints, up to 100 intermediate stop names,
+and realtime flags. A genuine empty itinerary is `no_itinerary`; transport/parse failure is
+`provider_unavailable`. Neither state gets a fabricated route or duration. Successful and no-itinerary
+results are cached for 30 minutes in a 512-entry bounded cache, provider failures are retried on a
+later user request, response size is bounded, and Transitous calls are serialized to at most one per
+second. Coverage remains limited to the local GTFS feeds listed by Transitous.
+
+`POST /v1/destination/hotel-prices` and the explicit hotel-detail action are the only hotel-data
+triggers. Merely opening the base OpenStreetMap guide page never calls SerpApi. The request validates
+destination, check-in/check-out, adults, and USD;
 then it synchronizes the documented free SerpApi account counters, atomically reserves one call in
 the same `serpapi-usage.sqlite3` billing/hour buckets used by Google Flights, and calls
 `engine=google_hotels` with provider caching allowed. Only sanitized local one-hour cache hits make
@@ -412,6 +429,24 @@ no provider request and reserve no call; a provider-side cached response is stil
 reserved in the local ledger. Output excludes API keys, property tokens, SerpApi internal URLs, raw
 errors, and unsafe or credential-bearing links. Returned prices are dated provider observations; taxes,
 inventory, and final checkout price are not guaranteed.
+
+`POST /v1/destination/hotel-price-detail` requires exactly one `hotel_id` or OSM `place_id`. A cached
+Google Hotels item is enriched only by a Property Details result whose opaque token, normalized name,
+and coordinates all identify the same hotel. An OSM item first performs an exact name-and-city search
+and accepts only one tightly coordinate-matching result before loading Property Details. Fuzzy or
+ambiguous matches return no evidence. The property token is process-local and never persisted; after a
+server restart, an explicit click may perform one controlled exact-property search to reacquire it.
+Thus an uncached OSM or restart-recovery detail may reserve two calls: search plus detail.
+
+The sanitized detail cache stores only returned room/seller prices and platform review evidence.
+Room rows can include room name, seller, nightly/total and pre-tax amounts, guests, beds, inclusions,
+breakfast, cancellation terms, and a safe HTTPS booking link. A nested rate must carry its own price
+evidence before its breakfast/cancellation terms can be shown; a room-level minimum is never attached
+to a different unpriced rate. Partial evidence in a listing response does not mark the explicit
+Property Details fetch complete. Review rows can include Google and
+`other_reviews` platform name, score scale, count, one returned excerpt, and its safe source link.
+Missing data remains `source_not_provided`; quota/provider failure remains
+`temporarily_unavailable`. Neither state is filled with another hotel or model data.
 
 The shared SerpApi HTTP client refuses redirects. Credentials are sent only to the fixed allowlisted
 HTTPS account, search, or Search Archive endpoint selected before the request.
@@ -431,8 +466,8 @@ Every strict comparison offer links to `GET /details/offer`. The page calls
 `POST /v1/offer-detail` with the route, `departure_date`, opaque `offer_id`, and `force_refresh`.
 Initial load sends `force_refresh=false` and reuses the five-minute strict cache. Only the explicit
 Refresh and re-query button sends `force_refresh=true`, which reruns the four cabin searches and
-attempts at most six eligible returned candidates per strict source, subject to the remaining free quota
-and provider response. The main comparison request has a 150-second browser wait limit and retains a
+requests validation for every eligible returned candidate per strict source, subject to the remaining
+free quota and provider response. The main comparison request has a 600-second browser wait limit and retains a
 visible timeout or failure message instead of spinning indefinitely. Its response repeats the selected
 strict provider offer and returns the complete one-to-four segment itinerary, including flight numbers,
 local/UTC times, confirmed cabin, booking/fare fields when supplied, and provider-confirmed layovers. AirLabs

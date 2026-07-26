@@ -19,6 +19,10 @@ from flight_forecaster.hotel_prices import HotelPriceOffer, HotelPriceSearchResu
 NOW = datetime(2026, 7, 21, 16, 0, tzinfo=UTC)
 
 
+def _valid_transit_departure() -> datetime:
+    return (datetime.now(UTC) + timedelta(days=1)).replace(second=0, microsecond=0)
+
+
 def _city() -> DestinationCity:
     return DestinationCity(
         destination_airport="YYZ",
@@ -52,6 +56,26 @@ def _place() -> DestinationPlace:
         longitude=-79.3871,
         distance_from_city_center_km=1.3,
         source_url="https://www.openstreetmap.org/node/123",
+    )
+
+
+def _hotel_place() -> DestinationPlace:
+    return DestinationPlace(
+        place_id="osm_hotel_node_456",
+        kind="hotel",
+        category="hotel",
+        name="Verified Hotel",
+        name_en="Verified Hotel",
+        address="2 Verified Street, Toronto",
+        description="An OpenStreetMap hotel record.",
+        website="https://example.org/verified-hotel",
+        phone="+1 416 555 0100",
+        opening_hours=None,
+        stars=4,
+        latitude=43.6501,
+        longitude=-79.3801,
+        distance_from_city_center_km=0.8,
+        source_url="https://www.openstreetmap.org/node/456",
     )
 
 
@@ -99,6 +123,7 @@ def _transport(latitude: float = 43.6426, longitude: float = -79.3871) -> Destin
 class _Guide:
     def __init__(self) -> None:
         self.route_coordinates: tuple[float, float] | None = None
+        self.transit_departure_at: datetime | None = None
 
     def resolve_city(self, destination: str) -> DestinationCity:
         assert destination.upper() == "YYZ"
@@ -133,13 +158,21 @@ class _Guide:
             },
         )
 
-    def get_place_detail(self, destination: str, place_id: str) -> DestinationPlaceDetail:
+    def get_place_detail(
+        self,
+        destination: str,
+        place_id: str,
+        *,
+        transit_departure_at: datetime | None = None,
+    ) -> DestinationPlaceDetail:
         assert destination.upper() == "YYZ"
-        assert place_id == _place().place_id
+        place = _hotel_place() if place_id == _hotel_place().place_id else _place()
+        assert place_id == place.place_id
+        self.transit_departure_at = transit_departure_at
         return DestinationPlaceDetail(
             city=_city(),
-            place=_place(),
-            transport=_transport(),
+            place=place,
+            transport=_transport(place.latitude, place.longitude),
         )
 
     def get_routes(
@@ -147,9 +180,12 @@ class _Guide:
         destination: str,
         latitude: float,
         longitude: float,
+        *,
+        transit_departure_at: datetime | None = None,
     ) -> DestinationTransport:
         assert destination == "YYZ"
         self.route_coordinates = (latitude, longitude)
+        self.transit_departure_at = transit_departure_at
         return _transport(latitude, longitude)
 
 
@@ -179,6 +215,7 @@ class _HotelProvider:
     def __init__(self) -> None:
         self.explicit: bool | None = None
         self.detail_calls = 0
+        self.exact_detail_calls = 0
 
     def search(
         self,
@@ -204,6 +241,25 @@ class _HotelProvider:
     def detail(self, *args: object, **kwargs: object) -> HotelPriceOffer:
         self.detail_calls += 1
         assert args[0] == _offer().hotel_id
+        assert kwargs["explicit"] is True
+        return _offer()
+
+    def exact_property_detail(
+        self,
+        hotel_names: tuple[str, ...],
+        latitude: float,
+        longitude: float,
+        *args: object,
+        **kwargs: object,
+    ) -> HotelPriceOffer:
+        self.exact_detail_calls += 1
+        assert hotel_names == ("Verified Hotel",)
+        assert (latitude, longitude) == (
+            _hotel_place().latitude,
+            _hotel_place().longitude,
+        )
+        assert args[:2] == ("Toronto, CA", "YYZ")
+        assert kwargs["explicit"] is True
         return _offer()
 
 
@@ -224,8 +280,9 @@ def test_destination_pages_are_served() -> None:
 
 
 def test_places_and_detail_expose_source_backed_routes(monkeypatch) -> None:
-    _install_fakes(monkeypatch)
+    guide, _ = _install_fakes(monkeypatch)
     client = TestClient(app)
+    transit_departure = _valid_transit_departure()
     places = client.post(
         "/v1/destination/places",
         json={"destination": "YYZ", "kind": "attraction", "language": "zh"},
@@ -245,6 +302,7 @@ def test_places_and_detail_expose_source_backed_routes(monkeypatch) -> None:
             "kind": "attraction",
             "place_id": _place().place_id,
             "language": "en",
+            "transit_departure_at": transit_departure.isoformat(),
         },
     )
     assert detail.status_code == 200
@@ -257,6 +315,24 @@ def test_places_and_detail_expose_source_backed_routes(monkeypatch) -> None:
     ]
     assert body["routes"][3]["duration_minutes"] is None
     assert body["transit_notice"]
+    assert guide.transit_departure_at == transit_departure
+    assert "transitous_motis" in body["source"]
+
+
+def test_destination_detail_rejects_naive_transit_departure_time(monkeypatch) -> None:
+    _install_fakes(monkeypatch)
+    response = TestClient(app).post(
+        "/v1/destination/place-detail",
+        json={
+            "destination": "YYZ",
+            "kind": "attraction",
+            "place_id": _place().place_id,
+            "language": "en",
+            "transit_departure_at": "2026-07-21T13:00:00",
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_hotel_price_search_is_explicit_and_exposes_safe_quote(monkeypatch) -> None:
@@ -303,6 +379,86 @@ def test_hotel_price_detail_uses_cached_offer_coordinates_for_routes(monkeypatch
     assert body["place"]["place_id"] is None
     assert body["offer"]["hotel_id"] == _offer().hotel_id
     assert len(body["routes"]) == 4
+
+
+def test_hotel_price_detail_resolves_exact_osm_hotel_and_reuses_routes(monkeypatch) -> None:
+    guide, hotel = _install_fakes(monkeypatch)
+    transit_departure = _valid_transit_departure()
+    response = TestClient(app).post(
+        "/v1/destination/hotel-price-detail",
+        json={
+            "destination": "YYZ",
+            "place_id": _hotel_place().place_id,
+            "check_in": "2026-07-25",
+            "check_out": "2026-07-26",
+            "adults": 1,
+            "language": "en",
+            "transit_departure_at": transit_departure.isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    assert hotel.exact_detail_calls == 1
+    assert hotel.detail_calls == 0
+    assert guide.route_coordinates is None
+    assert guide.transit_departure_at == transit_departure
+    body = response.json()
+    assert body["place"]["place_id"] == _hotel_place().place_id
+    assert body["place"]["address"] == _hotel_place().address
+    assert body["place"]["phone"] == _hotel_place().phone
+    assert body["offer"]["hotel_id"] == _offer().hotel_id
+    assert "openstreetmap_overpass" in body["source"]
+
+
+def test_hotel_detail_rejects_out_of_range_transit_time_before_provider_calls(
+    monkeypatch,
+) -> None:
+    _, hotel = _install_fakes(monkeypatch)
+    invalid_departure = (datetime.now(UTC) + timedelta(days=371)).replace(
+        microsecond=0
+    )
+
+    response = TestClient(app).post(
+        "/v1/destination/hotel-price-detail",
+        json={
+            "destination": "YYZ",
+            "hotel_id": _offer().hotel_id,
+            "check_in": "2026-07-25",
+            "check_out": "2026-07-26",
+            "adults": 1,
+            "language": "en",
+            "transit_departure_at": invalid_departure.isoformat(),
+        },
+    )
+
+    assert response.status_code == 422
+    assert hotel.detail_calls == 0
+    assert hotel.exact_detail_calls == 0
+
+
+def test_hotel_price_detail_requires_exactly_one_identity(monkeypatch) -> None:
+    _install_fakes(monkeypatch)
+    client = TestClient(app)
+    common = {
+        "destination": "YYZ",
+        "check_in": "2026-07-25",
+        "check_out": "2026-07-26",
+        "adults": 1,
+        "language": "en",
+    }
+
+    assert client.post("/v1/destination/hotel-price-detail", json=common).status_code == 422
+    assert (
+        client.post(
+            "/v1/destination/hotel-price-detail",
+            json={
+                **common,
+                "hotel_id": _offer().hotel_id,
+                "place_id": _hotel_place().place_id,
+            },
+        ).status_code
+        == 422
+    )
 
 
 def test_destination_requests_fail_closed_on_invalid_cross_kind_id(monkeypatch) -> None:

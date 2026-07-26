@@ -82,6 +82,18 @@ def test_place_detail_is_source_safe_and_renders_airport_routes() -> None:
     assert '["car","bicycle","foot"]' in detail
     assert 'mode==="bike"||mode==="cycling"' in detail
     assert "transport.options" in detail
+    assert "transit.legs" in detail
+    assert "line_name" in detail
+    assert "intermediate_stops" in detail
+    assert "coverage_status" in detail
+    assert "source_url" in detail
+    assert "transit_departure_at" in detail
+    assert (
+        'transit.departure_time_basis==="user_supplied"&&transitDepartureAt'
+        ")return transitDepartureAt"
+    ) in detail
+    assert 'transitTime(leg.departure_at,leg.from_timezone)' in detail
+    assert 'transitTime(leg.arrival_at,leg.to_timezone)' in detail
     assert 'kind==="priced_hotel"' in detail
     assert "nightly_price" in detail
     assert "website_url" in detail
@@ -126,7 +138,8 @@ def test_place_detail_localizes_categories_and_renders_complete_hotel_evidence()
         assert f'{key}:"' in detail
     for key in ("hotel", "hostel", "guest_house", "motel", "apartment"):
         assert f'{key}:"' in detail
-    assert 'language==="zh"?tr("transitUnavailable")' in detail
+    assert 'transitTr("noItinerary")' in detail
+    assert 'transitTr("providerUnavailable")' in detail
     assert 'id="hotel-class"' in detail
     assert 'id="review-count"' in detail
     assert 'id="amenities"' in detail
@@ -143,6 +156,32 @@ def test_place_detail_localizes_categories_and_renders_complete_hotel_evidence()
         "total_price",
     ):
         assert field in detail
+
+
+def test_hotel_detail_supports_exact_stay_room_and_cross_platform_evidence() -> None:
+    detail = _page("place.html")
+
+    assert 'id="stay-form"' in detail
+    assert 'id="hotel-check-in"' in detail
+    assert 'id="hotel-check-out"' in detail
+    assert 'id="hotel-adults"' in detail
+    assert 'id="room-grid"' in detail
+    assert 'id="review-grid"' in detail
+    assert "queryHotelEvidence" in detail
+    assert "room_rates" in detail
+    assert "room_rates_status" in detail
+    assert "review_sources" in detail
+    assert "review_sources_status" in detail
+    assert "booking_url" in detail
+    assert "review_url" in detail
+    assert "observed_at" in detail
+    assert "酒店名称、坐标和提供商房源标识" in detail
+    assert "hotel name, coordinates, and provider property identity" in detail
+    assert "系统没有用估算数据替代" in detail
+    assert "estimated data was not substituted" in detail
+    assert "if(hotelId)payload.hotel_id=hotelId" in detail
+    assert "if(placeId)payload.place_id=placeId" in detail
+    assert "innerHTML" not in detail
 
 
 def test_place_detail_never_coerces_missing_numeric_evidence_to_zero() -> None:

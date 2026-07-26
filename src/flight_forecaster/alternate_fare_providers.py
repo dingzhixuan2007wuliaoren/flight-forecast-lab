@@ -78,6 +78,8 @@ IGNAV_ONE_WAY_URL = "https://ignav.com/api/fares/one-way"
 IGNAV_BOOKING_LINKS_URL = "https://ignav.com/api/fares/booking-links"
 IGNAV_FREE_CALL_LIMIT = 1_000
 IGNAV_MAX_ITINERARIES_PER_CABIN = 1_000
+# Concurrency guard only; all eligible candidates covered by the real account
+# quota are queued through this bounded worker pool.
 MAX_ALTERNATE_BOOKING_WORKERS = 6
 
 _CABINS: tuple[Cabin, ...] = (
@@ -951,7 +953,6 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 diagnostics=diagnostics.snapshot(),
                 quota_limit="lifetime",
             )
-        provider_booking_capacity = max(0, lifetime_capacity - len(_CABINS))
         hard_limit = self.free_call_limit
         search_reservation = self._ledger.reserve(
             self.ledger_provider_code,
@@ -1029,13 +1030,13 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 retry_quota_limited=rate_limited,
             )
 
-        # Verify one bounded batch only.  Candidates outside this batch remain
-        # explicitly quota-limited; a comparison never drains the provider by
-        # walking subsequent batches.
+        # Reserve every eligible candidate atomically. The lifetime ledger may
+        # return a smaller reservation when the real account quota is exhausted;
+        # concurrency remains bounded independently of candidate count.
         confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
         provider_failures = 0
         strict_rejections = 0
-        requested = min(len(candidates), MAX_ALTERNATE_BOOKING_WORKERS)
+        requested = len(candidates)
         reserved = self._ledger.reserve(
             self.ledger_provider_code,
             requested,
@@ -1044,7 +1045,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
         attempted_candidates = candidates[:reserved]
         if attempted_candidates:
             with ThreadPoolExecutor(
-                max_workers=len(attempted_candidates),
+                max_workers=min(MAX_ALTERNATE_BOOKING_WORKERS, len(attempted_candidates)),
                 thread_name_prefix="searchapi-booking",
             ) as pool:
                 futures = {
@@ -1105,16 +1106,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
             confirmed_by_position,
             len(attempted_candidates),
         )
-        quota_limit = (
-            (
-                "provider_specific"
-                if provider_booking_capacity > MAX_ALTERNATE_BOOKING_WORKERS
-                and len(attempted_candidates) >= MAX_ALTERNATE_BOOKING_WORKERS
-                else "lifetime"
-            )
-            if quota_skipped
-            else None
-        )
+        quota_limit = "lifetime" if quota_skipped else None
         common: dict[str, Any] = {
             "searched_cabins": tuple(searched_cabins),
             "search_calls_used": len(searched_cabins),
@@ -1138,7 +1130,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
                 offers=offers,
                 **common,
             )
-        if quota_skipped and quota_limit != "provider_specific":
+        if quota_skipped:
             status = "budget_exhausted"
         elif provider_failures:
             status = "provider_error"
@@ -1863,10 +1855,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 coverage_status=("provider_incomplete" if failed_count else "complete"),
             )
 
-        requested_candidates = min(
-            len(candidates),
-            MAX_ALTERNATE_BOOKING_WORKERS,
-        )
+        requested_candidates = len(candidates)
         pricing_reservation = self._ledger.reserve(
             self.ledger_provider_code,
             requested_candidates,
@@ -1878,7 +1867,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
         strict_rejections = 0
         if attempted_candidates:
             with ThreadPoolExecutor(
-                max_workers=len(attempted_candidates),
+                max_workers=min(MAX_ALTERNATE_BOOKING_WORKERS, len(attempted_candidates)),
                 thread_name_prefix="ignav-booking",
             ) as pool:
                 futures = {
@@ -1936,16 +1925,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             confirmed_by_position,
             len(attempted_candidates),
         )
-        quota_limit = (
-            (
-                "provider_specific"
-                if pricing_reservation == requested_candidates
-                and len(candidates) > requested_candidates
-                else "lifetime"
-            )
-            if quota_skipped
-            else None
-        )
+        quota_limit = "lifetime" if quota_skipped else None
         common: dict[str, Any] = {
             "searched_cabins": _CABINS,
             "search_calls_used": len(_CABINS),
@@ -1969,7 +1949,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 offers=offers,
                 **common,
             )
-        if quota_skipped and quota_limit != "provider_specific":
+        if quota_skipped:
             status: SearchStatus = "budget_exhausted"
         elif provider_failures:
             status = "provider_error"
@@ -2209,17 +2189,7 @@ def _aggregate_strict_provider_results(
                 if result.coverage_status
                 in {"quota_limited", "quota_and_provider_incomplete"}
             ]
-            if quota_limited_results and all(
-                result.quota_limit == "provider_specific"
-                for result in quota_limited_results
-            ):
-                # The per-comparison candidate cap is a coverage boundary, not
-                # evidence that a provider account has exhausted its free quota.
-                # Keep no_results so the service can expose the dedicated
-                # fare_provider_coverage_limited state from the aggregate counts.
-                status = "no_results"
-            else:
-                status = "budget_exhausted" if quota_limited_results else "provider_error"
+            status = "budget_exhausted" if quota_limited_results else "provider_error"
 
     verified_candidate_count = sum(
         result.verified_candidate_count for result in results

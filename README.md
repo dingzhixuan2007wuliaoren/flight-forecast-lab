@@ -119,8 +119,9 @@ Quota snapshots follow the same free-first policy. The official [SerpApi Account
 
 SerpApi 免费计划目前包含每个 provider 结算周期 250 次成功搜索及每小时 50 次请求；周期边界
 以账户返回的 `plan_renewal_date` 为准，不按自然月切换。初始四舱搜索与 `booking_token` 后续查询
-共享这项额度。系统解析四个舱位搜索实际返回的合格候选，但 SerpApi 每次比较最多二次验证 6 个；
-超出的候选标为 `partial` / `quota_limited`，同一航程和舱位有多个已验证销售方时只保留最低价。`deep_search=true` 与
+共享这项额度。系统解析四个舱位搜索实际返回的合格候选，并在账户实际剩余的结算周期和小时额度内
+为全部候选原子预留二次验证；只有真实额度不足时，未获预留的候选才标为 `partial` / `quota_limited`。
+同一航程和舱位有多个已验证销售方时只保留最低价。`deep_search=true` 与
 `show_hidden=true` 会扩大 Google Flights 可见候选，但仍不能保证所有航司、航班、舱位、销售方
 或私有票价都被返回。额度不足时，已成功验证的结果仍可显示，未验证候选会被跳过，并通过
 `fare_search_metadata.coverage_status`、计数字段、`quota_limit` 和中英双语提示明确标记截断；
@@ -135,7 +136,7 @@ $env:SEARCHAPI_LIFETIME_LIMIT="100"
 python -m flight_forecaster serve --model-dir artifacts/demo
 ```
 
-`auto` 会并发运行所有已配置且获准参与的严格源，而不是在第一个成功来源后停止。只有一个来源实际运行时保留该来源自己的 provider code；两个或更多来源实际运行时，顶层 `fare_search_metadata.provider_code=strict_fare_aggregate`，`provider_runs` 保存每个来源的独立状态、计数、额度与诊断。SerpApi、SearchAPI 和显式发布后的 Ignav 各自完成四舱搜索后，每个来源、每次比较最多二次验证六个候选；候选顺序先覆盖每个有结果的舱位，再按供应商搜索价格处理。未验证部分明确标记为 `partial` / `quota_limited`，不伪装成“没有航班”。SearchAPI 的四舱搜索并发执行，而且只为该有界验证批次预留额度，因此中断不会再一次占满全部剩余额度。聚合只合并各来源已经独立通过二次购票验证的报价，并按“完整航段序列 + 舱位”跨源去重，保留最低最终确认价。任一来源失败、处理中或额度受限都会保留在逐源状态和聚合覆盖状态中；只有全部已完成来源都没有可验证报价时才返回结构化空结果。SearchAPI 的本地硬墙是安装生命周期 100 次，不按月重置，也不应配置成月额度。每个来源都会消耗自己的免费额度，因此增加来源可以缓解单源覆盖不足，但不能把多个免费计划变成无限额度，也不保证全球全量航班。前端会显示比较耗时，30 秒后说明仍在验证供应商，并在 150 秒停止浏览器等待且保留可见错误；重复点击不会创建第二个并行请求。
+`auto` 会并发运行所有已配置且获准参与的严格源，而不是在第一个成功来源后停止。只有一个来源实际运行时保留该来源自己的 provider code；两个或更多来源实际运行时，顶层 `fare_search_metadata.provider_code=strict_fare_aggregate`，`provider_runs` 保存每个来源的独立状态、计数、额度与诊断。SerpApi、SearchAPI 和显式发布后的 Ignav 各自完成四舱搜索后，会请求验证该来源返回的全部合格候选；原子账本只按各账户的实际剩余额度批准调用。候选顺序先覆盖每个有结果的舱位，再按供应商搜索价格处理，因此真实额度不足时会优先保留跨舱位覆盖。未获额度验证的部分明确标记为 `partial` / `quota_limited`，不伪装成“没有航班”。验证网络并发仍有界，但并发数不是候选数量上限。聚合只合并各来源已经独立通过二次购票验证的报价，并按“完整航段序列 + 舱位”跨源去重，保留最低最终确认价。任一来源失败、处理中或额度受限都会保留在逐源状态和聚合覆盖状态中；只有全部已完成来源都没有可验证报价时才返回结构化空结果。SearchAPI 的本地硬墙是安装生命周期 100 次，不按月重置，也不应配置成月额度。每个来源都会消耗自己的免费额度，因此增加来源可以缓解单源覆盖不足，但不能把多个免费计划变成无限额度，也不保证全球全量航班。前端会显示比较耗时，30 秒后说明仍在验证供应商，并在 10 分钟停止浏览器等待且保留可见错误；重复点击不会创建第二个并行请求。
 
 若 SerpApi 返回 `Processing` 或 `Queued`，后端会按 0.5、1、1.5、2 秒的有界退避读取固定的
 Search Archive 地址；它只轮询同一个经过白名单校验的 Search ID，不跟随响应中的任意 URL，
@@ -226,9 +227,11 @@ sources, metadata uses `strict_fare_aggregate` and preserves each source in `pro
 schedules/routes, route-level hints, catalogue-expanded cabins, and
 model-only flights never enter `offers` or rankings. The verified provider-result fare remains separate
 from the synthetic model estimate and forecast curve, and it is not a final-checkout guarantee.
-For each comparison, SerpApi, SearchAPI, and released Ignav each attempt booking-option verification
-for at most six eligible candidates returned by their four cabin searches. Excess candidates are
-reported as `partial` / `quota_limited`, rather than as no flights.
+For each comparison, SerpApi, SearchAPI, and released Ignav request booking-option verification for
+every eligible candidate returned by their four cabin searches. The atomic ledger admits only calls
+covered by that provider account's actual remaining quota; candidates skipped for lack of quota are
+reported as `partial` / `quota_limited`, rather than as no flights. Worker concurrency is bounded but
+does not impose a candidate-count limit.
 The response keeps only the lowest verified price across sellers and sources for the same complete
 segment sequence and cabin. Coverage
 counters and `coverage_status` distinguish complete candidate processing from quota or provider
@@ -313,13 +316,17 @@ The dashboard shows only a per-provider remaining-allowance summary for active s
 
 After a route comparison, two compact entries—Attractions and Hotels—appear above the strict-flight list. Their second-level pages classify real tagged places and return at most 30 named, geolocated results per list. OpenStreetMap supplies the place evidence: Nominatim resolves the airport's served city, then named OSM nodes are queried at progressive 5, 15, and 30 km radii, stopping once 30 results are available to keep public-service queries small. Each page reports the actual successfully queried radius and complete/partial coverage status; reaching the record target early or losing a wider-radius request is never presented as full 30 km coverage. A list operation makes at most one controlled retry on the currently listed global VK Maps public instance; successful responses are cached for 24 hours, while two-provider failures are not cached as false empty results. Missing descriptions, stars, contact details, opening hours, images, or websites remain unavailable rather than being invented.
 
-点击任一地点会打开详情页，并按需查询从到达机场到该坐标的驾车、骑行和步行路线。路线来自 `routing.openstreetmap.de` 的全球 car/bike/foot OSRM 图；成功结果缓存 24 小时并遵守每秒最多一次请求，临时失败不缓存、下次可以重试。显示的分钟数是基于道路图的预计时间，不是实时交通承诺。全球公共交通需要当地 GTFS/NeTEx 时刻覆盖；当前版本在没有可验证时刻源时明确标为不可用，不用直线速度伪造公交或地铁时间。
+点击任一地点会打开详情页，并按需查询从到达机场到该坐标的驾车、骑行和步行路线。路线来自 `routing.openstreetmap.de` 的全球 car/bike/foot OSRM 图；成功结果缓存 24 小时并遵守每秒最多一次请求，临时失败不缓存、下次可以重试。显示的分钟数是基于道路图的预计时间，不是实时交通承诺。公共交通使用无需密钥的 [Transitous MOTIS API](https://transitous.org/api/) 查询开放 GTFS 时刻表；查询显式关闭 MOTIS 的直达步行候选，避免其裁掉较慢但真实存在的公交方案。用户可输入带时区的出发时间，页面保留原始时区文本，并显示提供商实际返回的全程时间、换乘数、每段线路、运营方、起终站、中间站及时刻及实时更新标记。成功或确实无行程的结果缓存 30 分钟，每秒最多请求一次，缓存最多保留 512 个分钟级查询，并在页面直接链接 [Transitous 数据来源](https://transitous.org/sources/)；当地没有开放时刻覆盖或提供商失败时明确显示不可用，不用直线速度伪造公交或地铁。
 
-Opening a place requests airport-to-place driving, cycling, and walking routes on demand. They use the worldwide car/bike/foot OSRM graphs at `routing.openstreetmap.de`; successful routes are cached for 24 hours and respect the public service's one-request-per-second policy, while transient failures are not cached. Durations are road-graph estimates, not live-traffic promises. Public transport requires local GTFS/NeTEx timetable coverage; without a verified source it is explicitly unavailable rather than estimated from straight-line speed.
+Opening a place requests airport-to-place driving, cycling, and walking routes on demand. They use the worldwide car/bike/foot OSRM graphs at `routing.openstreetmap.de`; successful routes are cached for 24 hours and respect the public service's one-request-per-second policy, while transient failures are not cached. Durations are road-graph estimates, not live-traffic promises. Public transport uses the no-key [Transitous MOTIS API](https://transitous.org/api/) and an optional timezone-aware departure input. The request explicitly disables MOTIS direct walking so a slower real transit itinerary is not pruned; the page preserves the user's supplied offset and renders only provider-returned journey times, transfers, line/operator names, endpoints, intermediate stops, and realtime flags. Successful or genuine no-itinerary results are cached for 30 minutes in a bounded 512-entry minute-level cache, requests are limited to one per second, and the visible attribution links to [Transitous data sources](https://transitous.org/sources/). Missing local timetable coverage or provider failure stays explicitly unavailable; no straight-line transit estimate is substituted.
 
-酒店页的基础列表不会消耗付费或严格报价额度。只有用户填写入住日、退房日和成人数并点击“查询真实价格 / Check real prices”后，后端才会调用现有 SerpApi 账户的 [Google Hotels API](https://serpapi.com/google-hotels-api)。该请求与 Google Flights 严格报价共用同一个本地账本、供应商结算周期和小时限制；允许供应商缓存，只有本地一小时脱敏缓存命中不预留新额度。Processing/Queued 会使用经过格式验证的 Search ID 轮询固定归档地址；若仍未完成，最多只在再次原子预留额度后受控重提一次，并以一小时脱敏失败保护防止刷新或切换语言重复扣额。每晚价、总价、取消条件和销售来源只显示供应商同一报价记录实际返回的字段，税费包含情况未知，库存和价格仍可能变化。
+酒店页的基础 OpenStreetMap 列表不会消耗 SerpApi 额度。用户填写入住日、退房日和成人数并点击“查询真实资料”后，后端才会调用现有 SerpApi 账户的 [Google Hotels API](https://serpapi.com/google-hotels-api) 和 [Property Details](https://serpapi.com/google-hotels-property-details)。Google Hotels 列表中的酒店使用供应商房源标识读取详情；OpenStreetMap 酒店必须先通过精确酒店名称与紧邻坐标重新找到唯一同一房源，任何模糊或多重匹配都拒绝。服务器重启后不会持久化房源令牌；用户显式查询时可受控重查一次恢复令牌，因此一次未缓存的 OSM/重启后详情最多需要“房源搜索＋详情”两次额度。所有调用与 Google Flights 严格报价共用同一个本地账本、供应商结算周期和小时限制。
 
-The base hotel list consumes no fare-provider allowance. Only an explicit Check real prices action calls the existing SerpApi account's [Google Hotels API](https://serpapi.com/google-hotels-api) with the selected stay dates and adult count. Hotel searches share the exact same local ledger, provider billing window, and hourly cap as strict Google Flights searches. Provider caching is allowed, but only a sanitized local one-hour cache hit skips a new local quota reservation. Processing/Queued searches poll the fixed Search Archive URL for a validated Search ID and may be submitted only once more after another atomic quota reservation; a sanitized one-hour failure guard prevents refreshes and language changes from repeatedly spending calls. Nightly/total rates, cancellation terms, and seller attribution are shown only when they belong to the same returned quote; tax inclusion is unknown and availability can change.
+详情页按真实返回值列出不同平台的房型名称、每晚/总价、税费前金额、住客数、床型、早餐、免费取消期限、包含项目和安全预订链接；价格、早餐和取消权益必须来自同一个具体费率行，绝不把房型最低价绑定到另一个缺价套餐的权益。同时按 Google、Tripadvisor、Trip.com 等供应商实际返回的平台显示评分、评价数量、一个来源评价摘录及原评价链接。列表中的部分房型或 Google 聚合评分不会被误当成完整详情；用户显式查询仍会读取严格匹配的 Property Details。只有酒店名称、坐标和供应商房源标识都证明是同一家酒店时才合并这些证据。房源令牌、API key、SerpApi 内部链接和原始错误不会进入缓存、前端或日志；本地脱敏详情缓存一小时。未返回的房型、平台或字段保持“数据源未提供”，税费和最终库存仍以结账页为准。
+
+The base OpenStreetMap hotel list consumes no SerpApi allowance. An explicit Check real details action calls the existing account's [Google Hotels API](https://serpapi.com/google-hotels-api) and [Property Details](https://serpapi.com/google-hotels-property-details). A Google Hotels list item uses its provider property identity; an OpenStreetMap hotel must resolve to exactly one result with the same normalized name and tightly matching coordinates. Fuzzy or ambiguous matches are rejected. Property tokens are never persisted, so a user-triggered detail after a server restart may make one controlled exact-property search before the detail call. Uncached OSM or restart-recovery detail can therefore use two requests. Hotel and strict Google Flights calls share the same local ledger, provider billing window, and hourly cap.
+
+The detail page renders only returned room names, nightly/total and pre-tax amounts, guests, beds, breakfast, cancellation deadlines, inclusions, seller, and safe booking links. It also separates provider-returned Google, Tripadvisor, Trip.com, or other platform ratings, counts, one review excerpt, and the original-review link. Evidence is merged only after hotel name, coordinates, and provider property identity prove the same property. API keys, property tokens, SerpApi internal links, and raw errors never enter the sanitized one-hour cache, frontend, or logs. Missing room/platform fields remain unavailable; tax treatment and final inventory must still be confirmed at checkout.
 
 ## 新闻如何进入预测 / How news affects predictions
 

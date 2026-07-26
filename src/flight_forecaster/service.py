@@ -1795,8 +1795,9 @@ class PredictionService:
             and fare_result.coverage_status
             in {"quota_limited", "quota_and_provider_incomplete"}
         ):
-            # A bounded comparison did not verify every provider-returned
-            # candidate, so this is not evidence that no bookable flight exists.
+            # Actual provider/account quota did not permit verification of every
+            # returned candidate, so this is not evidence that no bookable flight
+            # exists.
             result_status = "fare_provider_coverage_limited"
         rejected_warning = (
             (
@@ -1855,15 +1856,16 @@ class PredictionService:
             strict_mode_notice=BilingualText(
                 zh=(
                     "严格可售模式仅显示经已启用的严格报价来源搜索，并由该来源的二次购票"
-                    "验证标识确认的报价。每个来源每次比较最多验证六个候选；免费额度、该上限或"
-                    "供应商错误都可能使覆盖不完整，未验证候选绝不会进入主列表。"
+                    "验证标识确认的报价。系统会尝试验证来源返回的全部合格候选；只有实际免费"
+                    "额度不足或供应商错误才会使覆盖不完整，未验证候选绝不会进入主列表。"
                     "测试数据、AirLabs 时刻、周期投影和纯模型航班都不能进入主列表。"
                 ),
                 en=(
                     "Strict bookable mode shows only offers confirmed by both an enabled "
                     "strict fare source search and that source's secondary booking-verification "
-                    "identifier. Each source verifies at most six candidates per comparison; "
-                    "free quota, that cap, or provider errors can leave coverage incomplete. "
+                    "identifier. The system attempts every eligible candidate returned by each "
+                    "source; only actual free-quota exhaustion or provider errors can leave "
+                    "coverage incomplete. "
                     "Unverified candidates "
                     "never enter the main list. Test data, AirLabs "
                     "timetables, recurring projections, and model-only flights cannot enter "

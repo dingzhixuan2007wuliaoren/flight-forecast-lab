@@ -553,7 +553,7 @@ def test_searchapi_runs_cabin_and_booking_requests_with_bounded_concurrency(
     assert client.booking_barrier.broken is False
 
 
-def test_searchapi_reserves_exactly_one_bounded_booking_batch(
+def test_searchapi_reserves_all_eligible_booking_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -591,11 +591,11 @@ def test_searchapi_reserves_exactly_one_bounded_booking_batch(
 
     assert result.status == "confirmed_offers"
     assert result.eligible_candidate_count == 12
-    assert result.pricing_calls_used == 6
-    assert result.quota_skipped_candidate_count == 6
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
-    assert requested_reservations == [4, 6]
+    assert result.pricing_calls_used == 12
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
+    assert requested_reservations == [4, 12]
 
 
 def test_searchapi_partial_rejections_do_not_claim_complete_no_results(
@@ -613,11 +613,11 @@ def test_searchapi_partial_rejections_do_not_claim_complete_no_results(
     assert result.status == "no_results"
     assert result.offers == ()
     assert result.eligible_candidate_count == 12
-    assert result.verification_attempted_count == 6
-    assert result.strictly_rejected_candidate_count == 6
-    assert result.quota_skipped_candidate_count == 6
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
+    assert result.verification_attempted_count == 12
+    assert result.strictly_rejected_candidate_count == 12
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
 
 
 def test_searchapi_business_authentication_failure_is_reserved(
@@ -867,7 +867,7 @@ def test_ignav_release_still_requires_a_verified_public_https_booking_link(
         assert result.strictly_rejected_candidate_count == 1
 
 
-def test_ignav_verifies_one_concurrent_batch_and_reports_remaining_candidates(
+def test_ignav_verifies_all_candidates_with_bounded_concurrency(
     tmp_path: Path,
 ) -> None:
     client = _BoundedConcurrentIgnavClient()
@@ -885,14 +885,14 @@ def test_ignav_verifies_one_concurrent_batch_and_reports_remaining_candidates(
     assert result.status == "confirmed_offers"
     assert result.search_calls_used == 4
     assert result.eligible_candidate_count == 12
-    assert result.verification_attempted_count == 6
-    assert result.pricing_calls_used == 6
-    assert result.quota_skipped_candidate_count == 6
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
-    assert provider._ledger.snapshot(provider.ledger_provider_code) == 10
+    assert result.verification_attempted_count == 12
+    assert result.pricing_calls_used == 12
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
+    assert provider._ledger.snapshot(provider.ledger_provider_code) == 16
     assert sum(url == IGNAV_ONE_WAY_URL for url, _ in client.calls) == 4
-    assert sum(url == IGNAV_BOOKING_LINKS_URL for url, _ in client.calls) == 6
+    assert sum(url == IGNAV_BOOKING_LINKS_URL for url, _ in client.calls) == 12
 
 
 def test_ignav_partial_rejections_do_not_claim_complete_no_results(
@@ -914,11 +914,11 @@ def test_ignav_partial_rejections_do_not_claim_complete_no_results(
     assert result.status == "no_results"
     assert result.offers == ()
     assert result.eligible_candidate_count == 12
-    assert result.verification_attempted_count == 6
-    assert result.strictly_rejected_candidate_count == 6
-    assert result.quota_skipped_candidate_count == 6
-    assert result.coverage_status == "quota_limited"
-    assert result.quota_limit == "provider_specific"
+    assert result.verification_attempted_count == 12
+    assert result.strictly_rejected_candidate_count == 12
+    assert result.quota_skipped_candidate_count == 0
+    assert result.coverage_status == "complete"
+    assert result.quota_limit is None
 
 
 class _FallbackStub:
@@ -1280,7 +1280,7 @@ def test_aggregate_distinguishes_provider_failure_from_complete_no_results() -> 
     ]
 
 
-def test_aggregate_keeps_bounded_empty_runs_as_coverage_limited_no_results() -> None:
+def test_aggregate_marks_quota_limited_empty_runs_as_budget_exhausted() -> None:
     call_log: list[str] = []
 
     def bounded_empty(provider_code: str, provider_name: str) -> FlightOfferSearchResult:
@@ -1319,7 +1319,7 @@ def test_aggregate_keeps_bounded_empty_runs_as_coverage_limited_no_results() -> 
         )
     ).search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
 
-    assert result.status == "no_results"
+    assert result.status == "budget_exhausted"
     assert result.offers == ()
     assert result.eligible_candidate_count == 24
     assert result.verification_attempted_count == 12

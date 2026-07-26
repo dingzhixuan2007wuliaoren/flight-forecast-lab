@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -17,6 +17,8 @@ from flight_forecaster.destination_guide import (
     OVERPASS_REQUEST_TIMEOUT_SECONDS,
     OVERPASS_URL,
     ROUTING_REQUEST_TIMEOUT_SECONDS,
+    TRANSITOUS_PLAN_URL,
+    TRANSITOUS_REQUEST_TIMEOUT_SECONDS,
     BoundedJsonHttpClient,
     DestinationAirportNotFound,
     DestinationDataUnavailable,
@@ -26,6 +28,7 @@ from flight_forecaster.destination_guide import (
     DestinationValidationError,
     OurAirportsMunicipalityResolver,
     _assert_allowed_outbound_url,
+    _TtlCache,
 )
 from flight_forecaster.route_info import Airport
 
@@ -69,6 +72,8 @@ class FakeTransport:
         self.overpass_payloads: list[Any] | None = None
         self._overpass_response_index = 0
         self.overpass_call_hook: Callable[[], None] | None = None
+        self.transit_payload: Any = {"itineraries": []}
+        self.fail_transit = False
 
     def request_json(
         self,
@@ -126,6 +131,10 @@ class FakeTransport:
                 "foot": (24_800.0, 18_000.0),
             }[mode]
             return {"code": "Ok", "routes": [{"distance": distance, "duration": duration}]}
+        if url == TRANSITOUS_PLAN_URL:
+            if self.fail_transit:
+                raise DestinationDataUnavailable("transit provider unavailable")
+            return self.transit_payload
         raise AssertionError(f"unexpected fake URL: {url}")
 
 
@@ -228,6 +237,66 @@ def _balanced_attraction_elements() -> list[dict[str, Any]]:
         }
         for index in range(100)
     ]
+
+
+def _transit_itinerary() -> dict[str, Any]:
+    return {
+        "itineraries": [
+            {
+                "duration": 2_700,
+                "startTime": "2026-07-21T13:00:00Z",
+                "endTime": "2026-07-21T13:45:00Z",
+                "transfers": 0,
+                "legs": [
+                    {
+                        "mode": "WALK",
+                        "from": {"name": "START"},
+                        "to": {"name": "Airport Station"},
+                        "duration": 300,
+                        "distance": 350,
+                        "startTime": "2026-07-21T13:00:00Z",
+                        "endTime": "2026-07-21T13:05:00Z",
+                        "scheduledStartTime": "2026-07-21T13:00:00Z",
+                        "scheduledEndTime": "2026-07-21T13:05:00Z",
+                        "realTime": False,
+                        "scheduled": False,
+                    },
+                    {
+                        "mode": "REGIONAL_RAIL",
+                        "from": {"name": "Airport Station", "tz": "America/Toronto"},
+                        "to": {"name": "Central Station", "tz": "America/Toronto"},
+                        "duration": 1_800,
+                        "startTime": "2026-07-21T13:05:00Z",
+                        "endTime": "2026-07-21T13:35:00Z",
+                        "scheduledStartTime": "2026-07-21T13:04:00Z",
+                        "scheduledEndTime": "2026-07-21T13:34:00Z",
+                        "realTime": True,
+                        "scheduled": True,
+                        "displayName": "Airport Express",
+                        "headsign": "Central Station",
+                        "agencyName": "Example Transit",
+                        "intermediateStops": [
+                            {"name": "Junction"},
+                            {"name": "Museum Stop"},
+                        ],
+                    },
+                    {
+                        "mode": "WALK",
+                        "from": {"name": "Central Station"},
+                        "to": {"name": "END"},
+                        "duration": 600,
+                        "distance": 720,
+                        "startTime": "2026-07-21T13:35:00Z",
+                        "endTime": "2026-07-21T13:45:00Z",
+                        "scheduledStartTime": "2026-07-21T13:35:00Z",
+                        "scheduledEndTime": "2026-07-21T13:45:00Z",
+                        "realTime": False,
+                        "scheduled": False,
+                    },
+                ],
+            }
+        ]
+    }
 
 
 def _service(
@@ -358,11 +427,114 @@ def test_place_detail_has_three_estimated_routes_and_explicit_transit_gap() -> N
     assert transit.status == "unavailable"
     assert transit.distance_km is None
     assert "not inferred" in transit.notice
+    assert transit.coverage_status == "no_itinerary"
+    assert transit.departure_time_basis == "request_time"
+    assert transit.requested_departure_at == datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
     assert len(_calls(transport, "routing.openstreetmap.de")) == 3
+    assert len(_calls(transport, "api.transitous.org")) == 1
     assert clock.sleeps == [pytest.approx(1.0)] * 4
 
     service.get_place_detail("YYZ", museum.place_id)
     assert len(_calls(transport, "routing.openstreetmap.de")) == 3
+    assert len(_calls(transport, "api.transitous.org")) == 1
+
+
+def test_transitous_itinerary_exposes_real_legs_lines_stops_and_requested_time() -> None:
+    transport = FakeTransport()
+    transport.transit_payload = _transit_itinerary()
+    service, _, _ = _service(transport=transport)
+    requested = datetime(2026, 7, 21, 13, 0, 45, tzinfo=UTC)
+    normalized = requested.replace(second=0)
+
+    routes = service.get_routes(
+        "YYZ",
+        43.6677,
+        -79.3948,
+        transit_departure_at=requested,
+    )
+
+    transit = routes.options[3]
+    assert transit.status == "available"
+    assert transit.duration_minutes == 45
+    assert transit.duration_basis == "transit_schedule_or_realtime"
+    assert transit.departure_time_basis == "user_supplied"
+    assert transit.requested_departure_at == normalized
+    assert transit.departure_at == normalized
+    assert transit.arrival_at == datetime(2026, 7, 21, 13, 45, tzinfo=UTC)
+    assert transit.transfers == 0
+    assert transit.realtime is True
+    assert transit.coverage_status == "covered"
+    assert transit.source_url == "https://transitous.org/sources/"
+    assert [leg.mode for leg in transit.legs] == [
+        "WALK",
+        "REGIONAL_RAIL",
+        "WALK",
+    ]
+    rail = transit.legs[1]
+    assert rail.line_name == "Airport Express"
+    assert rail.from_timezone == rail.to_timezone == "America/Toronto"
+    assert rail.agency_name == "Example Transit"
+    assert rail.headsign == "Central Station"
+    assert rail.intermediate_stops == ("Junction", "Museum Stop")
+    assert rail.realtime is True
+    calls = _calls(transport, "api.transitous.org")
+    assert len(calls) == 1
+    assert calls[0]["params"]["time"] == "2026-07-21T13:00:00+00:00"
+    assert calls[0]["params"]["directModes"] == ""
+    assert "AIRPLANE" not in calls[0]["params"]["transitModes"]
+    assert calls[0]["timeout"] == TRANSITOUS_REQUEST_TIMEOUT_SECONDS
+    assert "flight-forecast-lab/0.2" in calls[0]["headers"]["User-Agent"]
+
+    service.get_routes(
+        "YYZ",
+        43.6677,
+        -79.3948,
+        transit_departure_at=requested,
+    )
+    assert len(_calls(transport, "api.transitous.org")) == 1
+
+
+def test_transitous_failure_is_unavailable_without_invented_route_and_is_retried() -> None:
+    transport = FakeTransport()
+    transport.fail_transit = True
+    service, _, _ = _service(transport=transport)
+
+    first = service.get_routes("YYZ", 43.6677, -79.3948).options[3]
+    second = service.get_routes("YYZ", 43.6677, -79.3948).options[3]
+
+    assert first.status == second.status == "unavailable"
+    assert first.coverage_status == second.coverage_status == "provider_unavailable"
+    assert first.duration_minutes is None
+    assert first.legs == ()
+    assert first.source_url == "https://transitous.org/sources/"
+    assert len(_calls(transport, "api.transitous.org")) == 2
+
+
+def test_nonempty_invalid_transitous_itineraries_are_provider_failure_and_not_cached() -> None:
+    transport = FakeTransport()
+    transport.transit_payload = {"itineraries": [{"duration": 600, "legs": "invalid"}]}
+    service, _, _ = _service(transport=transport)
+
+    first = service.get_routes("YYZ", 43.6677, -79.3948).options[3]
+    second = service.get_routes("YYZ", 43.6677, -79.3948).options[3]
+
+    assert first.coverage_status == second.coverage_status == "provider_unavailable"
+    assert first.duration_minutes is None
+    assert first.legs == ()
+    assert len(_calls(transport, "api.transitous.org")) == 2
+
+
+def test_ttl_cache_evicts_oldest_entry_at_capacity() -> None:
+    clock = FakeClock()
+    cache = _TtlCache(clock, ttl=timedelta(minutes=30), max_entries=2)
+
+    cache.set(("first",), 1)
+    cache.set(("second",), 2)
+    cache.set(("third",), 3)
+
+    assert cache.get(("first",)) is None
+    assert cache.get(("second",)) == 2
+    assert cache.get(("third",)) == 3
 
 
 def test_route_provider_failure_does_not_invent_distance_or_time() -> None:
@@ -978,3 +1150,12 @@ def test_overpass_allowlist_contains_exactly_primary_and_one_verified_fallback()
         _assert_allowed_outbound_url(
             "https://attacker.maps.mail.ru/osm/tools/overpass/api/interpreter"
         )
+
+
+def test_transitous_allowlist_accepts_only_the_stable_plan_endpoint() -> None:
+    _assert_allowed_outbound_url(TRANSITOUS_PLAN_URL)
+
+    with pytest.raises(DestinationValidationError, match="allowlist"):
+        _assert_allowed_outbound_url("https://staging.api.transitous.org/api/v5/plan")
+    with pytest.raises(DestinationValidationError, match="allowlist"):
+        _assert_allowed_outbound_url("https://api.transitous.org/api/v5/trip")

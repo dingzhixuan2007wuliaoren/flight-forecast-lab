@@ -113,7 +113,11 @@ def _account(*, monthly: int = 10, hourly: int = 2, limit: int = 250) -> dict[st
     }
 
 
-def _search_payload(*, properties: list[Any] | None = None) -> dict[str, Any]:
+def _search_payload(
+    *,
+    properties: list[Any] | None = None,
+    query: str = "Toronto",
+) -> dict[str, Any]:
     if properties is None:
         properties = [
             {
@@ -162,7 +166,7 @@ def _search_payload(*, properties: list[Any] | None = None) -> dict[str, Any]:
         "search_metadata": {"id": "safe-search-id", "status": "Success"},
         "search_parameters": {
             "engine": "google_hotels",
-            "q": "Toronto",
+            "q": query,
             "check_in_date": CHECK_IN.isoformat(),
             "check_out_date": CHECK_OUT.isoformat(),
             "adults": 2,
@@ -170,6 +174,111 @@ def _search_payload(*, properties: list[Any] | None = None) -> dict[str, Any]:
             "hl": "en",
         },
         "properties": properties,
+    }
+
+
+def _property_detail_payload(
+    *,
+    name: str = "Harbour Test Hotel",
+    latitude: float = 43.6426,
+    longitude: float = -79.3871,
+    property_token: str = "do-not-persist-property-token",
+) -> dict[str, Any]:
+    return {
+        "search_metadata": {"id": "safe-detail-search-id", "status": "Success"},
+        "search_parameters": {
+            "engine": "google_hotels",
+            "property_token": property_token,
+            "check_in_date": CHECK_IN.isoformat(),
+            "check_out_date": CHECK_OUT.isoformat(),
+            "adults": 2,
+            "currency": "USD",
+            "hl": "en",
+        },
+        "type": "hotel",
+        "name": name,
+        "property_token": property_token,
+        "gps_coordinates": {"latitude": latitude, "longitude": longitude},
+        "overall_rating": 4.7,
+        "reviews": 1500,
+        "featured_prices": [
+            {
+                "source": "Hotel Direct",
+                "official": True,
+                "link": "https://hotel.example.test/rooms",
+                "rooms": [
+                    {
+                        "name": "Deluxe King",
+                        "num_guests": 2,
+                        "rates": [
+                            {
+                                "link": "https://hotel.example.test/rooms/deluxe",
+                                "num_guests": 2,
+                                "free_cancellation": True,
+                                "free_cancellation_until_date": "Aug 8",
+                                "free_cancellation_until_time": "6:00 PM",
+                                "breakfast_included": True,
+                                "beds": [{"type": "King", "count": 1}],
+                                "rate_per_night": {
+                                    "extracted_lowest": 240,
+                                    "extracted_before_taxes_fees": 210,
+                                },
+                                "total_rate": {
+                                    "extracted_lowest": 480,
+                                    "extracted_before_taxes_fees": 420,
+                                },
+                                "inclusions": ["Breakfast", "Free Wi-Fi"],
+                            }
+                        ],
+                    },
+                    {
+                        "name": "Twin City View",
+                        "link": "https://hotel.example.test/rooms/twin",
+                        "num_guests": 2,
+                        "rate_per_night": {"extracted_lowest": 220},
+                        "total_rate": {"extracted_lowest": 440},
+                    },
+                ],
+            },
+            {
+                "source": "Booking Platform",
+                "official": False,
+                "rooms": [
+                    {
+                        "name": "Deluxe King",
+                        "rates": [
+                            {
+                                "rate_per_night": {"extracted_lowest": 235},
+                                "total_rate": {"extracted_lowest": 470},
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+        "other_reviews": [
+            {
+                "source": "Tripadvisor",
+                "source_rating": {"score": 4.5, "max_score": 5},
+                "reviews": 321,
+                "user_review": {
+                    "username": "Verified guest",
+                    "date": "2 weeks ago",
+                    "rating": {"score": 5, "max_score": 5},
+                    "comment": "Quiet room and helpful staff.",
+                    "link": "https://reviews.example.test/tripadvisor/123",
+                },
+            },
+            {
+                "source": "Trip.com",
+                "source_rating": {"score": 4.2, "max_score": 5},
+                "reviews": 98,
+                "user_review": {
+                    "comment": "Convenient location.",
+                    "link": "https://reviews.example.test/trip/456",
+                },
+            },
+        ],
     }
 
 
@@ -773,3 +882,391 @@ def test_env_factory_uses_only_existing_serpapi_settings(
 
     assert provider.configured is True
     assert provider.usage_path == path
+
+
+def test_explicit_detail_returns_real_room_rates_and_platform_reviews(
+    tmp_path: Path,
+) -> None:
+    client = _Client(
+        [_account(monthly=0, hourly=0), _account(monthly=1, hourly=1)],
+        [_search_payload(), _property_detail_payload()],
+    )
+    provider = _provider(tmp_path, client)
+    listing = _search(provider)
+
+    detail = provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert detail is not None
+    assert detail.room_rates_status == "available"
+    assert detail.review_sources_status == "available"
+    assert len(detail.room_rates) == 3
+    direct = next(
+        item
+        for item in detail.room_rates
+        if item.room_name == "Deluxe King" and item.source == "Hotel Direct"
+    )
+    assert direct.nightly_price == 240
+    assert direct.total_price == 480
+    assert direct.nightly_before_taxes == 210
+    assert direct.total_before_taxes == 420
+    assert direct.beds == ("1 × King",)
+    assert direct.breakfast_included is True
+    assert direct.free_cancellation is True
+    assert direct.free_cancellation_until == "Aug 8 6:00 PM"
+    assert {item.source for item in detail.review_sources} == {
+        "Google",
+        "Tripadvisor",
+        "Trip.com",
+    }
+    tripadvisor = next(
+        item for item in detail.review_sources if item.source == "Tripadvisor"
+    )
+    assert tripadvisor.score == 4.5
+    assert tripadvisor.review_count == 321
+    assert tripadvisor.sample_comment == "Quiet room and helpful staff."
+    detail_call = [
+        call for call in client.calls if call["url"] == SERPAPI_SEARCH_URL
+    ][1]
+    assert detail_call["params"]["property_token"] == "do-not-persist-property-token"
+    assert "q" not in detail_call["params"]
+    assert _ledger_calls(
+        provider.usage_path,
+        "billing_cycle",
+        "renewal:2026-08-15",
+    ) == 2
+    persisted = provider.usage_path.read_bytes()
+    assert b"do-not-persist-property-token" not in persisted
+    assert b"property_token" not in persisted
+    assert b"Quiet room and helpful staff." in persisted
+
+
+def test_enriched_detail_is_cache_only_after_first_explicit_fetch(tmp_path: Path) -> None:
+    client = _Client(
+        [_account(monthly=0, hourly=0), _account(monthly=1, hourly=1)],
+        [_search_payload(), _property_detail_payload()],
+    )
+    provider = _provider(tmp_path, client)
+    listing = _search(provider)
+    first = provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+    calls = list(client.calls)
+
+    second = provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="zh-cn",
+        explicit=True,
+    )
+
+    assert second == first
+    assert client.calls == calls
+
+
+@pytest.mark.parametrize(
+    ("name", "latitude", "longitude"),
+    [
+        ("Different Hotel", 43.6426, -79.3871),
+        ("Harbour Test Hotel", 43.6526, -79.3871),
+        ("Harbour Test Hotel", 43.6426, -79.3971),
+    ],
+)
+def test_detail_rejects_cross_hotel_identity_even_with_same_property_token(
+    tmp_path: Path,
+    name: str,
+    latitude: float,
+    longitude: float,
+) -> None:
+    client = _Client(
+        [_account(monthly=0, hourly=0), _account(monthly=1, hourly=1)],
+        [
+            _search_payload(),
+            _property_detail_payload(
+                name=name,
+                latitude=latitude,
+                longitude=longitude,
+            ),
+        ],
+    )
+    provider = _provider(tmp_path, client)
+    listing = _search(provider)
+
+    with pytest.raises(HotelPriceError) as error_info:
+        provider.detail(
+            listing.offers[0].hotel_id,
+            "Toronto",
+            "YYZ",
+            CHECK_IN,
+            CHECK_OUT,
+            adults=2,
+            language="en",
+            explicit=True,
+        )
+
+    assert error_info.value.code == "response_invalid"
+    assert "same property identity" in str(error_info.value)
+
+
+def test_cached_listing_reacquires_token_once_after_process_restart(
+    tmp_path: Path,
+) -> None:
+    first_client = _Client(_account(monthly=0, hourly=0), _search_payload())
+    first_provider = _provider(tmp_path, first_client)
+    listing = _search(first_provider)
+    exact_query = "Harbour Test Hotel, Toronto"
+    second_client = _Client(
+        [_account(monthly=1, hourly=1), _account(monthly=2, hourly=2)],
+        [
+            _search_payload(query=exact_query),
+            _property_detail_payload(),
+        ],
+    )
+    restarted_provider = _provider(tmp_path, second_client)
+
+    detail = restarted_provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert detail is not None
+    assert detail.room_rates_status == "available"
+    assert detail.review_sources_status == "available"
+    searches = [
+        call for call in second_client.calls if call["url"] == SERPAPI_SEARCH_URL
+    ]
+    assert len(searches) == 2
+    assert searches[0]["params"]["q"] == exact_query
+    assert searches[1]["params"]["property_token"] == (
+        "do-not-persist-property-token"
+    )
+
+
+def test_reacquisition_never_fuzzy_merges_a_different_hotel(tmp_path: Path) -> None:
+    first_provider = _provider(
+        tmp_path,
+        _Client(_account(monthly=0, hourly=0), _search_payload()),
+    )
+    listing = _search(first_provider)
+    wrong_property = _search_payload(
+        query="Harbour Test Hotel, Toronto",
+        properties=[
+            {
+                "type": "hotel",
+                "name": "Harbour Test Hotel Annex",
+                "property_token": "different-property-token",
+                "gps_coordinates": {"latitude": 43.6426, "longitude": -79.3871},
+                "rate_per_night": {"extracted_lowest": 120},
+            }
+        ],
+    )
+    client = _Client(_account(monthly=1, hourly=1), wrong_property)
+    restarted_provider = _provider(tmp_path, client)
+
+    detail = restarted_provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert detail is not None
+    assert detail.room_rates_status == "temporarily_unavailable"
+    assert detail.review_sources_status == "available"
+    assert [call["url"] for call in client.calls].count(SERPAPI_SEARCH_URL) == 1
+
+
+def test_room_aggregate_price_never_inherits_unpriced_rate_benefits(
+    tmp_path: Path,
+) -> None:
+    detail_payload = _property_detail_payload()
+    detail_payload["featured_prices"] = [
+        {
+            "source": "Hotel Direct",
+            "rooms": [
+                {
+                    "name": "Strict King",
+                    "rate_per_night": {"extracted_lowest": 199},
+                    "total_rate": {"extracted_lowest": 398},
+                    "rates": [
+                        {
+                            "free_cancellation": True,
+                            "breakfast_included": True,
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    client = _Client(
+        [_account(monthly=0, hourly=0), _account(monthly=1, hourly=1)],
+        [_search_payload(), detail_payload],
+    )
+    provider = _provider(tmp_path, client)
+    listing = _search(provider)
+
+    detail = provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert detail is not None
+    assert len(detail.room_rates) == 1
+    room = detail.room_rates[0]
+    assert room.nightly_price == 199
+    assert room.total_price == 398
+    assert room.free_cancellation is None
+    assert room.breakfast_included is None
+
+
+def test_official_top_level_property_search_is_parsed_and_token_verified(
+    tmp_path: Path,
+) -> None:
+    exact_query = "Harbour Test Hotel, Toronto"
+    listing_payload = _search_payload(query=exact_query)
+    top_level_payload = {
+        "search_metadata": listing_payload["search_metadata"],
+        "search_parameters": listing_payload["search_parameters"],
+        **listing_payload["properties"][0],
+    }
+    client = _Client(
+        [_account(monthly=0, hourly=0), _account(monthly=1, hourly=1)],
+        [top_level_payload, _property_detail_payload()],
+    )
+    provider = _provider(tmp_path, client)
+
+    listing = _search(provider, city_query=exact_query)
+    detail = provider.detail(
+        listing.offers[0].hotel_id,
+        exact_query,
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert len(listing.offers) == 1
+    assert detail is not None
+    assert detail.detail_fetch_complete is True
+    assert detail.room_rates_status == "available"
+
+
+def test_partial_listing_evidence_does_not_skip_explicit_property_detail(
+    tmp_path: Path,
+) -> None:
+    listing_payload = _search_payload()
+    listing_payload["properties"][0]["featured_prices"] = (
+        _property_detail_payload()["featured_prices"][:1]
+    )
+    client = _Client(
+        [_account(monthly=0, hourly=0), _account(monthly=1, hourly=1)],
+        [listing_payload, _property_detail_payload()],
+    )
+    provider = _provider(tmp_path, client)
+    listing = _search(provider)
+
+    assert listing.offers[0].room_rates
+    assert {item.source for item in listing.offers[0].review_sources} == {"Google"}
+    assert listing.offers[0].detail_fetch_complete is False
+
+    detail = provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert detail is not None
+    assert detail.detail_fetch_complete is True
+    assert {item.source for item in detail.review_sources} == {
+        "Google",
+        "Tripadvisor",
+        "Trip.com",
+    }
+    assert [call["url"] for call in client.calls].count(SERPAPI_SEARCH_URL) == 2
+
+
+def test_osm_exact_property_restart_reuses_idempotent_query_for_token(
+    tmp_path: Path,
+) -> None:
+    exact_query = "Harbour Test Hotel, Toronto"
+    first_provider = _provider(
+        tmp_path,
+        _Client(
+            _account(monthly=0, hourly=0),
+            _search_payload(query=exact_query),
+        ),
+    )
+    _search(first_provider, city_query=exact_query)
+    second_client = _Client(
+        [_account(monthly=1, hourly=1), _account(monthly=2, hourly=2)],
+        [
+            _search_payload(query=exact_query),
+            _property_detail_payload(),
+        ],
+    )
+    restarted_provider = _provider(tmp_path, second_client)
+
+    detail = restarted_provider.exact_property_detail(
+        ("Harbour Test Hotel",),
+        43.6426,
+        -79.3871,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert detail is not None
+    searches = [
+        call for call in second_client.calls if call["url"] == SERPAPI_SEARCH_URL
+    ]
+    assert searches[0]["params"]["q"] == exact_query
+    assert "Harbour Test Hotel, Harbour Test Hotel" not in searches[0]["params"]["q"]
+    assert searches[1]["params"]["property_token"] == (
+        "do-not-persist-property-token"
+    )
