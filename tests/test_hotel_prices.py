@@ -197,6 +197,21 @@ def _property_detail_payload(
         },
         "type": "hotel",
         "name": name,
+        "address": "100 Harbour Street, Toronto, ON",
+        "phone": "+1 416 555 0100",
+        "check_in_time": "3:00 PM",
+        "check_out_time": "11:00 AM",
+        "thumbnail": "https://images.example.test/hotel-thumb.jpg",
+        "images": [
+            {
+                "thumbnail": "https://images.example.test/hotel-1-thumb.jpg",
+                "original_image": "https://images.example.test/hotel-1.jpg",
+            },
+            {
+                "thumbnail": "https://images.example.test/hotel-2-thumb.jpg",
+                "original_image": "https://images.example.test/hotel-2.jpg",
+            },
+        ],
         "property_token": property_token,
         "gps_coordinates": {"latitude": latitude, "longitude": longitude},
         "overall_rating": 4.7,
@@ -908,6 +923,15 @@ def test_explicit_detail_returns_real_room_rates_and_platform_reviews(
     assert detail is not None
     assert detail.room_rates_status == "available"
     assert detail.review_sources_status == "available"
+    assert detail.address == "100 Harbour Street, Toronto, ON"
+    assert detail.phone == "+1 416 555 0100"
+    assert detail.check_in_time == "3:00 PM"
+    assert detail.check_out_time == "11:00 AM"
+    assert detail.thumbnail == "https://images.example.test/hotel-thumb.jpg"
+    assert detail.images == (
+        "https://images.example.test/hotel-1.jpg",
+        "https://images.example.test/hotel-2.jpg",
+    )
     assert len(detail.room_rates) == 3
     direct = next(
         item
@@ -1186,6 +1210,106 @@ def test_official_top_level_property_search_is_parsed_and_token_verified(
     assert detail is not None
     assert detail.detail_fetch_complete is True
     assert detail.room_rates_status == "available"
+
+
+def test_property_wrapped_exact_search_is_not_misclassified_as_empty(
+    tmp_path: Path,
+) -> None:
+    exact_query = "Harbour Test Hotel, Toronto"
+    listing_payload = _search_payload(query=exact_query)
+    property_row = dict(listing_payload["properties"][0])
+    property_row.update(
+        {
+            "address": "100 Harbour Street, Toronto, ON",
+            "phone": "+1 416 555 0100",
+            "check_in_time": "3:00 PM",
+            "check_out_time": "11:00 AM",
+            "thumbnail": "https://images.example.test/listing-thumb.jpg",
+            "images": [
+                {
+                    "thumbnail": "https://images.example.test/listing-image-thumb.jpg",
+                    "original_image": "https://images.example.test/listing-image.jpg",
+                }
+            ],
+        }
+    )
+    wrapped_payload = {
+        "search_metadata": listing_payload["search_metadata"],
+        "search_parameters": listing_payload["search_parameters"],
+        "property": property_row,
+    }
+    client = _Client(
+        [_account(monthly=0, hourly=0), _account(monthly=1, hourly=1)],
+        [wrapped_payload, _property_detail_payload()],
+    )
+    provider = _provider(tmp_path, client)
+
+    listing = _search(provider, city_query=exact_query)
+
+    assert listing.status == "available"
+    assert len(listing.offers) == 1
+    offer = listing.offers[0]
+    assert offer.name == "Harbour Test Hotel"
+    assert offer.address == "100 Harbour Street, Toronto, ON"
+    assert offer.phone == "+1 416 555 0100"
+    assert offer.check_in_time == "3:00 PM"
+    assert offer.check_out_time == "11:00 AM"
+    assert offer.thumbnail == "https://images.example.test/listing-thumb.jpg"
+    assert offer.images == ("https://images.example.test/listing-image.jpg",)
+
+    detail = provider.detail(
+        offer.hotel_id,
+        exact_query,
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert detail is not None
+    assert detail.detail_fetch_complete is True
+    detail_call = [
+        call for call in client.calls if call["url"] == SERPAPI_SEARCH_URL
+    ][1]
+    assert detail_call["params"]["property_token"] == (
+        "do-not-persist-property-token"
+    )
+
+
+def test_provider_metadata_never_accepts_unsafe_image_urls(tmp_path: Path) -> None:
+    payload = _search_payload()
+    payload["properties"][0].update(
+        {
+            "thumbnail": "https://serpapi.com/private.jpg?api_key=secret",
+            "images": [
+                {"original_image": "http://images.example.test/insecure.jpg"},
+                {
+                    "original_image": (
+                        "https://images.example.test/private.jpg?token=secret"
+                    )
+                },
+                {
+                    "original_image": "https://images.example.test/public.jpg"
+                },
+            ],
+        }
+    )
+    provider = _provider(
+        tmp_path,
+        _Client(_account(monthly=0, hourly=0), payload),
+    )
+
+    result = _search(provider)
+
+    assert result.offers[0].thumbnail is None
+    assert result.offers[0].images == (
+        "https://images.example.test/public.jpg",
+    )
+    persisted = provider.usage_path.read_bytes()
+    assert b"api_key=secret" not in persisted
+    assert b"token=secret" not in persisted
 
 
 def test_partial_listing_evidence_does_not_skip_explicit_property_detail(

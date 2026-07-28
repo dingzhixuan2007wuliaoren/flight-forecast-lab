@@ -8,6 +8,7 @@ __pycache__/
 .pytest_tmp*/
 .test-tmp*/
 .codex-pytest-*/
+.tmp/
 .ruff_cache/
 runtime/
 .coverage

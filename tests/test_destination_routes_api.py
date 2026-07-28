@@ -213,6 +213,15 @@ def _offer() -> HotelPriceOffer:
         amenities=("Wi-Fi",),
         website_url="https://example.org/book-hotel",
         observed_at=NOW,
+        address="100 Provider Street, Toronto, ON",
+        phone="+1 416 555 0199",
+        check_in_time="3:00 PM",
+        check_out_time="11:00 AM",
+        thumbnail="https://images.example.org/hotel-thumb.jpg",
+        images=(
+            "https://images.example.org/hotel-1.jpg",
+            "https://images.example.org/hotel-2.jpg",
+        ),
     )
 
 
@@ -389,7 +398,15 @@ def test_hotel_price_detail_uses_cached_offer_coordinates_for_routes(monkeypatch
     assert guide.include_live_transit is False
     body = response.json()
     assert body["place"]["place_id"] is None
+    assert body["place"]["address"] == _offer().address
+    assert body["place"]["phone"] == _offer().phone
+    assert body["place"]["hours"] == "Check-in 3:00 PM · Check-out 11:00 AM"
+    assert body["place"]["check_in_time"] == "3:00 PM"
+    assert body["place"]["check_out_time"] == "11:00 AM"
+    assert body["place"]["thumbnail"] == _offer().thumbnail
+    assert body["place"]["images"] == list(_offer().images)
     assert body["offer"]["hotel_id"] == _offer().hotel_id
+    assert body["offer"]["address"] == _offer().address
     assert len(body["routes"]) == 4
 
 

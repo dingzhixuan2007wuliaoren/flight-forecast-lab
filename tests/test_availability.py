@@ -136,6 +136,21 @@ def _search_payload(travel_class: int) -> dict[str, Any]:
             "travel_class": travel_class,
             "currency": "USD",
         },
+        "price_insights": {
+            "lowest_price": amount,
+            "price_level": "typical",
+            "typical_price_range": [amount - 40, amount + 80],
+            "price_history": [
+                [
+                    int(datetime(2026, 7, 13, 12, tzinfo=UTC).timestamp()),
+                    amount + 20,
+                ],
+                [
+                    int(datetime(2026, 7, 14, 12, tzinfo=UTC).timestamp()),
+                    amount + 10,
+                ],
+            ],
+        },
         "best_flights": [
             {
                 "flights": [_flight(cabin)],
@@ -373,6 +388,28 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
     assert result.deduplicated_verified_count == 0
     assert result.coverage_status == "complete"
     assert result.quota_limit is None
+    assert len(result.historical_market_contexts) == 4
+    history_by_cabin = {
+        history.cabin: history for history in result.historical_market_contexts
+    }
+    assert set(history_by_cabin) == {
+        "economy",
+        "premium_economy",
+        "business",
+        "first",
+    }
+    economy_history = history_by_cabin["economy"]
+    assert economy_history.origin == "YYZ"
+    assert economy_history.destination == "LHR"
+    assert economy_history.departure_date == date(2026, 8, 20)
+    assert economy_history.provider_code == "serpapi_google_flights"
+    assert economy_history.scope == "route_departure_date_cabin_market"
+    assert economy_history.provider_observed_at == _FETCHED_AT
+    assert [point.price_usd for point in economy_history.points] == [320.0, 310.0]
+    assert [point.observed_at for point in economy_history.points] == [
+        datetime(2026, 7, 13, 12, tzinfo=UTC),
+        datetime(2026, 7, 14, 12, tzinfo=UTC),
+    ]
     assert client.account_calls[0]["timeout"] == 8.0
     for call in client.search_calls:
         assert call["params"]["type"] == 2
@@ -434,6 +471,89 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
         )
         == 12
     )
+
+
+def test_malformed_optional_market_history_is_discarded_without_weakening_strict_fares(
+    tmp_path: Path,
+) -> None:
+    class _MalformedHistoryClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            params = kwargs.get("params", {})
+            if url != SERPAPI_SEARCH_URL or "booking_token" in params:
+                return response
+            timestamp = int(datetime(2026, 7, 14, 12, tzinfo=UTC).timestamp())
+            invalid_by_cabin: dict[int, Any] = {
+                1: [["not-a-timestamp", 300]],
+                2: [[True, 500]],
+                3: [
+                    [
+                        int(datetime(2026, 7, 16, 12, tzinfo=UTC).timestamp()),
+                        900,
+                    ]
+                ],
+                4: [[timestamp, 1500], [timestamp, 1501]],
+            }
+            response.payload["price_insights"]["price_history"] = invalid_by_cabin[
+                int(params["travel_class"])
+            ]
+            response.content = json.dumps(response.payload).encode("utf-8")
+            return response
+
+    client = _MalformedHistoryClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ",
+        "LHR",
+        date(2026, 8, 20),
+        fetched_at=_FETCHED_AT,
+    )
+
+    assert result.status == "confirmed_offers"
+    assert len(result.offers) == 4
+    assert result.historical_market_contexts == ()
+    assert result.calls_used == 12
+    assert len(client.search_calls) == 4
+    assert len(client.booking_calls) == 8
+    assert result.coverage_status == "complete"
+
+
+def test_market_history_is_sorted_and_identical_timestamps_are_deduplicated(
+    tmp_path: Path,
+) -> None:
+    class _UnsortedHistoryClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            params = kwargs.get("params", {})
+            if url != SERPAPI_SEARCH_URL or "booking_token" in params:
+                return response
+            earlier = int(datetime(2026, 7, 13, 12, tzinfo=UTC).timestamp())
+            later = int(datetime(2026, 7, 14, 12, tzinfo=UTC).timestamp())
+            response.payload["price_insights"]["price_history"] = [
+                [later, 321],
+                [earlier, 300],
+                [later, 321],
+            ]
+            response.content = json.dumps(response.payload).encode("utf-8")
+            return response
+
+    client = _UnsortedHistoryClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ",
+        "LHR",
+        date(2026, 8, 20),
+        fetched_at=_FETCHED_AT,
+    )
+
+    assert result.status == "confirmed_offers"
+    assert len(result.historical_market_contexts) == 4
+    for history in result.historical_market_contexts:
+        assert [(point.observed_at, point.price_usd) for point in history.points] == [
+            (datetime(2026, 7, 13, 12, tzinfo=UTC), 300.0),
+            (datetime(2026, 7, 14, 12, tzinfo=UTC), 321.0),
+        ]
+    assert result.calls_used == 12
+    assert len(client.search_calls) == 4
+    assert len(client.booking_calls) == 8
 
 
 def test_booking_verification_attempts_all_candidates_and_options_in_each_response(
@@ -1719,6 +1839,7 @@ def test_five_minute_cache_and_force_refresh(tmp_path: Path) -> None:
     assert cached.cache_hit is True
     assert cached.calls_used == 0
     assert cached.offers
+    assert cached.historical_market_contexts == first.historical_market_contexts
     assert all(offer.provider_cache_hit for offer in cached.offers)
     assert all(offer.provider_cache_age_seconds == 240 for offer in cached.offers)
     assert refreshed.cache_hit is False

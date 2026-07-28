@@ -63,9 +63,22 @@ def test_destination_list_pages_have_bilingual_category_controls() -> None:
     assert "not a complete city inventory" in attractions
     assert "gaps in geographic coverage" in attractions
     assert "requestTimeoutMs=65000" in attractions
+    assert "requestTimeoutMs=65000" in hotels
     assert 'kind:"hotel"' in hotels
     assert '"/details/place?"' in attractions
     assert '"/details/place?"' in hotels
+    assert "航班结果不受影响" not in hotels
+    assert "Flight results are unaffected" not in hotels
+
+
+def test_destination_back_controls_start_in_the_page_top_left() -> None:
+    for name in ("attractions.html", "hotels.html", "place.html"):
+        page = _page(name)
+        top_left = page.index('class="top-left"')
+        back = page.index('class="back"', top_left)
+        brand = page.index('class="brand"', top_left)
+        language = page.index('class="language"', top_left)
+        assert top_left < back < brand < language
 
 
 def test_hotel_prices_are_only_requested_after_explicit_submit() -> None:
@@ -131,7 +144,8 @@ def test_place_detail_is_source_safe_and_renders_airport_routes() -> None:
     assert "website_url" in detail
     assert "该城市暂无可验证的公共交通路线数据" in detail
     assert "No verifiable public-transit route data" in detail
-    assert 'return url.protocol==="https:"?url.href:""' in detail
+    assert 'url.protocol==="https:"' in detail
+    assert "!privateHostname(url.hostname)" in detail
     assert 'link.rel="noopener noreferrer"' in detail
     assert "innerHTML" not in detail
     assert "sessionStorage" not in detail
@@ -227,6 +241,44 @@ def test_hotel_detail_supports_exact_stay_room_and_cross_platform_evidence() -> 
     assert "estimated data was not substituted" in detail
     assert "if(hotelId)payload.hotel_id=hotelId" in detail
     assert "if(placeId)payload.place_id=placeId" in detail
+    assert "detailData=priceData;renderDetail(priceData)" in detail
+    assert "innerHTML" not in detail
+
+
+def test_place_detail_renders_sourced_media_and_sparse_rating_sources() -> None:
+    attractions = _page("attractions.html")
+    detail = _page("place.html")
+
+    assert "place.photos" in attractions
+    assert "photo.attribution" in attractions
+    assert "coordinatePreview" in attractions
+    assert "精确坐标占位预览（不是地图或照片）" in attractions
+    assert "Exact-coordinate placeholder (not a map or photo)" in attractions
+    assert 'id="place-media-section"' in detail
+    assert "place.photos" in detail
+    assert "photo.source_page_url" in detail
+    assert "photo.license_url" in detail
+    assert "openstreetmap.org/export/embed.html" in detail
+    assert "精确坐标地图预览（不是景点照片）" in detail
+    assert "Exact-coordinate map preview (not an attraction photo)" in detail
+    assert "attraction_rating_source_capabilities" in detail
+    assert "capabilities.length" in detail
+    assert 'item.adapter_status==="active"' in detail
+    assert 'item.adapter_status==="catalogued"' in detail
+    assert "rating.platform_id" in detail
+    assert "ratings.forEach" in detail
+    assert "只显示命中项" in detail
+    assert "catalogue-only" in detail
+    assert "place.check_in_time" in detail
+    assert "place.check_out_time" in detail
+    assert "place.thumbnail" in detail
+    assert "place.images" in detail
+    assert "rate.total_before_taxes" in detail
+    assert "nightlyBeforeTaxes" in detail
+    assert "totalBeforeTaxes" in detail
+    assert "!url.username&&!url.password" in detail
+    assert 'url.port==="443"' in detail
+    assert "privateHostname(url.hostname)" in detail
     assert "innerHTML" not in detail
 
 

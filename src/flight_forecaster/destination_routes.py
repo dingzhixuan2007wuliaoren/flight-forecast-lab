@@ -208,6 +208,21 @@ def _hotel_category(property_type: str) -> str:
     return "hotel"
 
 
+def _hotel_stay_hours(
+    offer: HotelPriceOffer,
+    *,
+    language: Literal["zh-cn", "en"],
+) -> str | None:
+    parts: list[str] = []
+    if offer.check_in_time is not None:
+        label = "入住" if language == "zh-cn" else "Check-in"
+        parts.append(f"{label} {offer.check_in_time}")
+    if offer.check_out_time is not None:
+        label = "退房" if language == "zh-cn" else "Check-out"
+        parts.append(f"{label} {offer.check_out_time}")
+    return " · ".join(parts) or None
+
+
 def _destination_error(exc: Exception) -> HTTPException:
     if isinstance(exc, DestinationValidationError):
         return HTTPException(status_code=422, detail=str(exc))
@@ -509,13 +524,19 @@ def destination_hotel_price_detail(
         route_result
     )
     price = _safe_offer(offer, language=_language(request.language))
+    stay_hours = _hotel_stay_hours(
+        offer,
+        language=_language(request.language),
+    )
     if osm_place is None:
         hotel = {
             **price,
             "place_id": None,
             "kind": "hotel",
-            "address": None,
+            "address": offer.address,
             "opening_hours": None,
+            "hours": stay_hours,
+            "phone": offer.phone,
         }
         source = _source_chain("serpapi_google_hotels", transport_source)
     else:
@@ -524,9 +545,10 @@ def destination_hotel_price_detail(
             "place_id": osm_place.place_id,
             "kind": "hotel",
             "name_en": osm_place.name_en,
-            "address": osm_place.address,
+            "address": osm_place.address or offer.address,
             "opening_hours": osm_place.opening_hours,
-            "phone": osm_place.phone,
+            "hours": stay_hours,
+            "phone": osm_place.phone or offer.phone,
             "source_url": osm_place.source_url,
         }
         source = _source_chain(

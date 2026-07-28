@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
+from math import log1p
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -13,6 +14,8 @@ from flight_forecaster.availability import (
     FlightOfferSearchResult,
     FlightOfferSegment,
     ProviderDiagnostic,
+    RouteCabinMarketHistory,
+    RouteCabinMarketPricePoint,
 )
 from flight_forecaster.context import (
     AIRLABS_FREE_SAMPLE_LIMIT,
@@ -301,6 +304,7 @@ def _fare_result(
     offer: ConfirmedFlightOffer,
     *,
     observed_at: datetime,
+    historical_market_contexts: tuple[RouteCabinMarketHistory, ...] = (),
 ) -> FlightOfferSearchResult:
     return FlightOfferSearchResult(
         offers=(offer,),
@@ -320,6 +324,32 @@ def _fare_result(
         verification_attempted_count=1,
         verified_candidate_count=1,
         coverage_status="complete",
+        historical_market_contexts=historical_market_contexts,
+    )
+
+
+def _market_history(
+    *,
+    departure_date: date,
+    observed_at: datetime,
+    cabin: Cabin = "economy",
+) -> RouteCabinMarketHistory:
+    return RouteCabinMarketHistory(
+        origin="YYZ",
+        destination="LHR",
+        departure_date=departure_date,
+        cabin=cabin,
+        provider_observed_at=observed_at,
+        points=(
+            RouteCabinMarketPricePoint(
+                observed_at=observed_at - timedelta(days=2),
+                price_usd=480.0,
+            ),
+            RouteCabinMarketPricePoint(
+                observed_at=observed_at - timedelta(days=1),
+                price_usd=500.0,
+            ),
+        ),
     )
 
 
@@ -738,6 +768,12 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
         _fare_result(
             _confirmed_offer(selected_date=selected_date, verified_at=generated_at),
             observed_at=generated_at,
+            historical_market_contexts=(
+                _market_history(
+                    departure_date=selected_date,
+                    observed_at=generated_at,
+                ),
+            ),
         )
     )
     service = PredictionService(
@@ -776,6 +812,17 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
     assert result.fare_search_metadata.monthly_calls_used == 2
     assert result.fare_search_metadata.search_monthly_limit == 250
     assert result.fare_search_metadata.pricing_monthly_limit is None
+    assert len(result.historical_market_contexts) == 1
+    comparison_history = result.historical_market_contexts[0]
+    assert comparison_history.scope == "route_departure_date_cabin_market"
+    assert (
+        comparison_history.relation_to_offer
+        == "market_context_not_selected_offer_history"
+    )
+    assert comparison_history.cabin == "economy"
+    assert [point.price_usd for point in comparison_history.points] == [480.0, 500.0]
+    assert "不是所选航班" in comparison_history.notice.zh
+    assert "not price history for the selected flight" in comparison_history.notice.en
 
     selected = next(offer for offer in result.offers if offer.cabin == "economy")
     detail = service.offer_detail(
@@ -805,7 +852,17 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
     assert fare_provider.force_refresh_values == [False, False, True]
     curve = detail.price_curve
     assert curve.status == "model_projection"
+    assert curve.basis == "verified_fare_anchored_synthetic_trajectory"
+    assert curve.calibration_method == "log1p_offset_to_verified_fare"
+    assert curve.interval_basis == "synthetic_demo_interval_log1p_shifted"
     assert curve.historical_prices_available is False
+    assert curve.anchor_price_usd == 512.34
+    assert curve.anchor_verified_at == generated_at
+    assert curve.anchor_provider_code == "serpapi_google_flights"
+    assert curve.raw_model_start_price_usd == selected.estimated_price_usd
+    assert curve.calibration_log1p_offset == pytest.approx(
+        log1p(512.34) - log1p(selected.estimated_price_usd)
+    )
     assert curve.start_date == date(2026, 7, 14)
     assert curve.end_date == selected_date
     assert [point.quote_date for point in curve.points] == [
@@ -813,7 +870,7 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
         date(2026, 7, 15),
         date(2026, 7, 16),
     ]
-    assert curve.points[0].estimated_price_usd == selected.estimated_price_usd
+    assert curve.points[0].estimated_price_usd == 512.34
     assert all(
         point.interval_80_low_usd <= point.estimated_price_usd <= point.interval_80_high_usd
         for point in curve.points
@@ -823,8 +880,9 @@ def test_strict_priced_offer_has_detail_and_daily_model_price_curve(
         for first, second in zip(curve.points, curve.points[1:], strict=False)
     )
     assert curve.points[-1].quote_time.astimezone(UTC) < departure.astimezone(UTC)
-    assert "不是已采集的历史票价" in curve.notice.zh
-    assert "not collected fare history" in curve.notice.en
+    assert "第一个点精确等于本次已验证实时报价" in curve.notice.zh
+    assert "first point exactly equals" in curve.notice.en
+    assert detail.historical_market_context == comparison_history
 
 
 def test_priced_connection_preserves_each_leg_layover_and_live_fare_ranking(
@@ -965,7 +1023,14 @@ def test_priced_connection_preserves_each_leg_layover_and_live_fare_ranking(
     assert detail.itinerary.layovers[0].airport == "FRA"
     assert detail.itinerary.layovers[0].duration_minutes == 600
     assert detail.itinerary.total_duration_minutes == 1_110
-    assert detail.price_curve.points[0].estimated_price_usd == cheapest.estimated_price_usd
+    assert (
+        detail.price_curve.points[0].estimated_price_usd
+        == cheapest.live_fare.total_amount
+    )
+    assert (
+        detail.price_curve.raw_model_start_price_usd
+        == cheapest.estimated_price_usd
+    )
 
 
 def test_unknown_airline_requires_a_priced_cabin_and_is_not_expanded(

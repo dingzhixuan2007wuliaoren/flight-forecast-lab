@@ -92,7 +92,8 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert "segments.slice(0,MAX_STRICT_ITINERARY_SEGMENTS+1)" in offer_page
     assert "segments.length<=MAX_STRICT_ITINERARY_SEGMENTS" in offer_page
     assert 'id="curve-chart"' in offer_page
-    assert "historical_prices_available" in offer_page
+    assert "historical_market_context" in offer_page
+    assert 'id="historical-data"' in offer_page
     assert "本次准点预测已忽略天气变量。" in offer_page
     assert "Weather was omitted from this on-time prediction." in offer_page
     assert "weather_feature_status" in offer_page
@@ -100,7 +101,7 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert "coverageCacheSnapshot" in dashboard
     assert "600000" in offer_page
     assert "150000" not in offer_page
-    assert "minimumDaySpacing=96" in offer_page
+    assert "minimumDaySpacing=72" in offer_page
     assert "points.forEach(function(xPoint,pointIndex)" in offer_page
     assert "Math.min(5,points.length)" not in offer_page
     assert "overflow-x:auto" in offer_page

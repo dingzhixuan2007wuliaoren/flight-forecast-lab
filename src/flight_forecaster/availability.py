@@ -89,6 +89,8 @@ SERPAPI_MAX_HOURLY_LIMIT = 50
 MAX_PROVIDER_CACHE_AGE_SECONDS = 65 * 60
 MAX_PROVIDER_FUTURE_SKEW_SECONDS = 5 * 60
 PROVIDER_CACHE_HIT_AGE_SECONDS = 60
+MAX_SERPAPI_PRICE_HISTORY_POINTS = 400
+MIN_SERPAPI_PRICE_HISTORY_TIMESTAMP = int(datetime(2000, 1, 1, tzinfo=UTC).timestamp())
 # Poll only the original allowlisted Search ID.  The roughly 15-second bounded
 # window is long enough for asynchronous deep searches without submitting a
 # second paid search just because the ordinary five-second window was short.
@@ -323,6 +325,73 @@ class ConfirmedFlightOffer:
 
 
 @dataclass(frozen=True, slots=True)
+class RouteCabinMarketPricePoint:
+    """One sanitized query-level Google Flights market-history observation."""
+
+    observed_at: datetime
+    price_usd: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observed_at", _utc(self.observed_at))
+        amount = _finite_amount(self.price_usd)
+        if amount is None or amount <= 0:
+            raise ValueError("market-history price must be a positive finite amount")
+        object.__setattr__(self, "price_usd", amount)
+
+
+@dataclass(frozen=True, slots=True)
+class RouteCabinMarketHistory:
+    """Sanitized SerpApi query history, never a selected-offer price history."""
+
+    origin: str
+    destination: str
+    departure_date: date
+    cabin: Cabin
+    provider_observed_at: datetime
+    points: tuple[RouteCabinMarketPricePoint, ...]
+    provider_code: Literal["serpapi_google_flights"] = SERPAPI_PROVIDER_CODE
+    provider_name: Literal["SerpApi Google Flights"] = SERPAPI_PROVIDER_NAME
+    currency: Literal["USD"] = "USD"
+    scope: Literal["route_departure_date_cabin_market"] = (
+        "route_departure_date_cabin_market"
+    )
+
+    def __post_init__(self) -> None:
+        origin = _iata(self.origin)
+        destination = _iata(self.destination)
+        if (
+            origin is None
+            or destination is None
+            or origin == destination
+            or isinstance(self.departure_date, datetime)
+            or not isinstance(self.departure_date, date)
+            or self.cabin not in _CABINS
+        ):
+            raise ValueError("market-history query identity is invalid")
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "destination", destination)
+        observed_at = _utc(self.provider_observed_at)
+        object.__setattr__(self, "provider_observed_at", observed_at)
+        points = tuple(self.points)
+        object.__setattr__(self, "points", points)
+        if not 1 <= len(points) <= MAX_SERPAPI_PRICE_HISTORY_POINTS:
+            raise ValueError("market-history point count is invalid")
+        point_times = [point.observed_at for point in points]
+        if point_times != sorted(set(point_times)):
+            raise ValueError("market-history timestamps must be unique and increasing")
+        latest_allowed = observed_at.timestamp() + MAX_PROVIDER_FUTURE_SKEW_SECONDS
+        if any(point.observed_at.timestamp() > latest_allowed for point in points):
+            raise ValueError("market-history contains a future observation")
+        if (
+            self.provider_code != SERPAPI_PROVIDER_CODE
+            or self.provider_name != SERPAPI_PROVIDER_NAME
+            or self.currency != "USD"
+            or self.scope != "route_departure_date_cabin_market"
+        ):
+            raise ValueError("market-history provider attribution is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class FlightOfferSearchResult:
     """Strict offers plus conservative local request-attempt accounting.
 
@@ -363,6 +432,7 @@ class FlightOfferSearchResult:
     provider_code: str = SERPAPI_PROVIDER_CODE
     provider_name: str = SERPAPI_PROVIDER_NAME
     provider_runs: tuple[FlightOfferSearchResult, ...] = ()
+    historical_market_contexts: tuple[RouteCabinMarketHistory, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "offers", tuple(self.offers))
@@ -370,6 +440,11 @@ class FlightOfferSearchResult:
         object.__setattr__(self, "searched_cabins", tuple(self.searched_cabins))
         object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
         object.__setattr__(self, "provider_runs", tuple(self.provider_runs))
+        object.__setattr__(
+            self,
+            "historical_market_contexts",
+            tuple(self.historical_market_contexts),
+        )
         allowed_provider_names = {
             "none": "No strict fare provider",
             SERPAPI_PROVIDER_CODE: SERPAPI_PROVIDER_NAME,
@@ -413,6 +488,31 @@ class FlightOfferSearchResult:
                 for offer in self.offers
             ):
                 raise ValueError("every fare-search offer must match the result provider")
+        market_context_keys = [
+            (
+                context.provider_code,
+                context.origin,
+                context.destination,
+                context.departure_date,
+                context.cabin,
+            )
+            for context in self.historical_market_contexts
+        ]
+        if len(market_context_keys) != len(set(market_context_keys)):
+            raise ValueError("fare-search market histories must be unique")
+        if self.provider_code == AGGREGATE_PROVIDER_CODE:
+            if self.historical_market_contexts:
+                raise ValueError(
+                    "aggregate market histories must remain attributed to provider runs"
+                )
+        elif self.provider_code == SERPAPI_PROVIDER_CODE:
+            if any(
+                context.provider_code != SERPAPI_PROVIDER_CODE
+                for context in self.historical_market_contexts
+            ):
+                raise ValueError("SerpApi result contains another provider's market history")
+        elif self.historical_market_contexts:
+            raise ValueError("non-SerpApi results cannot contain SerpApi market history")
         if self.provider_code == IGNAV_QUARANTINE_PROVIDER_CODE and self.offers:
             raise ValueError("quarantined Ignav evidence cannot supply strict offers")
         if self.coverage_scope != "provider_returned_booking_verification_candidates":
@@ -1292,6 +1392,20 @@ class SerpApiFlightOfferProvider:
                 retry_quota_limited=search_retry_quota_limited,
             )
 
+        historical_market_contexts = tuple(
+            context
+            for cabin, payload in payloads.items()
+            if (
+                context := _parse_serpapi_market_history(
+                    payload,
+                    origin=origin,
+                    destination=destination,
+                    departure_date=departure_date,
+                    cabin=cabin,
+                )
+            )
+            is not None
+        )
         candidates = self._select_candidates(payloads, origin, destination, departure_date)
         if not candidates:
             coverage_status = _candidate_coverage_status(
@@ -1312,6 +1426,7 @@ class SerpApiFlightOfferProvider:
                 coverage_status=coverage_status,
                 quota_limit=search_quota_limit,
                 retry_quota_limited=search_retry_quota_limited,
+                historical_market_contexts=historical_market_contexts,
             )
 
         confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
@@ -1351,6 +1466,7 @@ class SerpApiFlightOfferProvider:
                     ),
                     quota_limit=search_quota_limit,
                     retry_quota_limited=search_retry_quota_limited,
+                    historical_market_contexts=historical_market_contexts,
                 )
             return self._diagnostic_result(
                 "provider_unavailable",
@@ -1360,6 +1476,7 @@ class SerpApiFlightOfferProvider:
                 search_calls_used=search_calls_used,
                 conservative_monthly_used=search_monthly_used,
                 eligible_candidate_count=len(candidates),
+                historical_market_contexts=historical_market_contexts,
             )
         reserved_candidates = list(enumerate(candidates[: booking_reservation.reserved_calls]))
 
@@ -1487,6 +1604,7 @@ class SerpApiFlightOfferProvider:
                 coverage_status=coverage_status,
                 quota_limit=quota_limit,
                 retry_quota_limited=retry_quota_limited,
+                historical_market_contexts=historical_market_contexts,
             )
         failure_status = _failure_status([*failures, *booking_failures])
         if failure_status is not None:
@@ -1516,6 +1634,7 @@ class SerpApiFlightOfferProvider:
             coverage_status=coverage_status,
             quota_limit=quota_limit,
             retry_quota_limited=retry_quota_limited,
+            historical_market_contexts=historical_market_contexts,
         )
 
     def _account_quota(self, diagnostics: _DiagnosticCollector) -> _AccountQuota:
@@ -2082,6 +2201,7 @@ class SerpApiFlightOfferProvider:
         coverage_status: CandidateCoverageStatus = "not_evaluated",
         quota_limit: QuotaLimit | None = None,
         retry_quota_limited: bool = False,
+        historical_market_contexts: tuple[RouteCabinMarketHistory, ...] = (),
     ) -> FlightOfferSearchResult:
         return FlightOfferSearchResult(
             offers=offers,
@@ -2113,6 +2233,7 @@ class SerpApiFlightOfferProvider:
             coverage_status=coverage_status,
             quota_limit=quota_limit,
             retry_quota_limited=retry_quota_limited,
+            historical_market_contexts=historical_market_contexts,
         )
 
     def _diagnostic_result(
@@ -2194,6 +2315,88 @@ def flight_offer_provider_from_env(
             providers += (ignav,)
         return FallbackFlightOfferProvider(providers)
     return NullFlightOfferProvider()
+
+
+def _parse_serpapi_market_history(
+    payload: dict[str, Any],
+    *,
+    origin: str,
+    destination: str,
+    departure_date: date,
+    cabin: Cabin,
+) -> RouteCabinMarketHistory | None:
+    """Fail closed on malformed optional history without rejecting strict fares.
+
+    ``price_insights.price_history`` belongs to the route/date/cabin search, not
+    to any selected itinerary or booking seller.  The provider payload has
+    already passed search-parameter and freshness validation before this helper
+    is called.  Optional malformed history is discarded as a whole so it cannot
+    weaken or contaminate the separately verified strict-offer path.
+    """
+
+    insights = payload.get("price_insights")
+    if insights is None:
+        return None
+    if not isinstance(insights, dict):
+        return None
+    raw_history = insights.get("price_history")
+    if raw_history is None:
+        return None
+    if (
+        not isinstance(raw_history, list)
+        or not 1 <= len(raw_history) <= MAX_SERPAPI_PRICE_HISTORY_POINTS
+    ):
+        return None
+    metadata = payload.get("search_metadata")
+    provider_observed_at = (
+        _provider_created_at(metadata.get("created_at"))
+        if isinstance(metadata, dict)
+        else None
+    )
+    if provider_observed_at is None:
+        return None
+    latest_allowed = int(
+        provider_observed_at.timestamp() + MAX_PROVIDER_FUTURE_SKEW_SECONDS
+    )
+    by_timestamp: dict[int, float] = {}
+    for raw_point in raw_history:
+        if not isinstance(raw_point, list) or len(raw_point) != 2:
+            return None
+        raw_timestamp, raw_price = raw_point
+        if (
+            isinstance(raw_timestamp, bool)
+            or not isinstance(raw_timestamp, int)
+            or raw_timestamp < MIN_SERPAPI_PRICE_HISTORY_TIMESTAMP
+            or raw_timestamp > latest_allowed
+            or isinstance(raw_price, bool)
+            or not isinstance(raw_price, (int, float))
+        ):
+            return None
+        price = _finite_amount(raw_price)
+        if price is None or price <= 0:
+            return None
+        existing = by_timestamp.get(raw_timestamp)
+        if existing is not None and existing != price:
+            return None
+        by_timestamp[raw_timestamp] = price
+    try:
+        points = tuple(
+            RouteCabinMarketPricePoint(
+                observed_at=datetime.fromtimestamp(timestamp, tz=UTC),
+                price_usd=price,
+            )
+            for timestamp, price in sorted(by_timestamp.items())
+        )
+        return RouteCabinMarketHistory(
+            origin=origin,
+            destination=destination,
+            departure_date=departure_date,
+            cabin=cabin,
+            provider_observed_at=provider_observed_at,
+            points=points,
+        )
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
 
 
 def _parse_search_candidate(

@@ -34,6 +34,8 @@ from flight_forecaster.availability import (
     ConfirmedFlightOffer,
     FlightOfferSearchResult,
     FlightOfferSegment,
+    RouteCabinMarketHistory,
+    RouteCabinMarketPricePoint,
 )
 from flight_forecaster.context import ContextProvider
 from flight_forecaster.schedules import ScheduleSearchResult
@@ -1091,6 +1093,25 @@ def _offer_result(
         provider_code=provider_code,
         provider_name=provider_name,
     )
+    historical_market_contexts = (
+        (
+            RouteCabinMarketHistory(
+                origin="YYZ",
+                destination="LHR",
+                departure_date=DEPARTURE_DATE,
+                cabin="economy",
+                provider_observed_at=NOW,
+                points=(
+                    RouteCabinMarketPricePoint(
+                        observed_at=NOW - timedelta(days=1),
+                        price_usd=499.0,
+                    ),
+                ),
+            ),
+        )
+        if provider_code == SERPAPI_PROVIDER_CODE
+        else ()
+    )
     return FlightOfferSearchResult(
         offers=(offer,),
         status="confirmed_offers",
@@ -1109,6 +1130,7 @@ def _offer_result(
         coverage_status="complete",
         provider_code=provider_code,
         provider_name=provider_name,
+        historical_market_contexts=historical_market_contexts,
     )
 
 
@@ -1132,6 +1154,17 @@ def test_fallback_queries_every_strict_provider_and_aggregates_confirmed_runs() 
     assert result.status == "confirmed_offers"
     assert len(result.offers) == 1
     assert len(result.provider_runs) == 2
+    assert result.historical_market_contexts == ()
+    serpapi_run = next(
+        run
+        for run in result.provider_runs
+        if run.provider_code == SERPAPI_PROVIDER_CODE
+    )
+    assert len(serpapi_run.historical_market_contexts) == 1
+    assert (
+        serpapi_run.historical_market_contexts[0].scope
+        == "route_departure_date_cabin_market"
+    )
     assert {run.provider_code for run in result.provider_runs} == {
         SERPAPI_PROVIDER_CODE,
         SEARCHAPI_PROVIDER_CODE,
@@ -1593,6 +1626,14 @@ def test_aggregate_attribution_survives_comparison_and_each_offer_detail(
     assert comparison.fare_search_metadata.provider_code == AGGREGATE_PROVIDER_CODE
     assert len(comparison.fare_search_metadata.provider_runs) == 2
     assert len(comparison.offers) == 2
+    assert len(comparison.historical_market_contexts) == 1
+    assert comparison.historical_market_contexts[0].provider_code == (
+        SERPAPI_PROVIDER_CODE
+    )
+    assert (
+        comparison.historical_market_contexts[0].relation_to_offer
+        == "market_context_not_selected_offer_history"
+    )
     assert {offer.live_fare.provider_code for offer in comparison.offers} == {
         SERPAPI_PROVIDER_CODE,
         SEARCHAPI_PROVIDER_CODE,
@@ -1610,6 +1651,12 @@ def test_aggregate_attribution_survives_comparison_and_each_offer_detail(
         )
         assert detail.fare_search_metadata is not None
         assert detail.fare_search_metadata.provider_code == AGGREGATE_PROVIDER_CODE
+        assert detail.historical_market_context is not None
+        assert detail.historical_market_context.provider_code == SERPAPI_PROVIDER_CODE
+        assert (
+            detail.historical_market_context.relation_to_offer
+            == "market_context_not_selected_offer_history"
+        )
         expected_basis = {
             SERPAPI_PROVIDER_CODE: "serpapi_booking_confirmed",
             SEARCHAPI_PROVIDER_CODE: "searchapi_booking_confirmed",

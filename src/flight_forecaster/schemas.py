@@ -555,6 +555,59 @@ class FareCoverageReference(BaseModel):
         return self
 
 
+class HistoricalMarketPricePoint(BaseModel):
+    """One SerpApi Google Flights query-level historical market observation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_at: datetime
+    price_usd: float = Field(gt=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_point(self) -> HistoricalMarketPricePoint:
+        _require_timezone(self.observed_at)
+        return self
+
+
+class HistoricalMarketContext(BaseModel):
+    """Route/date/cabin market history that is not a selected-offer history."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["available"] = "available"
+    provider_code: Literal["serpapi_google_flights"] = "serpapi_google_flights"
+    provider_name: Literal["SerpApi Google Flights"] = "SerpApi Google Flights"
+    scope: Literal["route_departure_date_cabin_market"] = (
+        "route_departure_date_cabin_market"
+    )
+    relation_to_offer: Literal["market_context_not_selected_offer_history"] = (
+        "market_context_not_selected_offer_history"
+    )
+    origin: str = Field(pattern=r"^[A-Z]{3}$")
+    destination: str = Field(pattern=r"^[A-Z]{3}$")
+    departure_date: date
+    cabin: Cabin
+    currency: Literal["USD"] = "USD"
+    provider_observed_at: datetime
+    points: list[HistoricalMarketPricePoint] = Field(min_length=1, max_length=400)
+    notice: BilingualText
+
+    @model_validator(mode="after")
+    def validate_context(self) -> HistoricalMarketContext:
+        _require_timezone(self.provider_observed_at)
+        if self.origin == self.destination:
+            raise ValueError("historical market origin and destination must differ")
+        observed_times = [point.observed_at for point in self.points]
+        if observed_times != sorted(set(observed_times)):
+            raise ValueError(
+                "historical market observations must be unique and increasing"
+            )
+        latest_allowed = self.provider_observed_at.astimezone(UTC) + timedelta(minutes=5)
+        if any(point.observed_at.astimezone(UTC) > latest_allowed for point in self.points):
+            raise ValueError("historical market context contains a future observation")
+        return self
+
+
 class ProviderMetadata(BaseModel):
     status: SignalStatus
     source: str
@@ -1449,6 +1502,10 @@ class ComparisonResponse(BaseModel):
         default_factory=list,
         max_length=2,
     )
+    historical_market_contexts: list[HistoricalMarketContext] = Field(
+        default_factory=list,
+        max_length=4,
+    )
     timetable_references: list[TimetableReference] = Field(default_factory=list)
     schedule_sample_truncated: bool
     schedule_sample_limit: Literal[50] = 50
@@ -1462,6 +1519,19 @@ class ComparisonResponse(BaseModel):
             raise ValueError("fare reference provider codes must be unique")
         if any(reference.can_supply_strict_offers for reference in self.fare_reference_snapshots):
             raise ValueError("fare coverage references cannot supply strict offers")
+        market_context_keys = [
+            (context.provider_code, context.cabin)
+            for context in self.historical_market_contexts
+        ]
+        if len(market_context_keys) != len(set(market_context_keys)):
+            raise ValueError("historical market contexts must be unique by provider and cabin")
+        if any(
+            context.origin != self.origin
+            or context.destination != self.destination
+            or context.departure_date != self.departure_date
+            for context in self.historical_market_contexts
+        ):
+            raise ValueError("historical market context must match the comparison query")
         offer_ids = [offer.id for offer in self.offers]
         if len(offer_ids) != len(set(offer_ids)):
             raise ValueError("comparison offer ids must be unique")
@@ -1819,8 +1889,25 @@ class PriceForecastPoint(BaseModel):
 
 class PriceForecastCurve(BaseModel):
     status: Literal["model_projection"] = "model_projection"
-    basis: Literal["synthetic_demo_model"] = "synthetic_demo_model"
+    basis: Literal["verified_fare_anchored_synthetic_trajectory"] = (
+        "verified_fare_anchored_synthetic_trajectory"
+    )
+    calibration_method: Literal["log1p_offset_to_verified_fare"] = (
+        "log1p_offset_to_verified_fare"
+    )
+    interval_basis: Literal["synthetic_demo_interval_log1p_shifted"] = (
+        "synthetic_demo_interval_log1p_shifted"
+    )
     currency: Literal["USD"] = "USD"
+    anchor_price_usd: float = Field(gt=0.0, allow_inf_nan=False)
+    anchor_verified_at: datetime
+    anchor_provider_code: Literal[
+        "serpapi_google_flights",
+        "searchapi_google_flights",
+        "ignav_verified_fares",
+    ]
+    raw_model_start_price_usd: float = Field(ge=0.0, allow_inf_nan=False)
+    calibration_log1p_offset: float = Field(allow_inf_nan=False)
     start_date: date
     end_date: date
     generated_at: datetime
@@ -1832,6 +1919,7 @@ class PriceForecastCurve(BaseModel):
     @model_validator(mode="after")
     def validate_curve(self) -> PriceForecastCurve:
         _require_timezone(self.generated_at)
+        _require_timezone(self.anchor_verified_at)
         if self.end_date < self.start_date:
             raise ValueError("price curve end date cannot precede its start date")
         quote_dates = [point.quote_date for point in self.points]
@@ -1839,6 +1927,8 @@ class PriceForecastCurve(BaseModel):
             raise ValueError("price curve quote dates must be unique and increasing")
         if quote_dates[0] != self.start_date or quote_dates[-1] != self.end_date:
             raise ValueError("price curve points must include the start and end dates")
+        if self.points[0].estimated_price_usd != self.anchor_price_usd:
+            raise ValueError("price curve must start exactly at its verified fare anchor")
         return self
 
 
@@ -1856,6 +1946,7 @@ class OfferDetailResponse(BaseModel):
     fare_search_metadata: FareSearchMetadata | None = None
     offer: ComparisonOffer
     itinerary: OfferItinerary
+    historical_market_context: HistoricalMarketContext | None = None
     price_curve: PriceForecastCurve
     notice: BilingualText
 
@@ -1876,4 +1967,21 @@ class OfferDetailResponse(BaseModel):
         }[fare.provider_code]
         if any(leg.data_basis != provider_basis for leg in self.itinerary.legs):
             raise ValueError("offer detail itinerary basis must match the live-fare provider")
+        if (
+            self.price_curve.anchor_provider_code != fare.provider_code
+            or self.price_curve.anchor_price_usd != fare.total_amount
+            or self.price_curve.anchor_verified_at != fare.verified_at
+            or self.price_curve.raw_model_start_price_usd
+            != self.offer.estimated_price_usd
+        ):
+            raise ValueError("price curve anchor must match the selected live fare")
+        if self.historical_market_context is not None and (
+            self.historical_market_context.origin != self.origin
+            or self.historical_market_context.destination != self.destination
+            or self.historical_market_context.departure_date != self.departure_date
+            or self.historical_market_context.cabin != fare.cabin_summary
+        ):
+            raise ValueError(
+                "historical market context must match the selected route, date, and cabin"
+            )
         return self

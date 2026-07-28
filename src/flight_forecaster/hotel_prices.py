@@ -260,6 +260,12 @@ class HotelPriceOffer:
     amenities: tuple[str, ...]
     website_url: str
     observed_at: datetime
+    address: str | None = None
+    phone: str | None = None
+    check_in_time: str | None = None
+    check_out_time: str | None = None
+    thumbnail: str | None = None
+    images: tuple[str, ...] = ()
     room_rates: tuple[HotelRoomRate, ...] = ()
     review_sources: tuple[HotelReviewSource, ...] = ()
     room_rates_status: HotelDetailEvidenceStatus = "not_requested"
@@ -269,6 +275,7 @@ class HotelPriceOffer:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "amenities", tuple(self.amenities))
+        object.__setattr__(self, "images", tuple(self.images))
         object.__setattr__(self, "room_rates", tuple(self.room_rates))
         object.__setattr__(self, "review_sources", tuple(self.review_sources))
         object.__setattr__(self, "observed_at", _as_utc(self.observed_at))
@@ -297,6 +304,24 @@ class HotelPriceOffer:
             raise ValueError("hotel currency is invalid")
         if _safe_public_url(self.website_url) is None:
             raise ValueError("hotel website URL is invalid")
+        if self.address is not None and _safe_text(self.address, 700) is None:
+            raise ValueError("hotel address is invalid")
+        if self.phone is not None and _safe_text(self.phone, 100) is None:
+            raise ValueError("hotel phone is invalid")
+        if self.check_in_time is not None and _safe_text(
+            self.check_in_time, 80
+        ) is None:
+            raise ValueError("hotel check-in time is invalid")
+        if self.check_out_time is not None and _safe_text(
+            self.check_out_time, 80
+        ) is None:
+            raise ValueError("hotel check-out time is invalid")
+        if self.thumbnail is not None and _safe_public_url(self.thumbnail) is None:
+            raise ValueError("hotel thumbnail is invalid")
+        if len(self.images) > 20 or any(
+            _safe_public_url(item) is None for item in self.images
+        ):
+            raise ValueError("hotel images are invalid")
         if len(self.amenities) > 40 or any(
             _safe_text(item, 100) is None for item in self.amenities
         ):
@@ -338,6 +363,12 @@ class HotelPriceOffer:
             "amenities": list(self.amenities),
             "website_url": self.website_url,
             "observed_at": self.observed_at.isoformat(),
+            "address": self.address,
+            "phone": self.phone,
+            "check_in_time": self.check_in_time,
+            "check_out_time": self.check_out_time,
+            "thumbnail": self.thumbnail,
+            "images": list(self.images),
             "room_rates": [item.as_safe_dict() for item in self.room_rates],
             "review_sources": [item.as_safe_dict() for item in self.review_sources],
             "room_rates_status": self.room_rates_status,
@@ -884,10 +915,9 @@ class SerpApiHotelPriceProvider:
             _validate_search_echo(payload, stay)
             offers = _parse_offers(payload, stay, observed_at)
             self._remember_property_tokens(payload, stay, offers)
-            raw_properties = payload.get("properties")
+            raw_properties = _property_rows(payload)
             if (
-                isinstance(raw_properties, list)
-                and raw_properties
+                raw_properties
                 and not offers
                 and not any(_safe_property_identity(row) for row in raw_properties)
             ):
@@ -1031,6 +1061,14 @@ class SerpApiHotelPriceProvider:
             cached,
             description=_safe_text(detail_row.get("description"), 1_200)
             or cached.description,
+            address=_property_address(detail_row) or cached.address,
+            phone=_property_phone(detail_row) or cached.phone,
+            check_in_time=_safe_text(detail_row.get("check_in_time"), 80)
+            or cached.check_in_time,
+            check_out_time=_safe_text(detail_row.get("check_out_time"), 80)
+            or cached.check_out_time,
+            thumbnail=_property_thumbnail(detail_row) or cached.thumbnail,
+            images=_property_images(detail_row) or cached.images,
             rating=_bounded_float(detail_row.get("overall_rating"), 0, 5)
             if detail_row.get("overall_rating") is not None
             else cached.rating,
@@ -1142,11 +1180,7 @@ class SerpApiHotelPriceProvider:
         stay: _Stay,
         offers: tuple[HotelPriceOffer, ...],
     ) -> None:
-        properties = payload.get("properties")
-        if properties is None:
-            properties = [payload] if _safe_top_level_property(payload) else []
-        elif not isinstance(properties, list):
-            return
+        properties = _property_rows(payload)
         known_ids = {offer.hotel_id for offer in offers}
         for row in properties[:HOTEL_PRICE_MAX_RESULTS]:
             if not isinstance(row, dict):
@@ -1462,14 +1496,7 @@ def _parse_offers(
     stay: _Stay,
     observed_at: datetime,
 ) -> tuple[HotelPriceOffer, ...]:
-    properties = payload.get("properties")
-    if properties is None:
-        properties = [payload] if _safe_top_level_property(payload) else []
-    if not isinstance(properties, list):
-        raise HotelPriceError(
-            "response_invalid",
-            "The hotel price provider property list is invalid.",
-        )
+    properties = _property_rows(payload)
     deduplicated: dict[str, HotelPriceOffer] = {}
     for row in properties[:HOTEL_PRICE_MAX_RESULTS]:
         offer = _parse_offer(row, stay, observed_at)
@@ -1479,6 +1506,28 @@ def _parse_offers(
         if current is None or _price_rank(offer) < _price_rank(current):
             deduplicated[offer.hotel_id] = offer
     return tuple(deduplicated.values())
+
+
+def _property_rows(payload: dict[str, Any]) -> list[Any]:
+    """Return every supported real Google Hotels property response shape."""
+
+    properties = payload.get("properties")
+    if properties is not None:
+        if not isinstance(properties, list):
+            raise HotelPriceError(
+                "response_invalid",
+                "The hotel price provider property list is invalid.",
+            )
+        return properties
+    property_row = payload.get("property")
+    if property_row is not None:
+        if not isinstance(property_row, dict):
+            raise HotelPriceError(
+                "response_invalid",
+                "The hotel price provider property detail is invalid.",
+            )
+        return [property_row]
+    return [payload] if _safe_top_level_property(payload) else []
 
 
 def _safe_property_identity(row: Any) -> bool:
@@ -1563,6 +1612,12 @@ def _parse_offer(
         amenities=amenities,
         website_url=public_link,
         observed_at=observed_at,
+        address=_property_address(row),
+        phone=_property_phone(row),
+        check_in_time=_safe_text(row.get("check_in_time"), 80),
+        check_out_time=_safe_text(row.get("check_out_time"), 80),
+        thumbnail=_property_thumbnail(row),
+        images=_property_images(row),
         room_rates=room_rates,
         review_sources=review_sources,
         room_rates_status="available" if room_rates else "not_requested",
@@ -1625,6 +1680,65 @@ def _selected_price(row: dict[str, Any]) -> dict[str, Any] | None:
         ),
         default=None,
     )
+
+
+def _property_address(row: dict[str, Any]) -> str | None:
+    address = row.get("address")
+    if isinstance(address, dict):
+        for key in ("formatted_address", "address", "full_address"):
+            safe = _safe_text(address.get(key), 700)
+            if safe is not None:
+                return safe
+    return (
+        _safe_text(address, 700)
+        or _safe_text(row.get("formatted_address"), 700)
+        or _safe_text(row.get("full_address"), 700)
+    )
+
+
+def _property_phone(row: dict[str, Any]) -> str | None:
+    return (
+        _safe_text(row.get("phone"), 100)
+        or _safe_text(row.get("phone_number"), 100)
+        or _safe_text(row.get("international_phone_number"), 100)
+    )
+
+
+def _property_thumbnail(row: dict[str, Any]) -> str | None:
+    direct = _safe_public_url(row.get("thumbnail"))
+    if direct is not None:
+        return direct
+    images = row.get("images")
+    if not isinstance(images, list):
+        return None
+    for image in images[:20]:
+        if isinstance(image, dict):
+            thumbnail = _safe_public_url(image.get("thumbnail"))
+            if thumbnail is not None:
+                return thumbnail
+    return None
+
+
+def _property_images(row: dict[str, Any]) -> tuple[str, ...]:
+    raw_images = row.get("images")
+    if not isinstance(raw_images, list):
+        return ()
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_images[:20]:
+        if isinstance(item, dict):
+            candidate = (
+                _safe_public_url(item.get("original_image"))
+                or _safe_public_url(item.get("image"))
+                or _safe_public_url(item.get("thumbnail"))
+            )
+        else:
+            candidate = _safe_public_url(item)
+        if candidate is None or candidate in seen:
+            continue
+        seen.add(candidate)
+        result.append(candidate)
+    return tuple(result)
 
 
 def _verified_property_detail(
@@ -2232,6 +2346,28 @@ def _offer_from_dict(payload: Any) -> HotelPriceOffer:
         amenities=tuple(payload.get("amenities") or ()),
         website_url=str(payload.get("website_url", "")),
         observed_at=_datetime_value(payload.get("observed_at")),
+        address=(
+            str(payload["address"]) if payload.get("address") is not None else None
+        ),
+        phone=(
+            str(payload["phone"]) if payload.get("phone") is not None else None
+        ),
+        check_in_time=(
+            str(payload["check_in_time"])
+            if payload.get("check_in_time") is not None
+            else None
+        ),
+        check_out_time=(
+            str(payload["check_out_time"])
+            if payload.get("check_out_time") is not None
+            else None
+        ),
+        thumbnail=(
+            str(payload["thumbnail"])
+            if payload.get("thumbnail") is not None
+            else None
+        ),
+        images=tuple(payload.get("images") or ()),
         room_rates=tuple(
             _room_rate_from_dict(item)
             for item in (payload.get("room_rates") or ())

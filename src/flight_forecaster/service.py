@@ -21,6 +21,7 @@ from flight_forecaster.availability import (
     ConfirmedFlightOffer,
     FlightOfferSearchResult,
     FlightOfferSegment,
+    RouteCabinMarketHistory,
     flight_offer_provider_from_env,
 )
 from flight_forecaster.catalog import AirlineProfile, get_airline_profile
@@ -56,6 +57,8 @@ from flight_forecaster.schemas import (
     ContextSignal,
     FareCoverageReference,
     FareSearchMetadata,
+    HistoricalMarketContext,
+    HistoricalMarketPricePoint,
     ItineraryLayover,
     ItineraryLeg,
     LiveFare,
@@ -917,6 +920,82 @@ class PredictionService:
         )
 
     @staticmethod
+    def _historical_market_context(
+        history: RouteCabinMarketHistory,
+    ) -> HistoricalMarketContext:
+        """Expose sanitized route/date/cabin history without offer attribution."""
+
+        return HistoricalMarketContext(
+            provider_code=history.provider_code,
+            provider_name=history.provider_name,
+            scope=history.scope,
+            origin=history.origin,
+            destination=history.destination,
+            departure_date=history.departure_date,
+            cabin=history.cabin,
+            currency=history.currency,
+            provider_observed_at=history.provider_observed_at,
+            points=[
+                HistoricalMarketPricePoint(
+                    observed_at=point.observed_at,
+                    price_usd=point.price_usd,
+                )
+                for point in history.points
+            ],
+            notice=BilingualText(
+                zh=(
+                    "这些价格是 SerpApi Google Flights 对相同航线、出发日期和舱位"
+                    "查询返回的市场历史；它们不是所选航班、销售方或当前可购买报价"
+                    "自身的历史。"
+                ),
+                en=(
+                    "These prices are query-level market history returned by SerpApi "
+                    "Google Flights for the same route, departure date, and cabin. "
+                    "They are not price history for the selected flight, seller, or "
+                    "currently bookable offer."
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _historical_market_contexts(
+        result: FlightOfferSearchResult,
+    ) -> list[HistoricalMarketContext]:
+        """Retain SerpApi histories from attributed runs in an aggregate result."""
+
+        source_results = result.provider_runs or (result,)
+        histories_by_key: dict[
+            tuple[str, str, str, date, str],
+            RouteCabinMarketHistory,
+        ] = {}
+        for source_result in source_results:
+            for history in source_result.historical_market_contexts:
+                key = (
+                    history.provider_code,
+                    history.origin,
+                    history.destination,
+                    history.departure_date,
+                    history.cabin,
+                )
+                histories_by_key[key] = history
+        cabin_order = {
+            "economy": 0,
+            "premium_economy": 1,
+            "business": 2,
+            "first": 3,
+        }
+        return [
+            PredictionService._historical_market_context(history)
+            for history in sorted(
+                histories_by_key.values(),
+                key=lambda item: (
+                    cabin_order[item.cabin],
+                    item.provider_code,
+                ),
+            )
+        ]
+
+    @staticmethod
     def _fare_reference_snapshot(
         result: ScrapeDoReferenceResult,
     ) -> FareCoverageReference:
@@ -1426,6 +1505,7 @@ class PredictionService:
             context = context_future.result()
             fare_result = fare_future.result()
 
+        historical_market_contexts = self._historical_market_contexts(fare_result)
         timetable_references: list[TimetableReference] = []
         for schedule in schedule_result.schedules:
             profile = get_airline_profile(schedule.airline_code)
@@ -1875,6 +1955,7 @@ class PredictionService:
             ),
             fare_search_metadata=fare_metadata,
             fare_reference_snapshots=fare_reference_snapshots,
+            historical_market_contexts=historical_market_contexts,
             timetable_references=timetable_references,
             schedule_sample_truncated=schedule_result.sample_truncated,
             schedule_sample_limit=AIRLABS_FREE_SAMPLE_LIMIT,
@@ -1917,8 +1998,10 @@ class PredictionService:
         quote time. They are deliberately not described as observed fare history.
         """
 
-        if offer.scheduled_departure_local is None:
-            raise OfferNotFoundError("strict offer no longer has a complete departure time")
+        if offer.scheduled_departure_local is None or offer.live_fare is None:
+            raise OfferNotFoundError(
+                "strict offer no longer has a complete departure time and live fare"
+            )
         departure = offer.scheduled_departure_local
         departure_utc = departure.astimezone(UTC)
         generated_at = comparison.generated_at.astimezone(UTC)
@@ -1987,28 +2070,76 @@ class PredictionService:
             0.0,
             np.expm1(self.bundle["price_model"].predict(features)),
         )
-        half_width = float(self.bundle["price_interval_half_width_usd"])
-        points = [
-            PriceForecastPoint(
-                quote_date=quote_date,
-                quote_time=quote_time,
-                days_until_departure=round(
-                    (departure_utc - quote_time.astimezone(UTC)).total_seconds() / 86_400.0,
-                    4,
+        raw_estimates = [round(float(estimate), 2) for estimate in estimates]
+        # The comparison already exposes this exact first model prediction. Reuse
+        # that public value as the retained raw baseline so explanation metadata
+        # and the selected comparison row cannot drift by floating-point noise.
+        raw_estimates[0] = offer.estimated_price_usd
+        anchor_price_usd = offer.live_fare.total_amount
+        calibration_log1p_offset = float(
+            np.log1p(anchor_price_usd) - np.log1p(raw_estimates[0])
+        )
+
+        def calibrate(raw_amount: float) -> float:
+            return max(
+                0.0,
+                float(
+                    np.expm1(
+                        np.log1p(max(0.0, raw_amount))
+                        + calibration_log1p_offset
+                    )
                 ),
-                estimated_price_usd=round(float(estimate), 2),
-                interval_80_low_usd=round(max(0.0, float(estimate) - half_width), 2),
-                interval_80_high_usd=round(float(estimate) + half_width, 2),
             )
-            for quote_date, quote_time, estimate in zip(
+
+        half_width = float(self.bundle["price_interval_half_width_usd"])
+        points: list[PriceForecastPoint] = []
+        for index, (quote_date, quote_time, raw_estimate) in enumerate(
+            zip(
                 quote_dates,
                 quote_times,
-                estimates,
+                raw_estimates,
                 strict=True,
             )
-        ]
+        ):
+            calibrated_estimate = (
+                anchor_price_usd
+                if index == 0
+                else round(calibrate(raw_estimate), 2)
+            )
+            calibrated_low = round(
+                calibrate(max(0.0, raw_estimate - half_width)),
+                2,
+            )
+            calibrated_high = round(calibrate(raw_estimate + half_width), 2)
+            points.append(
+                PriceForecastPoint(
+                    quote_date=quote_date,
+                    quote_time=quote_time,
+                    days_until_departure=round(
+                        (
+                            departure_utc - quote_time.astimezone(UTC)
+                        ).total_seconds()
+                        / 86_400.0,
+                        4,
+                    ),
+                    estimated_price_usd=calibrated_estimate,
+                    interval_80_low_usd=min(
+                        calibrated_low,
+                        calibrated_estimate,
+                    ),
+                    interval_80_high_usd=max(
+                        calibrated_high,
+                        calibrated_estimate,
+                    ),
+                )
+            )
         extrapolated = any(point.days_until_departure > 180.0 for point in points)
         return PriceForecastCurve(
+            anchor_price_usd=anchor_price_usd,
+            anchor_verified_at=offer.live_fare.verified_at,
+            anchor_provider_code=offer.live_fare.provider_code,
+            raw_model_start_price_usd=raw_estimates[0],
+            calibration_log1p_offset=calibration_log1p_offset,
             start_date=points[0].quote_date,
             end_date=points[-1].quote_date,
             generated_at=generated_at,
@@ -2016,14 +2147,22 @@ class PredictionService:
             points=points,
             notice=BilingualText(
                 zh=(
-                    "曲线中的全部点由当前一次请求使用同一合成演示模型生成，"
-                    "仅改变模拟查询日期；它不是已采集的历史票价、实时票价或可购买报价。"
-                    + (" 部分点超过模型主要的 180 天训练提前期，属于外推。" if extrapolated else "")
+                    "曲线先由同一合成演示模型仅改变模拟查询日期生成，再对所有点"
+                    "施加同一个 log1p 偏移，使第一个点精确等于本次已验证实时报价。"
+                    "趋势和区间仍是演示模型输出，不是已采集的历史票价、未来实时"
+                    "票价或可购买报价。"
+                    + (
+                        " 部分点超过模型主要的 180 天训练提前期，属于外推。"
+                        if extrapolated
+                        else ""
+                    )
                 ),
                 en=(
-                    "Every point is generated in this request by the same synthetic-demo "
-                    "model while varying only the simulated quote date; this is not collected "
-                    "fare history, a live fare, or a bookable quote."
+                    "Every point is first generated by the same synthetic-demo model while "
+                    "varying only the simulated quote date. One log1p offset is then applied "
+                    "to every point so the first point exactly equals this request's verified "
+                    "live fare. The trajectory and interval remain demo-model outputs, not "
+                    "collected fare history, future live prices, or bookable quotes."
                     + (
                         " Some points extend beyond the model's main 180-day training horizon."
                         if extrapolated
@@ -2133,6 +2272,14 @@ class PredictionService:
             layovers=layovers,
         )
 
+        historical_market_context = next(
+            (
+                context
+                for context in comparison.historical_market_contexts
+                if context.cabin == offer.live_fare.cabin_summary
+            ),
+            None,
+        )
         return OfferDetailResponse(
             origin=request.origin,
             destination=request.destination,
@@ -2147,6 +2294,7 @@ class PredictionService:
             fare_search_metadata=comparison.fare_search_metadata,
             offer=offer,
             itinerary=itinerary,
+            historical_market_context=historical_market_context,
             price_curve=self._price_curve_for_offer(
                 comparison=comparison,
                 offer=offer,

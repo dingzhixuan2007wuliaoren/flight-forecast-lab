@@ -13,6 +13,7 @@ from flight_forecaster.destination_guide import (
     ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS,
     ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS,
     ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS,
+    ATTRACTION_RATING_SOURCE_REGISTRY,
     OVERPASS_ENDPOINTS,
     OVERPASS_FALLBACK_URL,
     OVERPASS_RADIUS_METERS,
@@ -22,6 +23,7 @@ from flight_forecaster.destination_guide import (
     TRANSITOUS_PLAN_URL,
     TRANSITOUS_REQUEST_TIMEOUT_SECONDS,
     WIKIDATA_API_URL,
+    WIKIMEDIA_COMMONS_API_URL,
     WIKIPEDIA_API_URLS,
     BoundedJsonHttpClient,
     DestinationAirportNotFound,
@@ -81,6 +83,8 @@ class FakeTransport:
         self.fail_transit = False
         self.wikidata_entities: dict[str, dict[str, Any]] = {}
         self.wikipedia_pages: dict[str, list[dict[str, Any]]] = {"zh": [], "en": []}
+        self.commons_pages: list[dict[str, Any]] = []
+        self.fail_commons = False
 
     def request_json(
         self,
@@ -138,10 +142,12 @@ class FakeTransport:
         if url in WIKIPEDIA_API_URLS.values():
             language = "zh" if url == WIKIPEDIA_API_URLS["zh"] else "en"
             return {"query": {"pages": self.wikipedia_pages[language]}}
+        if url == WIKIMEDIA_COMMONS_API_URL:
+            if self.fail_commons:
+                raise DestinationDataUnavailable("Commons unavailable")
+            return {"query": {"pages": self.commons_pages}}
         if "routing.openstreetmap.de" in url:
-            mode = next(
-                value for value in ("car", "bike", "foot") if f"routed-{value}" in url
-            )
+            mode = next(value for value in ("car", "bike", "foot") if f"routed-{value}" in url)
             if mode in self.fail_modes:
                 raise DestinationDataUnavailable("route unavailable")
             distance, duration = {
@@ -419,6 +425,7 @@ def test_exact_wikimedia_identity_adds_introductions_and_platform_scores() -> No
                 "tourism": "gallery",
                 "wikidata": "Q1001",
                 "wikipedia": "en:Verified Gallery",
+                "wikimedia_commons": "File:Verified Gallery.jpg",
             },
         }
     ]
@@ -437,34 +444,26 @@ def test_exact_wikimedia_identity_adds_introductions_and_platform_scores() -> No
                 "zhwiki": {"site": "zhwiki", "title": "已验证美术馆"},
             },
             "claims": {
+                "P18": [
+                    {
+                        "rank": "preferred",
+                        "mainsnak": {"datavalue": {"value": "Verified Gallery.jpg"}},
+                    }
+                ],
                 "P444": [
                     {
                         "rank": "normal",
                         "mainsnak": {"datavalue": {"value": "4.7/5"}},
                         "qualifiers": {
-                            "P447": [
-                                {"datavalue": {"value": {"id": "Q2001"}}}
-                            ],
-                            "P7887": [
-                                {"datavalue": {"value": {"amount": "+1234"}}}
-                            ],
-                            "P585": [
-                                {
-                                    "datavalue": {
-                                        "value": {"time": "+2026-01-02T00:00:00Z"}
-                                    }
-                                }
-                            ],
+                            "P447": [{"datavalue": {"value": {"id": "Q2001"}}}],
+                            "P7887": [{"datavalue": {"value": {"amount": "+1234"}}}],
+                            "P585": [{"datavalue": {"value": {"time": "+2026-01-02T00:00:00Z"}}}],
                             "P2699": [
-                                {
-                                    "datavalue": {
-                                        "value": "https://ratings.example.org/gallery"
-                                    }
-                                }
+                                {"datavalue": {"value": "https://ratings.example.org/gallery"}}
                             ],
                         },
                     }
-                ]
+                ],
             },
         },
         "Q2001": {
@@ -479,6 +478,7 @@ def test_exact_wikimedia_identity_adds_introductions_and_platform_scores() -> No
             {
                 "title": "已验证美术馆",
                 "extract": "这是由中文维基百科返回的真实简介。",
+                "pageimage": "Verified Gallery.jpg",
                 "canonicalurl": (
                     "https://zh.wikipedia.org/wiki/"
                     "%E5%B7%B2%E9%AA%8C%E8%AF%81%E7%BE%8E%E6%9C%AF%E9%A6%86"
@@ -489,18 +489,46 @@ def test_exact_wikimedia_identity_adds_introductions_and_platform_scores() -> No
             {
                 "title": "Verified Gallery",
                 "extract": "This is a real introduction returned by English Wikipedia.",
+                "pageimage": "Verified Gallery.jpg",
                 "canonicalurl": "https://en.wikipedia.org/wiki/Verified_Gallery",
             }
         ],
     }
+    transport.commons_pages = [
+        {
+            "title": "File:Verified Gallery.jpg",
+            "imageinfo": [
+                {
+                    "url": (
+                        "https://upload.wikimedia.org/wikipedia/commons/a/ab/Verified_Gallery.jpg"
+                    ),
+                    "thumburl": (
+                        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/"
+                        "Verified_Gallery.jpg/960px-Verified_Gallery.jpg"
+                    ),
+                    "descriptionurl": (
+                        "https://commons.wikimedia.org/wiki/File:Verified_Gallery.jpg"
+                    ),
+                    "width": 2400,
+                    "height": 1600,
+                    "extmetadata": {
+                        "Artist": {"value": "<b>Jane Photographer</b>"},
+                        "Credit": {"value": "Jane Photographer / Museum archive"},
+                        "LicenseShortName": {"value": "CC BY-SA 4.0"},
+                        "LicenseUrl": {
+                            "value": ("https://creativecommons.org/licenses/by-sa/4.0/")
+                        },
+                    },
+                }
+            ],
+        }
+    ]
     service, _, _ = _service(transport=transport)
 
     place = service.list_places("YYZ", "attraction", limit=300).places[0]
 
     assert place.description_zh == "这是由中文维基百科返回的真实简介。"
-    assert place.description_en == (
-        "This is a real introduction returned by English Wikipedia."
-    )
+    assert place.description_en == ("This is a real introduction returned by English Wikipedia.")
     assert place.description_basis == "wikipedia_extract"
     assert place.description_source == "wikipedia"
     assert place.ratings_status == "available"
@@ -514,6 +542,24 @@ def test_exact_wikimedia_identity_adds_introductions_and_platform_scores() -> No
     assert rating.review_count == 1234
     assert rating.point_in_time == "2026-01-02"
     assert rating.source_url == "https://ratings.example.org/gallery"
+    assert rating.subject_wikidata_id == "Q1001"
+    assert rating.source_registry_key == "wikidata_p444"
+    assert rating.identity_match_basis == "osm_wikidata_subject_and_p447_issuer"
+    assert rating.source_status == "source_returned_exact_match"
+    assert place.photo_status == "available"
+    assert place.map_preview is None
+    assert len(place.photos) == 1
+    photo = place.photos[0]
+    assert photo.file_title == "File:Verified Gallery.jpg"
+    assert photo.match_basis == "osm_wikimedia_commons"
+    assert photo.author == "Jane Photographer"
+    assert photo.license_name == "CC BY-SA 4.0"
+    assert photo.attribution == (
+        "Jane Photographer / Museum archive — Jane Photographer — CC BY-SA 4.0"
+    )
+    commons_call = _calls(transport, "commons.wikimedia.org")[0]
+    assert commons_call["params"]["iiprop"] == "url|size|extmetadata"
+    assert commons_call["params"]["titles"] == "File:Verified Gallery.jpg"
 
 
 def test_attraction_without_free_text_gets_only_an_osm_fact_summary() -> None:
@@ -527,6 +573,202 @@ def test_attraction_without_free_text_gets_only_an_osm_fact_summary() -> None:
     assert "Toronto" in (park.description_en or "")
     assert park.ratings == ()
     assert park.ratings_status == "source_not_provided"
+
+
+def test_photo_candidate_priority_uses_p18_before_wikipedia_pageimage() -> None:
+    place = DestinationPlace(
+        place_id="osm_attraction_node_6001",
+        kind="attraction",
+        category="museum",
+        name="Priority Museum",
+        wikidata_id="Q6001",
+        latitude=43.65,
+        longitude=-79.38,
+        distance_from_city_center_km=0.5,
+        source_url="https://www.openstreetmap.org/node/6001",
+    )
+    entity = {
+        "sitelinks": {
+            "enwiki": {"site": "enwiki", "title": "Priority Museum"},
+        },
+        "claims": {
+            "P18": [
+                {
+                    "rank": "normal",
+                    "mainsnak": {"datavalue": {"value": "Wikidata exact image.jpg"}},
+                }
+            ]
+        },
+    }
+
+    candidates = destination_guide._attraction_photo_candidates(
+        place,
+        entity,
+        {
+            ("en", "priority museum"): "Wikipedia page image.jpg",
+        },
+    )
+
+    assert candidates == (
+        ("File:Wikidata exact image.jpg", "wikidata_p18"),
+        ("File:Wikipedia page image.jpg", "wikipedia_pageimage"),
+    )
+
+
+def test_commons_failure_keeps_attraction_and_uses_exact_coordinate_map() -> None:
+    transport = FakeTransport()
+    transport.attractions = [
+        {
+            "type": "node",
+            "id": 7_001,
+            "lat": 43.6512345,
+            "lon": -79.3812345,
+            "tags": {
+                "name": "Photo Candidate Museum",
+                "tourism": "museum",
+                "wikimedia_commons": "File:Candidate Museum.jpg",
+            },
+        }
+    ]
+    transport.fail_commons = True
+    service, _, _ = _service(transport=transport)
+
+    result = service.list_places("YYZ", "attraction")
+
+    assert result.result_count == 1
+    place = result.places[0]
+    assert place.photos == ()
+    assert place.photo_status == "provider_unavailable"
+    assert place.map_preview is not None
+    assert place.map_preview.preview_kind == "exact_coordinate_map"
+    assert place.map_preview.latitude == 43.6512345
+    assert place.map_preview.longitude == -79.3812345
+    assert place.map_preview.source_url == (
+        "https://www.openstreetmap.org/?mlat=43.6512345&mlon=-79.3812345"
+        "#map=15/43.6512345/-79.3812345"
+    )
+
+
+def test_incomplete_commons_license_evidence_is_rejected_as_a_photo() -> None:
+    transport = FakeTransport()
+    transport.attractions = [
+        {
+            "type": "node",
+            "id": 7_002,
+            "lat": 43.65,
+            "lon": -79.38,
+            "tags": {
+                "name": "Unlicensed Candidate",
+                "tourism": "museum",
+                "wikimedia_commons": "File:No license.jpg",
+            },
+        }
+    ]
+    transport.commons_pages = [
+        {
+            "title": "File:No license.jpg",
+            "imageinfo": [
+                {
+                    "url": ("https://upload.wikimedia.org/wikipedia/commons/a/aa/No_license.jpg"),
+                    "descriptionurl": ("https://commons.wikimedia.org/wiki/File:No_license.jpg"),
+                    "width": 1200,
+                    "height": 800,
+                    "extmetadata": {"Artist": {"value": "Known author"}},
+                }
+            ],
+        }
+    ]
+    service, _, _ = _service(transport=transport)
+
+    place = service.list_places("YYZ", "attraction").places[0]
+
+    assert place.photos == ()
+    assert place.photo_status == "source_rejected"
+    assert place.map_preview is not None
+
+
+def test_same_rating_platform_keeps_only_latest_valid_snapshot() -> None:
+    statements = []
+    for score, date, review_count in (
+        ("4.1/5", "+2024-05-01T00:00:00Z", "+100"),
+        ("4.8/5", "+2026-02-03T00:00:00Z", "+900"),
+    ):
+        statements.append(
+            {
+                "rank": "normal",
+                "mainsnak": {"datavalue": {"value": score}},
+                "qualifiers": {
+                    "P447": [{"datavalue": {"value": {"id": "Q9001"}}}],
+                    "P7887": [{"datavalue": {"value": {"amount": review_count}}}],
+                    "P585": [{"datavalue": {"value": {"time": date}}}],
+                },
+            }
+        )
+    ratings = destination_guide._parse_wikidata_ratings(
+        {"claims": {"P444": statements}},
+        entity_id="Q8001",
+        issuer_labels={"Q9001": {"en": "Exact Review Platform"}},
+    )
+
+    assert len(ratings) == 1
+    assert ratings[0].score_text == "4.8/5"
+    assert ratings[0].review_count == 900
+    assert ratings[0].point_in_time == "2026-02-03"
+    assert ratings[0].subject_wikidata_id == "Q8001"
+
+
+def test_rating_source_registry_is_exposed_as_capability_not_query_evidence() -> None:
+    service, _, _ = _service()
+
+    places = service.list_places("YYZ", "attraction")
+    detail = service.get_place_detail(
+        "YYZ",
+        places.places[0].place_id,
+    )
+
+    capabilities = places.attraction_rating_source_capabilities
+    assert capabilities == ATTRACTION_RATING_SOURCE_REGISTRY
+    assert detail.attraction_rating_source_capabilities == capabilities
+    assert len(capabilities) >= 10
+    assert len({item.key for item in capabilities}) == len(capabilities)
+    assert all(
+        item.evidence_policy == "capability_only_not_query_evidence" for item in capabilities
+    )
+    assert {item.adapter_status for item in capabilities} == {
+        "active",
+        "catalogued",
+    }
+    assert all(place.ratings == () for place in places.places)
+
+
+def test_contact_variants_and_structured_address_are_preserved() -> None:
+    transport = FakeTransport()
+    transport.attractions = [
+        {
+            "type": "node",
+            "id": 7_003,
+            "lat": 43.65,
+            "lon": -79.38,
+            "tags": {
+                "name": "Contact Detail Museum",
+                "tourism": "museum",
+                "addr:housenumber": "12",
+                "addr:place": "Civic Square",
+                "addr:suburb": "Old Town",
+                "addr:city": "Toronto",
+                "addr:postcode": "M5V 1A1",
+                "contact:mobile": "+1 416 555 0199",
+                "contact:opening_hours": "Mo-Fr 09:00-18:00",
+            },
+        }
+    ]
+    service, _, _ = _service(transport=transport)
+
+    place = service.list_places("YYZ", "attraction").places[0]
+
+    assert place.address == "12 Civic Square, Old Town, Toronto, M5V 1A1"
+    assert place.phone == "+1 416 555 0199"
+    assert place.opening_hours == "Mo-Fr 09:00-18:00"
 
 
 def test_all_supported_hotel_types_and_source_provided_stars_are_preserved() -> None:
@@ -549,7 +791,7 @@ def test_all_supported_hotel_types_and_source_provided_stars_are_preserved() -> 
     assert '["tourism"~' not in query
     for category in ("hotel", "hostel", "guest_house", "motel", "apartment"):
         assert f'["tourism"="{category}"]["name"]' in query
-    assert query.count("[\"tourism\"=") == 5
+    assert query.count('["tourism"=') == 5
 
 
 def test_place_detail_has_three_estimated_routes_and_explicit_transit_gap() -> None:
@@ -717,10 +959,7 @@ def test_transient_route_failure_is_retried_while_successes_remain_cached() -> N
     assert first.options[1].status == "unavailable"
     assert second.options[1].status == "available"
     route_calls = _calls(transport, "routing.openstreetmap.de")
-    assert all(
-        call["timeout"] == ROUTING_REQUEST_TIMEOUT_SECONDS == 5.0
-        for call in route_calls
-    )
+    assert all(call["timeout"] == ROUTING_REQUEST_TIMEOUT_SECONDS == 5.0 for call in route_calls)
     assert sum("routed-car" in call["url"] for call in route_calls) == 1
     assert sum("routed-bike" in call["url"] for call in route_calls) == 2
     assert sum("routed-foot" in call["url"] for call in route_calls) == 1
@@ -785,11 +1024,7 @@ def test_injected_ourairports_fallback_extends_global_airport_coverage() -> None
 def test_ourairports_municipality_reader_is_lazy_and_has_24_hour_cache() -> None:
     clock = FakeClock()
     payloads = [
-        (
-            b"iata_code,municipality\n"
-            b"YYZ,Toronto\n"
-            b"YQB,Quebec City\n"
-        ),
+        (b"iata_code,municipality\nYYZ,Toronto\nYQB,Quebec City\n"),
         b"iata_code,municipality\nYYZ,New Toronto\n",
     ]
     calls = 0
@@ -969,14 +1204,8 @@ def test_primary_overpass_success_never_calls_fallback_and_uses_short_timeout() 
     assert result.result_count == 30
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert [call["url"] for call in calls] == [OVERPASS_URL] * 4
-    assert (
-        calls[0]["timeout"]
-        == ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS
-        == 9.0
-    )
-    assert f"[timeout:{ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS}]" in calls[0]["data"][
-        "data"
-    ]
+    assert calls[0]["timeout"] == ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS == 9.0
+    assert f"[timeout:{ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS}]" in calls[0]["data"]["data"]
 
 
 def test_primary_failure_switches_to_fallback_then_caches_success() -> None:
@@ -1031,10 +1260,7 @@ def test_one_list_operation_reuses_fallback_and_stays_under_budget() -> None:
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert len(calls) == 5
     assert [call["url"] for call in calls].count(OVERPASS_FALLBACK_URL) == 4
-    assert all(
-        call["timeout"] <= ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS
-        for call in calls
-    )
+    assert all(call["timeout"] <= ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS for call in calls)
     assert ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS == 42.0 < 60
 
 
@@ -1152,10 +1378,7 @@ def test_overpass_runtime_remark_is_provider_failure_and_is_not_cached() -> None
 
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert [call["url"] for call in calls] == [
-        endpoint
-        for _ in range(2)
-        for _ in range(4)
-        for endpoint in OVERPASS_ENDPOINTS
+        endpoint for _ in range(2) for _ in range(4) for endpoint in OVERPASS_ENDPOINTS
     ]
 
 

@@ -16,6 +16,7 @@ instead of being inferred.
 from __future__ import annotations
 
 import csv
+import html
 import ipaddress
 import json
 import math
@@ -58,6 +59,12 @@ AttractionRatingStatus = Literal[
     "source_not_provided",
     "provider_unavailable",
 ]
+AttractionPhotoStatus = Literal[
+    "available",
+    "source_not_provided",
+    "provider_unavailable",
+    "source_rejected",
+]
 ListCategory = Literal[
     "all",
     "landmark",
@@ -92,9 +99,7 @@ TransitLegMode = Literal[
     "OTHER",
 ]
 
-ATTRACTION_CATEGORIES = frozenset(
-    {"landmark", "museum", "nature", "entertainment", "shopping"}
-)
+ATTRACTION_CATEGORIES = frozenset({"landmark", "museum", "nature", "entertainment", "shopping"})
 HOTEL_CATEGORIES = frozenset({"hotel", "hostel", "guest_house", "motel", "apartment"})
 ATTRACTION_CATEGORY_ORDER: tuple[AttractionCategory, ...] = (
     "landmark",
@@ -110,9 +115,7 @@ HOTEL_CATEGORY_ORDER: tuple[HotelCategory, ...] = (
     "motel",
     "apartment",
 )
-PLACE_ID_PATTERN = re.compile(
-    r"^osm_(attraction|hotel)_(node|way|relation)_([1-9][0-9]{0,18})$"
-)
+PLACE_ID_PATTERN = re.compile(r"^osm_(attraction|hotel)_(node|way|relation)_([1-9][0-9]{0,18})$")
 
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
@@ -120,6 +123,7 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OVERPASS_FALLBACK_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 OVERPASS_ENDPOINTS = (OVERPASS_URL, OVERPASS_FALLBACK_URL)
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
+WIKIMEDIA_COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIPEDIA_API_URLS = {
     "zh": "https://zh.wikipedia.org/w/api.php",
     "en": "https://en.wikipedia.org/w/api.php",
@@ -143,6 +147,8 @@ MAX_OVERPASS_ELEMENTS = 350
 MAX_WIKIMEDIA_BATCH_SIZE = 50
 MAX_WIKIPEDIA_TITLES_PER_LANGUAGE = 40
 MAX_WIKIDATA_RATING_ISSUERS = 100
+MAX_ATTRACTION_PHOTOS = 3
+COMMONS_THUMBNAIL_WIDTH = 960
 MAX_NOMINATIM_BYTES = 1_000_000
 MAX_OVERPASS_BYTES = 5_000_000
 MAX_WIKIMEDIA_BYTES = 3_000_000
@@ -193,6 +199,113 @@ class DestinationValidationError(DestinationGuideError, ValueError):
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+class AttractionRatingSourceCapability(_StrictModel):
+    """A known rating-source capability, not evidence that a score was returned."""
+
+    key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,39}$")
+    display_name: str = Field(min_length=1, max_length=100)
+    capability: Literal["ratings", "ratings_and_reviews"]
+    adapter_status: Literal["active", "catalogued"]
+    exact_match_requirement: Literal[
+        "wikidata_subject_and_issuer",
+        "provider_place_id",
+    ]
+    evidence_policy: Literal["capability_only_not_query_evidence"] = (
+        "capability_only_not_query_evidence"
+    )
+
+
+ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
+    AttractionRatingSourceCapability,
+    ...,
+] = (
+    AttractionRatingSourceCapability(
+        key="wikidata_p444",
+        display_name="Wikidata review score statements",
+        capability="ratings",
+        adapter_status="active",
+        exact_match_requirement="wikidata_subject_and_issuer",
+    ),
+    AttractionRatingSourceCapability(
+        key="google_places",
+        display_name="Google Places",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="tripadvisor",
+        display_name="Tripadvisor",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="yelp",
+        display_name="Yelp",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="foursquare",
+        display_name="Foursquare",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="viator",
+        display_name="Viator",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="tiqets",
+        display_name="Tiqets",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="klook",
+        display_name="Klook",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="getyourguide",
+        display_name="GetYourGuide",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="trip_com",
+        display_name="Trip.com",
+        capability="ratings_and_reviews",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="apple_maps",
+        display_name="Apple Maps",
+        capability="ratings",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+    AttractionRatingSourceCapability(
+        key="bing_maps",
+        display_name="Bing Maps",
+        capability="ratings",
+        adapter_status="catalogued",
+        exact_match_requirement="provider_place_id",
+    ),
+)
 
 
 class DestinationCity(_StrictModel):
@@ -267,20 +380,90 @@ class DestinationAttractionRating(_StrictModel):
     review_count: int | None = Field(default=None, ge=0, le=2_000_000_000)
     point_in_time: str | None = Field(default=None, min_length=4, max_length=40)
     source_url: str = Field(min_length=20, max_length=2_048)
+    subject_wikidata_id: str = Field(pattern=r"^Q[1-9][0-9]{0,18}$")
+    source_registry_key: Literal["wikidata_p444"] = "wikidata_p444"
+    identity_match_basis: Literal["osm_wikidata_subject_and_p447_issuer",] = (
+        "osm_wikidata_subject_and_p447_issuer"
+    )
+    source_status: Literal["source_returned_exact_match"] = "source_returned_exact_match"
     data_source: Literal["wikidata"] = "wikidata"
 
     @model_validator(mode="after")
     def score_is_consistent(self) -> DestinationAttractionRating:
         if (self.score is None) != (self.max_score is None):
             raise ValueError("numeric score and scale must be supplied together")
-        if (
-            self.score is not None
-            and self.max_score is not None
-            and self.score > self.max_score
-        ):
+        if self.score is not None and self.max_score is not None and self.score > self.max_score:
             raise ValueError("numeric score must not exceed its scale")
         if _safe_public_https_url(self.source_url) is None:
             raise ValueError("rating source URL must be a safe public HTTPS URL")
+        return self
+
+
+class DestinationAttractionPhoto(_StrictModel):
+    """A Commons photo with exact place linkage and reusable-license evidence."""
+
+    file_title: str = Field(
+        min_length=6,
+        max_length=500,
+        pattern=r"^File:.+",
+    )
+    image_url: str = Field(min_length=20, max_length=2_048)
+    thumbnail_url: str = Field(min_length=20, max_length=2_048)
+    source_page_url: str = Field(min_length=20, max_length=2_048)
+    author: str = Field(min_length=1, max_length=500)
+    license_name: str = Field(min_length=1, max_length=200)
+    license_url: str = Field(min_length=20, max_length=2_048)
+    attribution: str = Field(min_length=1, max_length=1_000)
+    width: int = Field(ge=1, le=100_000)
+    height: int = Field(ge=1, le=100_000)
+    match_basis: Literal[
+        "osm_wikimedia_commons",
+        "wikidata_p18",
+        "wikipedia_pageimage",
+    ]
+    source_status: Literal["verified_reusable_photo"] = "verified_reusable_photo"
+    data_source: Literal["wikimedia_commons_imageinfo"] = "wikimedia_commons_imageinfo"
+
+    @model_validator(mode="after")
+    def photo_evidence_is_safe(self) -> DestinationAttractionPhoto:
+        for value in (
+            self.image_url,
+            self.thumbnail_url,
+            self.source_page_url,
+            self.license_url,
+        ):
+            if _safe_public_https_url(value) is None:
+                raise ValueError("photo evidence URLs must be safe public HTTPS URLs")
+        if not _is_wikimedia_upload_url(self.image_url):
+            raise ValueError("photo URL must identify a Wikimedia upload")
+        if not _is_wikimedia_upload_url(self.thumbnail_url):
+            raise ValueError("photo thumbnail must identify a Wikimedia upload")
+        if not _is_wikimedia_commons_page(self.source_page_url):
+            raise ValueError("photo source page must identify the Commons file")
+        if (
+            _commons_page_file_title(self.source_page_url) or ""
+        ).casefold() != self.file_title.casefold():
+            raise ValueError("photo source page must match the Commons file title")
+        return self
+
+
+class DestinationAttractionMapPreview(_StrictModel):
+    """An exact-coordinate map fallback; deliberately not represented as a photo."""
+
+    preview_kind: Literal["exact_coordinate_map"] = "exact_coordinate_map"
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    zoom: int = Field(default=15, ge=1, le=19)
+    source_url: str = Field(min_length=20, max_length=2_048)
+    data_source: Literal["openstreetmap_exact_coordinate_preview"] = (
+        "openstreetmap_exact_coordinate_preview"
+    )
+
+    @model_validator(mode="after")
+    def preview_matches_coordinates(self) -> DestinationAttractionMapPreview:
+        expected = _osm_map_preview_url(self.latitude, self.longitude, self.zoom)
+        if self.source_url != expected:
+            raise ValueError("map preview URL must match the exact place coordinates")
         return self
 
 
@@ -295,12 +478,15 @@ class DestinationPlace(_StrictModel):
     description_zh: str | None = Field(default=None, min_length=1, max_length=2_000)
     description_en: str | None = Field(default=None, min_length=1, max_length=2_000)
     description_source: Literal["openstreetmap", "wikidata", "wikipedia"] | None = None
-    description_basis: Literal[
-        "osm_description",
-        "wikidata_description",
-        "wikipedia_extract",
-        "osm_tag_summary",
-    ] | None = None
+    description_basis: (
+        Literal[
+            "osm_description",
+            "wikidata_description",
+            "wikipedia_extract",
+            "osm_tag_summary",
+        ]
+        | None
+    ) = None
     description_url: str | None = Field(default=None, min_length=20, max_length=2_048)
     wikidata_id: str | None = Field(
         default=None,
@@ -312,6 +498,18 @@ class DestinationPlace(_StrictModel):
         max_length=20,
     )
     ratings_status: AttractionRatingStatus = "source_not_provided"
+    osm_wikimedia_commons_file: str | None = Field(
+        default=None,
+        min_length=6,
+        max_length=500,
+        pattern=r"^File:.+",
+    )
+    photos: tuple[DestinationAttractionPhoto, ...] = Field(
+        default_factory=tuple,
+        max_length=MAX_ATTRACTION_PHOTOS,
+    )
+    photo_status: AttractionPhotoStatus = "source_not_provided"
+    map_preview: DestinationAttractionMapPreview | None = None
     website: str | None = Field(default=None, min_length=9, max_length=2_048)
     phone: str | None = Field(default=None, min_length=1, max_length=100)
     opening_hours: str | None = Field(default=None, min_length=1, max_length=500)
@@ -334,12 +532,22 @@ class DestinationPlace(_StrictModel):
             or self.ratings_status != "source_not_provided"
             or self.wikidata_id is not None
             or self.wikipedia_url is not None
+            or self.osm_wikimedia_commons_file is not None
+            or self.photos
+            or self.photo_status != "source_not_provided"
+            or self.map_preview is not None
         ):
             raise ValueError("attraction enrichment fields are only valid for attractions")
         if self.ratings_status == "available" and not self.ratings:
             raise ValueError("available attraction ratings require at least one score")
         if self.ratings and self.ratings_status != "available":
             raise ValueError("attraction ratings require available status")
+        if self.photo_status == "available" and not self.photos:
+            raise ValueError("available attraction photos require photo evidence")
+        if self.photos and self.photo_status != "available":
+            raise ValueError("attraction photos require available status")
+        if self.photos and self.map_preview is not None:
+            raise ValueError("a verified photo and map fallback cannot be active together")
         if self.website is not None and _safe_public_https_url(self.website) is None:
             raise ValueError("website must be a safe public HTTPS URL")
         for url in (self.description_url, self.wikipedia_url):
@@ -371,6 +579,14 @@ class DestinationPlaceList(_StrictModel):
     query_parts_succeeded: int = Field(default=1, ge=0, le=16)
     query_parts_total: int = Field(default=1, ge=1, le=16)
     provider_truncated: bool = False
+    attraction_rating_source_capabilities: tuple[
+        AttractionRatingSourceCapability,
+        ...,
+    ] = Field(
+        default=ATTRACTION_RATING_SOURCE_REGISTRY,
+        min_length=10,
+        max_length=20,
+    )
     data_source: Literal["openstreetmap_overpass"] = "openstreetmap_overpass"
 
     @model_validator(mode="after")
@@ -382,9 +598,7 @@ class DestinationPlaceList(_StrictModel):
             raise ValueError("result_count must equal the number of places")
         if any(place.kind != self.kind for place in self.places):
             raise ValueError("all places must match the list kind")
-        if self.category != "all" and any(
-            place.category != self.category for place in self.places
-        ):
+        if self.category != "all" and any(place.category != self.category for place in self.places):
             raise ValueError("all places must match the selected category")
         if self.fetched_at.tzinfo is None or self.expires_at.tzinfo is None:
             raise ValueError("cache timestamps must include timezone information")
@@ -470,9 +684,7 @@ class DestinationTransitRouteReference(_StrictModel):
     near_destination: bool
     stops: tuple[str, ...] = Field(min_length=1, max_length=100)
     source_url: str = Field(min_length=20, max_length=300)
-    data_source: Literal["openstreetmap_route_relation"] = (
-        "openstreetmap_route_relation"
-    )
+    data_source: Literal["openstreetmap_route_relation"] = "openstreetmap_route_relation"
 
     @model_validator(mode="after")
     def reference_is_source_backed(self) -> DestinationTransitRouteReference:
@@ -490,10 +702,13 @@ class DestinationTransportOption(_StrictModel):
     status: Literal["available", "unavailable"]
     distance_km: float | None = Field(default=None, ge=0, le=10_000)
     duration_minutes: int | None = Field(default=None, ge=1, le=100_000)
-    duration_basis: Literal[
-        "estimated_route_no_live_traffic",
-        "transit_schedule_or_realtime",
-    ] | None = None
+    duration_basis: (
+        Literal[
+            "estimated_route_no_live_traffic",
+            "transit_schedule_or_realtime",
+        ]
+        | None
+    ) = None
     requested_departure_at: datetime | None = None
     departure_time_basis: Literal["user_supplied", "request_time"] | None = None
     departure_at: datetime | None = None
@@ -507,20 +722,23 @@ class DestinationTransportOption(_StrictModel):
         default=(),
         max_length=12,
     )
-    coverage_status: Literal[
-        "covered",
-        "no_itinerary",
-        "provider_unavailable",
-        "not_configured",
-        "authentication_failed",
-        "quota_exhausted",
-        "rate_limited",
-        "provider_processing",
-        "provider_error",
-        "response_invalid",
-        "quota_ledger_unavailable",
-        "route_reference_only",
-    ] | None = None
+    coverage_status: (
+        Literal[
+            "covered",
+            "no_itinerary",
+            "provider_unavailable",
+            "not_configured",
+            "authentication_failed",
+            "quota_exhausted",
+            "rate_limited",
+            "provider_processing",
+            "provider_error",
+            "response_invalid",
+            "quota_ledger_unavailable",
+            "route_reference_only",
+        ]
+        | None
+    ) = None
     notice: str = Field(min_length=1, max_length=600)
     data_source: Literal[
         "routing_openstreetmap_de_osrm",
@@ -553,12 +771,9 @@ class DestinationTransportOption(_StrictModel):
                     or not self.legs
                 ):
                     raise ValueError("available public transit requires complete itinerary data")
-                has_exact_times = (
-                    self.departure_at is not None and self.arrival_at is not None
-                )
+                has_exact_times = self.departure_at is not None and self.arrival_at is not None
                 has_provider_labels = (
-                    self.departure_time_label is not None
-                    and self.arrival_time_label is not None
+                    self.departure_time_label is not None and self.arrival_time_label is not None
                 )
                 if not has_exact_times and not has_provider_labels:
                     raise ValueError(
@@ -566,9 +781,7 @@ class DestinationTransportOption(_StrictModel):
                     )
                 if (self.departure_at is None) != (self.arrival_at is None):
                     raise ValueError("public-transit timestamps must be complete")
-                if (self.departure_time_label is None) != (
-                    self.arrival_time_label is None
-                ):
+                if (self.departure_time_label is None) != (self.arrival_time_label is None):
                     raise ValueError("public-transit clock labels must be complete")
                 if (
                     self.departure_at is not None
@@ -597,21 +810,25 @@ class DestinationTransportOption(_StrictModel):
                     )
                 if self.data_source != "routing_openstreetmap_de_osrm":
                     raise ValueError("available route must come from the OSRM source")
-                if any(
-                    value is not None
-                    for value in (
-                        self.requested_departure_at,
-                        self.departure_time_basis,
-                        self.departure_at,
-                        self.arrival_at,
-                        self.departure_time_label,
-                        self.arrival_time_label,
-                        self.transfers,
-                        self.realtime,
-                        self.coverage_status,
-                        self.source_url,
+                if (
+                    any(
+                        value is not None
+                        for value in (
+                            self.requested_departure_at,
+                            self.departure_time_basis,
+                            self.departure_at,
+                            self.arrival_at,
+                            self.departure_time_label,
+                            self.arrival_time_label,
+                            self.transfers,
+                            self.realtime,
+                            self.coverage_status,
+                            self.source_url,
+                        )
                     )
-                ) or self.legs or self.route_references:
+                    or self.legs
+                    or self.route_references
+                ):
                     raise ValueError("street routes cannot contain public-transit data")
         elif any(
             value is not None
@@ -709,6 +926,14 @@ class DestinationPlaceDetail(_StrictModel):
     city: DestinationCity
     place: DestinationPlace
     transport: DestinationTransport
+    attraction_rating_source_capabilities: tuple[
+        AttractionRatingSourceCapability,
+        ...,
+    ] = Field(
+        default=ATTRACTION_RATING_SOURCE_REGISTRY,
+        min_length=10,
+        max_length=20,
+    )
 
 
 class JsonHttpTransport(Protocol):
@@ -993,19 +1218,15 @@ class DestinationGuideService:
         self.airport_resolver = airport_resolver or OurAirportsResolver(
             timeout_seconds=min(timeout_seconds, 10)
         )
-        self.municipality_resolver = (
-            municipality_resolver or OurAirportsMunicipalityResolver(
-                timeout_seconds=timeout_seconds,
-                monotonic_clock=monotonic_clock,
-            )
+        self.municipality_resolver = municipality_resolver or OurAirportsMunicipalityResolver(
+            timeout_seconds=timeout_seconds,
+            monotonic_clock=monotonic_clock,
         )
         self.timeout_seconds = timeout_seconds
         self._clock = monotonic_clock
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self._serpapi_transit_provider = serpapi_transit_provider
-        self._enable_transit_route_references = bool(
-            enable_transit_route_references
-        )
+        self._enable_transit_route_references = bool(enable_transit_route_references)
         self._nominatim_limiter = _OneRequestPerSecond(clock=monotonic_clock, sleeper=sleeper)
         self._overpass_limiter = _OneRequestPerSecond(clock=monotonic_clock, sleeper=sleeper)
         self._wikimedia_limiter = _OneRequestPerSecond(
@@ -1070,9 +1291,7 @@ class DestinationGuideService:
         if normalized_category == "all":
             selected = _balanced_places(all_places, normalized_kind, limit)
         else:
-            filtered = tuple(
-                place for place in all_places if place.category == normalized_category
-            )
+            filtered = tuple(place for place in all_places if place.category == normalized_category)
             selected = filtered[:limit]
         return DestinationPlaceList(
             city=city,
@@ -1316,11 +1535,7 @@ class DestinationGuideService:
             tile_payload: Any = None
             endpoints = (
                 preferred_endpoint,
-                next(
-                    endpoint
-                    for endpoint in OVERPASS_ENDPOINTS
-                    if endpoint != preferred_endpoint
-                ),
+                next(endpoint for endpoint in OVERPASS_ENDPOINTS if endpoint != preferred_endpoint),
             )
             for endpoint in endpoints:
                 try:
@@ -1356,14 +1571,10 @@ class DestinationGuideService:
             if tile_places is None:
                 continue
             successful_parts += 1
-            provider_truncated = provider_truncated or _overpass_payload_hit_limit(
-                tile_payload
-            )
+            provider_truncated = provider_truncated or _overpass_payload_hit_limit(tile_payload)
             for place in tile_places:
                 existing = by_id.get(place.place_id)
-                if existing is None or _place_completeness(place) > _place_completeness(
-                    existing
-                ):
+                if existing is None or _place_completeness(place) > _place_completeness(existing):
                     by_id[place.place_id] = place
 
         if successful_parts == 0:
@@ -1391,11 +1602,7 @@ class DestinationGuideService:
             provider_truncated=provider_truncated or internal_truncated,
             result_count=len(places),
         )
-        cache_ttl = (
-            PARTIAL_DESTINATION_CACHE_TTL
-            if coverage.partial
-            else DESTINATION_CACHE_TTL
-        )
+        cache_ttl = PARTIAL_DESTINATION_CACHE_TTL if coverage.partial else DESTINATION_CACHE_TTL
         value = (places, fetched_at, fetched_at + cache_ttl, coverage)
         self._place_cache.set(key, value, ttl=cache_ttl)
         return value
@@ -1431,11 +1638,7 @@ class DestinationGuideService:
             )
             radius_places: tuple[DestinationPlace, ...] | None = None
             last_error: DestinationGuideError | None = None
-            endpoints = (
-                (OVERPASS_URL,)
-                if fallback_used
-                else (OVERPASS_URL, OVERPASS_FALLBACK_URL)
-            )
+            endpoints = (OVERPASS_URL,) if fallback_used else (OVERPASS_URL, OVERPASS_FALLBACK_URL)
             for endpoint in endpoints:
                 if endpoint == OVERPASS_FALLBACK_URL:
                     fallback_used = True
@@ -1483,9 +1686,7 @@ class DestinationGuideService:
             last_successful_radius_meters = radius_meters
             for place in radius_places:
                 existing = by_id.get(place.place_id)
-                if existing is None or _place_completeness(place) > _place_completeness(
-                    existing
-                ):
+                if existing is None or _place_completeness(place) > _place_completeness(existing):
                     by_id[place.place_id] = place
             if len(by_id) >= HOTEL_RESULT_TARGET:
                 break
@@ -1506,11 +1707,7 @@ class DestinationGuideService:
             last_successful_radius_meters,
             expansion_failed=expansion_failed,
         )
-        cache_ttl = (
-            PARTIAL_DESTINATION_CACHE_TTL
-            if coverage.partial
-            else DESTINATION_CACHE_TTL
-        )
+        cache_ttl = PARTIAL_DESTINATION_CACHE_TTL if coverage.partial else DESTINATION_CACHE_TTL
         value = (places, fetched_at, fetched_at + cache_ttl, coverage)
         self._place_cache.set(key, value, ttl=cache_ttl)
         return value
@@ -1523,16 +1720,12 @@ class DestinationGuideService:
         """Add only exact-identity Wikimedia evidence, then factual OSM summaries."""
 
         wikidata_ids = tuple(
-            dict.fromkeys(
-                place.wikidata_id for place in places if place.wikidata_id is not None
-            )
+            dict.fromkeys(place.wikidata_id for place in places if place.wikidata_id is not None)
         )
         enrichment_started = self._clock()
 
         def remaining_budget() -> float:
-            return WIKIMEDIA_OPERATION_BUDGET_SECONDS - (
-                self._clock() - enrichment_started
-            )
+            return WIKIMEDIA_OPERATION_BUDGET_SECONDS - (self._clock() - enrichment_started)
 
         entities: dict[str, Mapping[str, Any]] = {}
         failed_wikidata_ids: set[str] = set()
@@ -1571,9 +1764,9 @@ class DestinationGuideService:
                 failed_wikidata_ids.update(batch)
         failed_wikidata_ids.update(set(wikidata_ids) - entities.keys())
 
-        issuer_ids = tuple(
-            sorted(_wikidata_rating_issuer_ids(entities.values()))
-        )[:MAX_WIKIDATA_RATING_ISSUERS]
+        issuer_ids = tuple(sorted(_wikidata_rating_issuer_ids(entities.values())))[
+            :MAX_WIKIDATA_RATING_ISSUERS
+        ]
         issuer_labels: dict[str, Mapping[str, str]] = {}
         for batch in _chunks(issuer_ids, MAX_WIKIMEDIA_BATCH_SIZE):
             remaining = remaining_budget()
@@ -1622,26 +1815,34 @@ class DestinationGuideService:
             tuple[str, str],
             tuple[str, str],
         ] = {}
+        wikipedia_pageimages: dict[tuple[str, str], str] = {}
+        failed_wikipedia_photo_keys: set[tuple[str, str]] = set()
+        completed_wikipedia_photo_keys: set[tuple[str, str]] = set()
         for language, titles in wikipedia_titles.items():
             endpoint = WIKIPEDIA_API_URLS[language]
             for batch in _chunks(tuple(sorted(titles)), 20):
+                requested_photo_keys = {(language, title.casefold()) for title in batch}
                 remaining = remaining_budget()
                 if remaining <= 0.25:
+                    failed_wikipedia_photo_keys.update(requested_photo_keys)
                     break
                 try:
                     self._wikimedia_limiter.wait()
                     remaining = remaining_budget()
                     if remaining <= 0.25:
+                        failed_wikipedia_photo_keys.update(requested_photo_keys)
                         break
                     payload = self.client.request_json(
                         "GET",
                         endpoint,
                         params={
                             "action": "query",
-                            "prop": "extracts|info",
+                            "prop": "extracts|info|pageimages",
                             "inprop": "url",
                             "exintro": "1",
                             "explaintext": "1",
+                            "piprop": "name",
+                            "pilicense": "free",
                             "redirects": "1",
                             "titles": "|".join(batch),
                             "format": "json",
@@ -1662,16 +1863,93 @@ class DestinationGuideService:
                             requested_titles=set(batch),
                         )
                     )
+                    wikipedia_pageimages.update(
+                        _parse_wikipedia_pageimages(
+                            payload,
+                            language=language,
+                            requested_titles=set(batch),
+                        )
+                    )
+                    completed_wikipedia_photo_keys.update(requested_photo_keys)
                 except DestinationGuideError:
+                    failed_wikipedia_photo_keys.update(requested_photo_keys)
                     continue
+        all_wikipedia_photo_keys = {
+            (language, title.casefold())
+            for language, titles in wikipedia_titles.items()
+            for title in titles
+        }
+        failed_wikipedia_photo_keys.update(
+            all_wikipedia_photo_keys - completed_wikipedia_photo_keys
+        )
+
+        photo_candidates_by_place = {
+            place.place_id: _attraction_photo_candidates(
+                place,
+                entities.get(place.wikidata_id or ""),
+                wikipedia_pageimages,
+            )
+            for place in places
+        }
+        commons_titles = tuple(
+            dict.fromkeys(
+                file_title
+                for candidates in photo_candidates_by_place.values()
+                for file_title, _match_basis in candidates
+            )
+        )
+        commons_assets: dict[str, Mapping[str, Any]] = {}
+        failed_commons_titles: set[str] = set()
+        completed_commons_titles: set[str] = set()
+        for batch in _chunks(commons_titles, MAX_WIKIMEDIA_BATCH_SIZE):
+            remaining = remaining_budget()
+            if remaining <= 0.25:
+                failed_commons_titles.update(title.casefold() for title in batch)
+                break
+            try:
+                self._wikimedia_limiter.wait()
+                remaining = remaining_budget()
+                if remaining <= 0.25:
+                    failed_commons_titles.update(title.casefold() for title in batch)
+                    break
+                payload = self.client.request_json(
+                    "GET",
+                    WIKIMEDIA_COMMONS_API_URL,
+                    params={
+                        "action": "query",
+                        "prop": "imageinfo",
+                        "iiprop": "url|size|extmetadata",
+                        "iiurlwidth": str(COMMONS_THUMBNAIL_WIDTH),
+                        "titles": "|".join(batch),
+                        "redirects": "1",
+                        "format": "json",
+                        "formatversion": "2",
+                    },
+                    headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                    timeout_seconds=min(
+                        self.timeout_seconds,
+                        WIKIMEDIA_REQUEST_TIMEOUT_SECONDS,
+                        remaining,
+                    ),
+                    max_response_bytes=MAX_WIKIMEDIA_BYTES,
+                )
+                commons_assets.update(
+                    _parse_commons_photo_assets(
+                        payload,
+                        requested_titles=set(batch),
+                    )
+                )
+                completed_commons_titles.update(title.casefold() for title in batch)
+            except DestinationGuideError:
+                failed_commons_titles.update(title.casefold() for title in batch)
+                continue
+        failed_commons_titles.update(
+            {title.casefold() for title in commons_titles} - completed_commons_titles
+        )
 
         enriched: list[DestinationPlace] = []
         for place in places:
-            entity = (
-                entities.get(place.wikidata_id)
-                if place.wikidata_id is not None
-                else None
-            )
+            entity = entities.get(place.wikidata_id) if place.wikidata_id is not None else None
             updates = _attraction_enrichment_updates(
                 place,
                 city,
@@ -1679,6 +1957,19 @@ class DestinationGuideService:
                 issuer_labels=issuer_labels,
                 wikipedia_extracts=wikipedia_extracts,
                 wikidata_failed=place.wikidata_id in failed_wikidata_ids,
+                photo_candidates=photo_candidates_by_place.get(place.place_id, ()),
+                commons_assets=commons_assets,
+                failed_commons_titles=failed_commons_titles,
+                wikipedia_photo_failed=any(
+                    key in failed_wikipedia_photo_keys
+                    for key in (
+                        (language, title.casefold())
+                        for language, title in _wikipedia_titles_for_place(
+                            place,
+                            entity,
+                        ).items()
+                    )
+                ),
             )
             enriched.append(
                 DestinationPlace.model_validate(
@@ -1705,12 +1996,9 @@ class DestinationGuideService:
             return cached
         observed_at = _aware_utc(self._wall_clock())
         expires_at = observed_at + DESTINATION_CACHE_TTL
-        server_profile = {"car": "routed-car", "bike": "routed-bike", "foot": "routed-foot"}[
-            mode
-        ]
+        server_profile = {"car": "routed-car", "bike": "routed-bike", "foot": "routed-foot"}[mode]
         coordinates = (
-            f"{airport.longitude:.6f},{airport.latitude:.6f};"
-            f"{longitude:.6f},{latitude:.6f}"
+            f"{airport.longitude:.6f},{airport.latitude:.6f};{longitude:.6f},{latitude:.6f}"
         )
         url = f"{ROUTING_BASE_URL}/{server_profile}/route/v1/driving/{coordinates}"
         try:
@@ -2142,9 +2430,7 @@ def _attraction_coverage(
             provider_truncated=False,
         )
     if provider_truncated:
-        reason: Literal["result_limit_reached", "provider_failure"] = (
-            "result_limit_reached"
-        )
+        reason: Literal["result_limit_reached", "provider_failure"] = "result_limit_reached"
         zh = (
             f"已完成 {successful_parts}/{total_parts} 个城市分块，但至少一个公开数据响应或"
             f"本地安全上限达到 {MAX_INTERNAL_PLACES_PER_KIND} 条；当前显示所有已保留的"
@@ -2274,11 +2560,7 @@ def _parse_wikidata_entities(
         raise DestinationDataUnavailable("Wikidata response is missing entities")
     parsed: dict[str, Mapping[str, Any]] = {}
     for entity_id, entity in payload["entities"].items():
-        if (
-            entity_id in allowed_ids
-            and isinstance(entity, dict)
-            and entity.get("missing") is None
-        ):
+        if entity_id in allowed_ids and isinstance(entity, dict) and entity.get("missing") is None:
             parsed[entity_id] = entity
     return parsed
 
@@ -2418,6 +2700,278 @@ def _parse_wikipedia_extracts(
     return result
 
 
+def _parse_wikipedia_pageimages(
+    payload: Any,
+    *,
+    language: str,
+    requested_titles: set[str],
+) -> dict[tuple[str, str], str]:
+    """Return only free page-image filenames attached to requested exact pages."""
+
+    if not isinstance(payload, dict):
+        raise DestinationDataUnavailable("Wikipedia response is not an object")
+    query = payload.get("query")
+    pages = query.get("pages") if isinstance(query, dict) else None
+    if not isinstance(pages, (list, dict)):
+        raise DestinationDataUnavailable("Wikipedia response is missing pages")
+    raw_pages = pages if isinstance(pages, list) else list(pages.values())
+    page_by_title: dict[str, str] = {}
+    for page in raw_pages:
+        if not isinstance(page, dict) or page.get("missing") is not None:
+            continue
+        title = _clean_text(page.get("title"), 500)
+        file_title = _commons_file_title(page.get("pageimage"))
+        if title and file_title:
+            page_by_title[title.casefold()] = file_title
+
+    aliases: dict[str, str] = {}
+    for field in ("normalized", "redirects"):
+        values = query.get(field) if isinstance(query, dict) else None
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            before = _clean_text(item.get("from"), 500)
+            after = _clean_text(item.get("to"), 500)
+            if before and after:
+                aliases[before.casefold()] = after.casefold()
+
+    result: dict[tuple[str, str], str] = {}
+    for requested in requested_titles:
+        key = requested.casefold()
+        resolved = key
+        for _ in range(3):
+            next_value = aliases.get(resolved)
+            if next_value is None or next_value == resolved:
+                break
+            resolved = next_value
+        item = page_by_title.get(resolved) or page_by_title.get(key)
+        if item:
+            result[(language, key)] = item
+    return result
+
+
+def _commons_file_title(value: object) -> str | None:
+    cleaned = _clean_text(value, 500)
+    if cleaned is None:
+        return None
+    cleaned = cleaned.replace("_", " ")
+    if cleaned.casefold().startswith("category:"):
+        return None
+    if cleaned.casefold().startswith("file:"):
+        filename = cleaned[5:].strip()
+    else:
+        filename = cleaned
+    if (
+        not filename
+        or any(character in filename for character in "\r\n|[]{}<>")
+        or "://" in filename
+    ):
+        return None
+    return f"File:{filename}"[:500]
+
+
+def _osm_commons_file(value: object) -> str | None:
+    cleaned = _clean_text(value, 500)
+    if cleaned is None or not cleaned.casefold().startswith("file:"):
+        return None
+    return _commons_file_title(cleaned)
+
+
+def _wikidata_image_filename(entity: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(entity, Mapping):
+        return None
+    claims = entity.get("claims")
+    statements = claims.get("P18") if isinstance(claims, dict) else None
+    if not isinstance(statements, list):
+        return None
+    for statement in statements:
+        if not isinstance(statement, dict) or statement.get("rank") == "deprecated":
+            continue
+        file_title = _commons_file_title(_wikidata_text_snak(statement.get("mainsnak"), 500))
+        if file_title:
+            return file_title
+    return None
+
+
+def _attraction_photo_candidates(
+    place: DestinationPlace,
+    entity: Mapping[str, Any] | None,
+    wikipedia_pageimages: Mapping[tuple[str, str], str],
+) -> tuple[
+    tuple[
+        str,
+        Literal[
+            "osm_wikimedia_commons",
+            "wikidata_p18",
+            "wikipedia_pageimage",
+        ],
+    ],
+    ...,
+]:
+    candidates: list[
+        tuple[
+            str,
+            Literal[
+                "osm_wikimedia_commons",
+                "wikidata_p18",
+                "wikipedia_pageimage",
+            ],
+        ]
+    ] = []
+    seen: set[str] = set()
+
+    def add(
+        file_title: str | None,
+        basis: Literal[
+            "osm_wikimedia_commons",
+            "wikidata_p18",
+            "wikipedia_pageimage",
+        ],
+    ) -> None:
+        normalized = _commons_file_title(file_title)
+        if normalized is None or normalized.casefold() in seen:
+            return
+        seen.add(normalized.casefold())
+        candidates.append((normalized, basis))
+
+    add(place.osm_wikimedia_commons_file, "osm_wikimedia_commons")
+    add(_wikidata_image_filename(entity), "wikidata_p18")
+    titles = _wikipedia_titles_for_place(place, entity)
+    for language in ("zh", "en"):
+        title = titles.get(language)
+        if title:
+            add(
+                wikipedia_pageimages.get((language, title.casefold())),
+                "wikipedia_pageimage",
+            )
+    return tuple(candidates[:MAX_ATTRACTION_PHOTOS])
+
+
+def _clean_commons_metadata(value: object, maximum: int) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("value")
+    if not isinstance(value, str):
+        return None
+    without_tags = re.sub(r"<[^>]{0,1000}>", " ", value)
+    return _clean_text(html.unescape(without_tags), maximum)
+
+
+def _parse_commons_photo_assets(
+    payload: Any,
+    *,
+    requested_titles: set[str],
+) -> dict[str, Mapping[str, Any]]:
+    """Resolve requested Commons files to attribution-complete image evidence."""
+
+    if not isinstance(payload, dict):
+        raise DestinationDataUnavailable("Commons response is not an object")
+    query = payload.get("query")
+    pages = query.get("pages") if isinstance(query, dict) else None
+    if not isinstance(pages, (list, dict)):
+        raise DestinationDataUnavailable("Commons response is missing pages")
+    requested = {
+        title.casefold()
+        for title in (_commons_file_title(value) for value in requested_titles)
+        if title is not None
+    }
+    raw_pages = pages if isinstance(pages, list) else list(pages.values())
+    assets_by_title: dict[str, Mapping[str, Any]] = {}
+    for page in raw_pages:
+        if not isinstance(page, dict) or page.get("missing") is not None:
+            continue
+        file_title = _commons_file_title(page.get("title"))
+        if file_title is None:
+            continue
+        imageinfo = page.get("imageinfo")
+        if not isinstance(imageinfo, list) or not imageinfo:
+            continue
+        info = imageinfo[0]
+        if not isinstance(info, dict):
+            continue
+        image_url = _safe_public_https_url(info.get("url"))
+        thumbnail_url = _safe_public_https_url(info.get("thumburl") or info.get("url"))
+        source_page_url = _safe_public_https_url(info.get("descriptionurl"))
+        width = _bounded_int(info.get("width"), 1, 100_000)
+        height = _bounded_int(info.get("height"), 1, 100_000)
+        metadata = info.get("extmetadata")
+        if not isinstance(metadata, dict):
+            continue
+        author = _clean_commons_metadata(
+            metadata.get("Artist") or metadata.get("Credit"),
+            500,
+        )
+        credit = _clean_commons_metadata(metadata.get("Credit"), 500)
+        license_name = _clean_commons_metadata(
+            metadata.get("LicenseShortName"),
+            200,
+        )
+        license_url = _safe_public_https_url(
+            _clean_commons_metadata(metadata.get("LicenseUrl"), 2_048)
+        )
+        if (
+            image_url is None
+            or thumbnail_url is None
+            or source_page_url is None
+            or width is None
+            or height is None
+            or author is None
+            or license_name is None
+            or license_url is None
+            or not _is_wikimedia_upload_url(image_url)
+            or not _is_wikimedia_upload_url(thumbnail_url)
+            or not _is_wikimedia_commons_page(source_page_url)
+        ):
+            continue
+        credit_text = credit if credit and credit.casefold() != author.casefold() else author
+        attribution = _clean_text(
+            f"{credit_text} — {author} — {license_name}"
+            if credit_text != author
+            else f"{author} — {license_name}",
+            1_000,
+        )
+        if attribution is None:
+            continue
+        assets_by_title[file_title.casefold()] = {
+            "file_title": file_title,
+            "image_url": image_url,
+            "thumbnail_url": thumbnail_url,
+            "source_page_url": source_page_url,
+            "author": author,
+            "license_name": license_name,
+            "license_url": license_url,
+            "attribution": attribution,
+            "width": width,
+            "height": height,
+        }
+    aliases: dict[str, str] = {}
+    for field in ("normalized", "redirects"):
+        values = query.get(field) if isinstance(query, dict) else None
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            before = _commons_file_title(item.get("from"))
+            after = _commons_file_title(item.get("to"))
+            if before and after:
+                aliases[before.casefold()] = after.casefold()
+
+    result: dict[str, Mapping[str, Any]] = {}
+    for requested_title in requested:
+        resolved = requested_title
+        for _ in range(3):
+            next_value = aliases.get(resolved)
+            if next_value is None or next_value == resolved:
+                break
+            resolved = next_value
+        asset = assets_by_title.get(resolved) or assets_by_title.get(requested_title)
+        if asset:
+            result[requested_title] = asset
+    return result
+
+
 def _wikidata_item_snak(value: object) -> str | None:
     if not isinstance(value, dict):
         return None
@@ -2515,8 +3069,10 @@ def _parse_wikidata_ratings(
     statements = claims.get("P444") if isinstance(claims, dict) else None
     if not isinstance(statements, list):
         return ()
-    ratings: list[DestinationAttractionRating] = []
-    seen: set[tuple[str, str, int | None]] = set()
+    latest_by_issuer: dict[
+        str,
+        tuple[tuple[int, int, int, int, int, int], DestinationAttractionRating],
+    ] = {}
     for statement in statements:
         if not isinstance(statement, dict) or statement.get("rank") == "deprecated":
             continue
@@ -2539,34 +3095,71 @@ def _parse_wikidata_ratings(
             issuer_id = _wikidata_item_snak(issuer_snak)
             if issuer_id is None:
                 continue
-            dedupe_key = (issuer_id, score_text.casefold(), review_count)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
             labels = issuer_labels.get(issuer_id, {})
             platform_zh = labels.get("zh")
             platform_en = labels.get("en")
             platform = platform_en or platform_zh or issuer_id
             try:
-                ratings.append(
-                    DestinationAttractionRating(
-                        platform=platform,
-                        platform_zh=platform_zh,
-                        platform_en=platform_en,
-                        platform_id=issuer_id,
-                        score_text=score_text,
-                        score=score,
-                        max_score=maximum,
-                        review_count=review_count,
-                        point_in_time=point_in_time,
-                        source_url=source_url,
-                    )
+                rating = DestinationAttractionRating(
+                    platform=platform,
+                    platform_zh=platform_zh,
+                    platform_en=platform_en,
+                    platform_id=issuer_id,
+                    score_text=score_text,
+                    score=score,
+                    max_score=maximum,
+                    review_count=review_count,
+                    point_in_time=point_in_time,
+                    source_url=source_url,
+                    subject_wikidata_id=entity_id,
                 )
             except ValueError:
                 continue
-            if len(ratings) >= 20:
-                return tuple(ratings)
-    return tuple(ratings)
+            recency_key = _rating_snapshot_recency_key(
+                point_in_time,
+                rank=_clean_text(statement.get("rank"), 20),
+                review_count=review_count,
+                has_numeric_score=score is not None,
+            )
+            previous = latest_by_issuer.get(issuer_id)
+            if previous is None or recency_key > previous[0]:
+                latest_by_issuer[issuer_id] = (recency_key, rating)
+    return tuple(
+        item[1]
+        for item in sorted(
+            latest_by_issuer.values(),
+            key=lambda item: (
+                item[1].platform.casefold(),
+                item[1].platform_id,
+            ),
+        )[:20]
+    )
+
+
+def _rating_snapshot_recency_key(
+    point_in_time: str | None,
+    *,
+    rank: str | None,
+    review_count: int | None,
+    has_numeric_score: bool,
+) -> tuple[int, int, int, int, int, int]:
+    year = month = day = 0
+    if point_in_time:
+        parts = point_in_time.split("-")
+        try:
+            year = int(parts[0])
+            month = int(parts[1]) if len(parts) > 1 else 0
+            day = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            year = month = day = 0
+    return (
+        int(point_in_time is not None),
+        year,
+        month,
+        day,
+        int(rank == "preferred"),
+        int(review_count is not None) + int(has_numeric_score),
+    )
 
 
 def _osm_tag_summary(
@@ -2614,6 +3207,10 @@ def _attraction_enrichment_updates(
     issuer_labels: Mapping[str, Mapping[str, str]],
     wikipedia_extracts: Mapping[tuple[str, str], tuple[str, str]],
     wikidata_failed: bool,
+    photo_candidates: tuple[tuple[str, str], ...],
+    commons_assets: Mapping[str, Mapping[str, Any]],
+    failed_commons_titles: set[str],
+    wikipedia_photo_failed: bool,
 ) -> dict[str, Any]:
     descriptions = _wikidata_language_values(
         entity.get("descriptions") if isinstance(entity, Mapping) else None,
@@ -2648,9 +3245,7 @@ def _attraction_enrichment_updates(
     if extracts:
         description_source = "wikipedia"
         description_basis = "wikipedia_extract"
-        description_url = (
-            (extracts.get("zh") or extracts.get("en") or (None, None))[1]
-        )
+        description_url = (extracts.get("zh") or extracts.get("en") or (None, None))[1]
     elif descriptions:
         description_source = "wikidata"
         description_basis = "wikidata_description"
@@ -2680,6 +3275,37 @@ def _attraction_enrichment_updates(
         ratings_status = "provider_unavailable"
     else:
         ratings_status = "source_not_provided"
+
+    photos: list[DestinationAttractionPhoto] = []
+    for file_title, match_basis in photo_candidates:
+        asset = commons_assets.get(file_title.casefold())
+        if asset is None:
+            continue
+        try:
+            photos.append(
+                DestinationAttractionPhoto(
+                    **asset,
+                    match_basis=match_basis,
+                )
+            )
+        except ValueError:
+            continue
+    photo_evidence = tuple(photos[:MAX_ATTRACTION_PHOTOS])
+    photo_status: AttractionPhotoStatus
+    if photo_evidence:
+        photo_status = "available"
+    elif photo_candidates and any(
+        file_title.casefold() in failed_commons_titles
+        for file_title, _match_basis in photo_candidates
+    ):
+        photo_status = "provider_unavailable"
+    elif photo_candidates:
+        photo_status = "source_rejected"
+    elif wikidata_failed or wikipedia_photo_failed:
+        photo_status = "provider_unavailable"
+    else:
+        photo_status = "source_not_provided"
+
     wikipedia_url = place.wikipedia_url
     if wikipedia_url is None:
         for language in ("zh", "en"):
@@ -2698,6 +3324,11 @@ def _attraction_enrichment_updates(
         "wikipedia_url": wikipedia_url,
         "ratings": ratings,
         "ratings_status": ratings_status,
+        "photos": photo_evidence,
+        "photo_status": photo_status,
+        "map_preview": (
+            None if photo_evidence else _attraction_map_preview(place.latitude, place.longitude)
+        ),
     }
 
 
@@ -2955,8 +3586,9 @@ def _parse_osm_element(
     description_zh = _clean_text(tags.get("description:zh"), 2_000)
     description_en = _clean_text(tags.get("description:en"), 2_000)
     wikidata_id = _wikidata_id(tags.get("wikidata")) if kind == "attraction" else None
-    wikipedia_url = (
-        _wikipedia_tag_url(tags.get("wikipedia")) if kind == "attraction" else None
+    wikipedia_url = _wikipedia_tag_url(tags.get("wikipedia")) if kind == "attraction" else None
+    osm_wikimedia_commons_file = (
+        _osm_commons_file(tags.get("wikimedia_commons")) if kind == "attraction" else None
     )
     try:
         return DestinationPlace(
@@ -2980,12 +3612,13 @@ def _parse_osm_element(
             else None,
             wikidata_id=wikidata_id,
             wikipedia_url=wikipedia_url,
-            website=website,
-            phone=(
-                _clean_text(tags.get("contact:phone"), 100)
-                or _clean_text(tags.get("phone"), 100)
+            osm_wikimedia_commons_file=osm_wikimedia_commons_file,
+            map_preview=(
+                _attraction_map_preview(latitude, longitude) if kind == "attraction" else None
             ),
-            opening_hours=_clean_text(tags.get("opening_hours"), 500),
+            website=website,
+            phone=_contact_phone_from_tags(tags),
+            opening_hours=_opening_hours_from_tags(tags),
             stars=stars,
             latitude=latitude,
             longitude=longitude,
@@ -3068,18 +3701,89 @@ def _safe_float(value: object, minimum: float, maximum: float) -> float | None:
 
 
 def _address_from_tags(tags: Mapping[str, Any]) -> str | None:
-    full = _clean_text(tags.get("addr:full"), 700)
+    full = (
+        _clean_text(tags.get("addr:full"), 700)
+        or _clean_text(tags.get("contact:address"), 700)
+        or _clean_text(tags.get("address"), 700)
+    )
     if full:
         return full
     house_number = _clean_text(tags.get("addr:housenumber"), 50)
     street = _clean_text(tags.get("addr:street"), 200)
-    first_line = " ".join(part for part in (house_number, street) if part)
+    place_name = _clean_text(tags.get("addr:place"), 200)
+    first_line = " ".join(part for part in (house_number, street or place_name) if part)
+    neighbourhood = _clean_text(tags.get("addr:neighbourhood"), 150) or _clean_text(
+        tags.get("addr:quarter"), 150
+    )
+    suburb = _clean_text(tags.get("addr:suburb"), 150)
+    district = _clean_text(tags.get("addr:city_district"), 150) or _clean_text(
+        tags.get("addr:district"), 150
+    )
     city = _clean_text(tags.get("addr:city"), 150)
+    town = _clean_text(tags.get("addr:town"), 150)
+    village = _clean_text(tags.get("addr:village"), 150)
+    municipality = _clean_text(tags.get("addr:municipality"), 150)
+    county = _clean_text(tags.get("addr:county"), 150)
     postcode = _clean_text(tags.get("addr:postcode"), 50)
     state = _clean_text(tags.get("addr:state"), 150)
     country = _clean_text(tags.get("addr:country"), 100)
-    parts = [part for part in (first_line, city, state, postcode, country) if part]
+    parts = [
+        part
+        for part in (
+            first_line,
+            neighbourhood,
+            suburb,
+            district,
+            city or town or village or municipality,
+            county,
+            state,
+            postcode,
+            country,
+        )
+        if part
+    ]
+    parts = list(dict.fromkeys(parts))
     return ", ".join(parts)[:700] or None
+
+
+def _contact_phone_from_tags(tags: Mapping[str, Any]) -> str | None:
+    for key in (
+        "contact:phone",
+        "phone",
+        "contact:mobile",
+        "mobile",
+        "operator:phone",
+    ):
+        value = _clean_text(tags.get(key), 100)
+        if value:
+            return value
+    return None
+
+
+def _opening_hours_from_tags(tags: Mapping[str, Any]) -> str | None:
+    for key in ("opening_hours", "contact:opening_hours"):
+        value = _clean_text(tags.get(key), 500)
+        if value:
+            return value
+    return None
+
+
+def _osm_map_preview_url(latitude: float, longitude: float, zoom: int = 15) -> str:
+    return (
+        f"{OPENSTREETMAP_BASE_URL}/?mlat={latitude:.7f}&mlon={longitude:.7f}"
+        f"#map={zoom}/{latitude:.7f}/{longitude:.7f}"
+    )
+
+
+def _attraction_map_preview(
+    latitude: float,
+    longitude: float,
+) -> DestinationAttractionMapPreview:
+    return DestinationAttractionMapPreview(
+        latitude=latitude,
+        longitude=longitude,
+        source_url=_osm_map_preview_url(latitude, longitude),
+    )
 
 
 def _parse_stars(value: object) -> float | None:
@@ -3125,6 +3829,44 @@ def _safe_public_https_url(value: object) -> str | None:
     return parse.urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
 
 
+def _is_wikimedia_upload_url(value: str) -> bool:
+    try:
+        parsed = parse.urlsplit(value)
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname == "upload.wikimedia.org"
+        and parsed.port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.startswith("/wikipedia/commons/")
+    )
+
+
+def _is_wikimedia_commons_page(value: str) -> bool:
+    try:
+        parsed = parse.urlsplit(value)
+    except ValueError:
+        return False
+    decoded_path = parse.unquote(parsed.path)
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname == "commons.wikimedia.org"
+        and parsed.port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and decoded_path.startswith("/wiki/File:")
+    )
+
+
+def _commons_page_file_title(value: str) -> str | None:
+    if not _is_wikimedia_commons_page(value):
+        return None
+    parsed = parse.urlsplit(value)
+    return _commons_file_title(parse.unquote(parsed.path[len("/wiki/") :]))
+
+
 def _is_osm_element_url(value: str) -> bool:
     try:
         parsed = parse.urlsplit(value)
@@ -3152,6 +3894,7 @@ def _place_completeness(place: DestinationPlace) -> int:
             place.wikidata_id,
             place.wikipedia_url,
             place.ratings if place.ratings else None,
+            place.photos if place.photos else None,
             place.website,
             place.phone,
             place.opening_hours,
@@ -3208,18 +3951,14 @@ def validate_transit_departure_at(
         or requested.tzinfo is None
         or requested.utcoffset() is None
     ):
-        raise DestinationValidationError(
-            "transit_departure_at must be a timezone-aware datetime"
-        )
+        raise DestinationValidationError("transit_departure_at must be a timezone-aware datetime")
     normalized = requested.astimezone(UTC).replace(second=0, microsecond=0)
     if normalized < reference - timedelta(days=1):
         raise DestinationValidationError(
             "transit_departure_at cannot be more than one day in the past"
         )
     if normalized > reference + timedelta(days=370):
-        raise DestinationValidationError(
-            "transit_departure_at must be within 370 days"
-        )
+        raise DestinationValidationError("transit_departure_at must be within 370 days")
     return normalized
 
 
@@ -3366,9 +4105,7 @@ def _merge_osm_transit_references(
         airport_value = airport_routes.get(relation_id)
         destination_value = destination_routes.get(relation_id)
         values = tuple(
-            value
-            for value in (airport_value, destination_value)
-            if isinstance(value, Mapping)
+            value for value in (airport_value, destination_value) if isinstance(value, Mapping)
         )
         if not values:
             continue
@@ -3522,16 +4259,12 @@ def _parse_transit_leg(value: object) -> DestinationTransitLeg | None:
             scheduled_arrival_at=scheduled_arrival_at,
             duration_minutes=max(1, math.ceil(duration_seconds / 60)),
             distance_km=(
-                round(distance_meters / 1_000, 1)
-                if distance_meters is not None
-                else None
+                round(distance_meters / 1_000, 1) if distance_meters is not None else None
             ),
             line_name=line_name,
             headsign=_clean_text(value.get("headsign"), 300),
             agency_name=_clean_text(value.get("agencyName"), 300),
-            intermediate_stops=_transit_intermediate_stops(
-                value.get("intermediateStops")
-            ),
+            intermediate_stops=_transit_intermediate_stops(value.get("intermediateStops")),
             realtime=value["realTime"],
             scheduled=value["scheduled"],
         )
@@ -3656,9 +4389,7 @@ def _serpapi_transit_option(
     observed_at = _aware_utc(result.observed_at)
     safe_expires_at = max(expires_at, observed_at + timedelta(minutes=1))
     if result.status != "available":
-        coverage_status = (
-            "no_itinerary" if result.status == "no_results" else result.status
-        )
+        coverage_status = "no_itinerary" if result.status == "no_results" else result.status
         return DestinationTransportOption(
             mode="public_transit",
             status="unavailable",
@@ -3736,6 +4467,7 @@ def _assert_allowed_outbound_url(url: str) -> None:
         ("overpass-api.de", "/api/interpreter"),
         ("maps.mail.ru", "/osm/tools/overpass/api/interpreter"),
         ("www.wikidata.org", "/w/api.php"),
+        ("commons.wikimedia.org", "/w/api.php"),
         ("zh.wikipedia.org", "/w/api.php"),
         ("en.wikipedia.org", "/w/api.php"),
         ("davidmegginson.github.io", "/ourairports-data/airports.csv"),
