@@ -4,5 +4,10 @@
 __pycache__
 *.pyc
 data
-artifacts
 tests
+runtime
+.env
+.env.*
+.pytest_cache
+.ruff_cache
+.coverage

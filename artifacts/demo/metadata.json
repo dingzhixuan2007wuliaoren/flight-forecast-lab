@@ -1,8 +1,15 @@
 {
-  "artifact_schema_version": 1,
+  "artifact_schema_version": 3,
+  "context_prior": {
+    "operations_airport_groups": 34,
+    "source": "synthetic_demo_training_average",
+    "status": "proxy",
+    "training_rows_only": true,
+    "weather_month_groups": 12
+  },
   "data_fingerprints": {
-    "on_time_sha256": "3985ed267c51f366bdc0976958431cb5ec3d317b5e3e40a3808dff7e52536946",
-    "price_sha256": "c86ca74db50f41e9a6b6d22ca6182d7f1ef016ddb882d68cd3789e3851afdefe"
+    "on_time_sha256": "bebea6727d2d1e9bd1729c84afd1cc625eb319bdf3733d7058bd3ed82e3f5dc2",
+    "price_sha256": "96e7e20f28bfa2f4c948165afeadecf6da977270aa4799243ead50be44b4f0d7"
   },
   "data_mode": "synthetic_demo",
   "data_time_ranges": {
@@ -15,7 +22,7 @@
       "start": "2023-01-01T04:00:00+00:00"
     }
   },
-  "model_version": "0.1.0",
+  "model_version": "0.2.0",
   "random_state": 42,
   "row_counts": {
     "on_time": 8000,
@@ -26,6 +33,11 @@
     "python": "3.12.13",
     "scikit_learn": "1.9.0"
   },
+  "runtime_context_features": {
+    "news_disruption_index": "bounded recent-news signal; synthetic relationship in demo training",
+    "origin_congestion_index": "resolved automatically at prediction time",
+    "weather_severity_forecast": "used only when live or forecast weather is usable; otherwise the separate no-weather on-time model is selected"
+  },
   "target_definitions": {
     "on_time": "not cancelled and arrival delay below 15 minutes",
     "price": "USD fare estimate conditional on itinerary and booking lead time"
@@ -34,5 +46,5 @@
     "on_time": 1200,
     "price": 900
   },
-  "trained_at_utc": "2026-07-11T18:57:20.660853+00:00"
+  "trained_at_utc": "2026-07-15T21:22:33.699000+00:00"
 }

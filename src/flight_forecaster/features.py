@@ -9,6 +9,7 @@ PRICE_NUMERIC_FEATURES = [
     "duration_minutes",
     "distance_km",
     "days_until_departure",
+    "news_disruption_index",
     "departure_month_sin",
     "departure_month_cos",
     "departure_weekday_sin",
@@ -24,6 +25,7 @@ ONTIME_NUMERIC_FEATURES = [
     "distance_km",
     "weather_severity_forecast",
     "origin_congestion_index",
+    "news_disruption_index",
     "departure_month_sin",
     "departure_month_cos",
     "departure_weekday_sin",
@@ -34,6 +36,12 @@ ONTIME_NUMERIC_FEATURES = [
     "is_peak_hour",
 ]
 ONTIME_FEATURES = ONTIME_CATEGORICAL_FEATURES + ONTIME_NUMERIC_FEATURES
+ONTIME_NUMERIC_FEATURES_WITHOUT_WEATHER = [
+    feature for feature in ONTIME_NUMERIC_FEATURES if feature != "weather_severity_forecast"
+]
+ONTIME_FEATURES_WITHOUT_WEATHER = (
+    ONTIME_CATEGORICAL_FEATURES + ONTIME_NUMERIC_FEATURES_WITHOUT_WEATHER
+)
 
 
 def _cyclic(values: pd.Series, period: float) -> tuple[pd.Series, pd.Series]:
@@ -47,6 +55,28 @@ def _codes(frame: pd.DataFrame) -> pd.DataFrame:
         result[column] = result[column].astype(str).str.strip().str.upper()
     result["route"] = result["origin"] + "-" + result["destination"]
     return result
+
+
+def _local_time_parts(
+    frame: pd.DataFrame,
+    fallback: pd.Series,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    components: list[pd.Series] = []
+    bounds = (
+        ("departure_local_month", 1, 12),
+        ("departure_local_weekday", 0, 6),
+        ("departure_local_hour", 0, 23),
+    )
+    defaults = (fallback.dt.month, fallback.dt.weekday, fallback.dt.hour)
+    for (column, minimum, maximum), default in zip(bounds, defaults, strict=True):
+        if column in frame:
+            values = pd.to_numeric(frame[column], errors="raise")
+            if not values.between(minimum, maximum).all():
+                raise ValueError(f"{column} must be between {minimum} and {maximum}")
+            components.append(values.astype(int))
+        else:
+            components.append(default)
+    return components[0], components[1], components[2]
 
 
 def build_price_features(frame: pd.DataFrame) -> pd.DataFrame:
@@ -66,6 +96,8 @@ def build_price_features(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"price data is missing columns: {sorted(missing)}")
 
     result = _codes(frame)
+    if "news_disruption_index" not in result:
+        result["news_disruption_index"] = 0.0
     quote_time = pd.to_datetime(result["quote_time"], utc=True, errors="raise")
     departure_time = pd.to_datetime(result["departure_time"], utc=True, errors="raise")
     lead_days = (departure_time - quote_time).dt.total_seconds() / 86_400.0
@@ -73,9 +105,7 @@ def build_price_features(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("all departure_time values must be after quote_time")
 
     result["days_until_departure"] = lead_days
-    month = departure_time.dt.month
-    weekday = departure_time.dt.weekday
-    hour = departure_time.dt.hour
+    month, weekday, hour = _local_time_parts(result, departure_time)
     result["departure_month_sin"], result["departure_month_cos"] = _cyclic(month, 12)
     result["departure_weekday_sin"], result["departure_weekday_cos"] = _cyclic(weekday, 7)
     result["departure_hour_sin"], result["departure_hour_cos"] = _cyclic(hour, 24)
@@ -83,28 +113,46 @@ def build_price_features(frame: pd.DataFrame) -> pd.DataFrame:
     return result[PRICE_FEATURES]
 
 
-def build_ontime_features(frame: pd.DataFrame) -> pd.DataFrame:
+def _build_ontime_features(
+    frame: pd.DataFrame,
+    *,
+    include_weather: bool,
+) -> pd.DataFrame:
     required = {
         "origin",
         "destination",
         "airline",
         "distance_km",
         "scheduled_departure",
-        "weather_severity_forecast",
         "origin_congestion_index",
     }
+    if include_weather:
+        required.add("weather_severity_forecast")
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"on-time data is missing columns: {sorted(missing)}")
 
     result = _codes(frame)
+    if "news_disruption_index" not in result:
+        result["news_disruption_index"] = 0.0
     scheduled = pd.to_datetime(result["scheduled_departure"], utc=True, errors="raise")
-    month = scheduled.dt.month
-    weekday = scheduled.dt.weekday
-    hour = scheduled.dt.hour
+    month, weekday, hour = _local_time_parts(result, scheduled)
     result["departure_month_sin"], result["departure_month_cos"] = _cyclic(month, 12)
     result["departure_weekday_sin"], result["departure_weekday_cos"] = _cyclic(weekday, 7)
     result["departure_hour_sin"], result["departure_hour_cos"] = _cyclic(hour, 24)
     result["is_weekend"] = weekday.isin([5, 6]).astype(int)
     result["is_peak_hour"] = hour.isin([6, 7, 8, 16, 17, 18, 19]).astype(int)
-    return result[ONTIME_FEATURES]
+    features = ONTIME_FEATURES if include_weather else ONTIME_FEATURES_WITHOUT_WEATHER
+    return result[features]
+
+
+def build_ontime_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build the on-time feature matrix when usable live/forecast weather exists."""
+
+    return _build_ontime_features(frame, include_weather=True)
+
+
+def build_ontime_features_without_weather(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build the on-time matrix without creating or imputing a weather feature."""
+
+    return _build_ontime_features(frame, include_weather=False)

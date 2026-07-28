@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from flight_forecaster.catalog import comparison_airlines
+
 ROUTES = (
     ("JFK", "LAX", 3_983, 365, 320),
     ("LAX", "JFK", 3_983, 345, 315),
@@ -18,11 +20,65 @@ ROUTES = (
     ("LAS", "DEN", 1_010, 115, 130),
     ("DFW", "SFO", 2_353, 235, 245),
     ("SFO", "DFW", 2_353, 220, 240),
+    ("JFK", "LHR", 5_554, 415, 520),
+    ("LHR", "JFK", 5_554, 485, 540),
+    ("CDG", "DXB", 5_248, 405, 430),
+    ("DXB", "CDG", 5_248, 445, 450),
+    ("DXB", "SYD", 12_040, 825, 840),
+    ("SYD", "DXB", 12_040, 875, 870),
+    ("SIN", "LHR", 10_875, 835, 850),
+    ("LHR", "SIN", 10_875, 790, 820),
+    ("HND", "LAX", 8_815, 620, 760),
+    ("LAX", "HND", 8_815, 690, 790),
+    ("YYZ", "YVR", 3_349, 310, 340),
+    ("YVR", "YYZ", 3_349, 275, 330),
+    ("GRU", "MAD", 8_378, 630, 650),
+    ("MAD", "GRU", 8_378, 660, 680),
+    ("JNB", "LHR", 9_080, 665, 690),
+    ("LHR", "JNB", 9_080, 650, 670),
+    ("DOH", "AKL", 14_535, 1_050, 1_100),
+    ("AKL", "DOH", 14_535, 1_020, 1_070),
+    ("SCL", "LIM", 2_462, 235, 230),
+    ("LIM", "SCL", 2_462, 225, 220),
+    ("NRT", "SIN", 5_350, 430, 480),
+    ("SIN", "NRT", 5_350, 420, 470),
+    ("DEL", "FRA", 6_130, 500, 510),
+    ("FRA", "DEL", 6_130, 475, 500),
+    ("CAI", "JED", 1_215, 140, 190),
+    ("JED", "CAI", 1_215, 145, 185),
+    ("AKL", "SYD", 2_160, 220, 260),
+    ("SYD", "AKL", 2_160, 190, 250),
+    ("MEX", "BOG", 3_150, 270, 290),
+    ("BOG", "MEX", 3_150, 285, 300),
+    ("IST", "JFK", 8_040, 660, 690),
+    ("JFK", "IST", 8_040, 585, 670),
 )
 
-AIRLINES = np.array(["AA", "AS", "DL", "UA", "WN"])
-AIRLINE_PRICE_MULTIPLIER = {"AA": 1.02, "AS": 1.00, "DL": 1.06, "UA": 1.04, "WN": 0.92}
-AIRLINE_DISRUPTION_EFFECT = {"AA": 0.20, "AS": -0.15, "DL": -0.25, "UA": 0.10, "WN": 0.05}
+_AIRLINE_PROFILES = comparison_airlines()
+AIRLINES = np.array([profile.code for profile in _AIRLINE_PROFILES])
+_SERVICE_PRICE = {"low_cost": 0.82, "hybrid": 0.93, "full_service": 1.04}
+_SERVICE_DISRUPTION = {"low_cost": 0.12, "hybrid": 0.04, "full_service": -0.05}
+
+
+def _stable_carrier_offset(code: str) -> float:
+    """Small deterministic variation used only by the synthetic global demo."""
+
+    return ((sum(ord(character) for character in code) % 13) - 6) * 0.006
+
+
+AIRLINE_PRICE_MULTIPLIER = {
+    profile.code: _SERVICE_PRICE[profile.service_model] + _stable_carrier_offset(profile.code)
+    for profile in _AIRLINE_PROFILES
+}
+AIRLINE_DISRUPTION_EFFECT = {
+    profile.code: _SERVICE_DISRUPTION[profile.service_model]
+    + _stable_carrier_offset(profile.code) * 1.8
+    for profile in _AIRLINE_PROFILES
+}
+_AIRLINE_WEIGHTS = np.array(
+    [0.75 if profile.service_model == "low_cost" else 1.0 for profile in _AIRLINE_PROFILES]
+)
+AIRLINE_PROBABILITIES = _AIRLINE_WEIGHTS / _AIRLINE_WEIGHTS.sum()
 CABINS = np.array(["economy", "premium_economy", "business", "first"])
 CABIN_MULTIPLIER = {
     "economy": 1.0,
@@ -58,9 +114,14 @@ def generate_demo_price_data(rows: int = 6_000, seed: int = 42) -> pd.DataFrame:
         + pd.to_timedelta(departure_hour, unit="h")
     )
 
-    airline = rng.choice(AIRLINES, size=rows, p=[0.23, 0.12, 0.25, 0.23, 0.17])
+    airline = rng.choice(AIRLINES, size=rows, p=AIRLINE_PROBABILITIES)
     cabin = rng.choice(CABINS, size=rows, p=[0.82, 0.09, 0.075, 0.015])
     stops = rng.choice([0, 1, 2], size=rows, p=[0.72, 0.25, 0.03])
+    news_disruption = np.clip(
+        rng.beta(0.8, 8.0, size=rows) + (rng.random(rows) < 0.025) * rng.uniform(0.4, 0.9, rows),
+        0,
+        1,
+    )
     month = departure_time.month.to_numpy()
     weekday = departure_time.weekday.to_numpy()
 
@@ -76,7 +137,17 @@ def generate_demo_price_data(rows: int = 6_000, seed: int = 42) -> pd.DataFrame:
     carrier = np.array([AIRLINE_PRICE_MULTIPLIER[value] for value in airline])
     cabin_factor = np.array([CABIN_MULTIPLIER[value] for value in cabin])
     market_noise = rng.lognormal(mean=0.0, sigma=0.13, size=rows)
-    price = base_fare * urgency * season * weekend * stop_discount * carrier * cabin_factor
+    news_factor = 1.0 + 0.08 * news_disruption
+    price = (
+        base_fare
+        * urgency
+        * season
+        * weekend
+        * stop_discount
+        * carrier
+        * cabin_factor
+        * news_factor
+    )
     price = np.maximum(49.0, price * market_noise)
 
     return pd.DataFrame(
@@ -90,6 +161,7 @@ def generate_demo_price_data(rows: int = 6_000, seed: int = 42) -> pd.DataFrame:
             "stops": stops,
             "duration_minutes": np.round(duration_minutes).astype(int),
             "distance_km": distance_km,
+            "news_disruption_index": np.round(news_disruption, 4),
             "price_usd": np.round(price, 2),
         }
     )
@@ -108,7 +180,12 @@ def generate_demo_ontime_data(rows: int = 8_000, seed: int = 43) -> pd.DataFrame
         + pd.to_timedelta(scheduled_day, unit="D")
         + pd.to_timedelta(scheduled_hour, unit="h")
     )
-    airline = rng.choice(AIRLINES, size=rows, p=[0.23, 0.12, 0.25, 0.23, 0.17])
+    airline = rng.choice(AIRLINES, size=rows, p=AIRLINE_PROBABILITIES)
+    news_disruption = np.clip(
+        rng.beta(0.8, 8.0, size=rows) + (rng.random(rows) < 0.025) * rng.uniform(0.4, 0.9, rows),
+        0,
+        1,
+    )
     distance_km = np.array([route[2] for route in routes], dtype=float)
     month = scheduled.month.to_numpy()
     weekday = scheduled.weekday.to_numpy()
@@ -128,7 +205,7 @@ def generate_demo_ontime_data(rows: int = 8_000, seed: int = 43) -> pd.DataFrame
         "SEA": 0.50,
         "SFO": 0.64,
     }
-    origin_congestion = np.array([airport_base[route[0]] for route in routes])
+    origin_congestion = np.array([airport_base.get(route[0], 0.56) for route in routes])
     origin_congestion = np.clip(origin_congestion + rng.normal(0, 0.09, rows), 0, 1)
     peak = np.isin(scheduled_hour, [6, 8, 16, 18, 20]).astype(float)
     weekend = np.isin(weekday, [5, 6]).astype(float)
@@ -141,6 +218,7 @@ def generate_demo_ontime_data(rows: int = 8_000, seed: int = 43) -> pd.DataFrame
         + 0.45 * peak
         - 0.16 * weekend
         + 0.16 * (distance_km > 3_000)
+        + 1.10 * news_disruption
         + carrier_effect
     )
     disruption_probability = 1.0 / (1.0 + np.exp(-disruption_logit))
@@ -166,6 +244,7 @@ def generate_demo_ontime_data(rows: int = 8_000, seed: int = 43) -> pd.DataFrame
             "distance_km": distance_km,
             "weather_severity_forecast": np.round(weather, 4),
             "origin_congestion_index": np.round(origin_congestion, 4),
+            "news_disruption_index": np.round(news_disruption, 4),
             "cancelled": cancelled.astype(int),
             "arrival_delay_minutes": np.round(arrival_delay, 1),
             "on_time": on_time,

@@ -32,14 +32,16 @@ from flight_forecaster import __version__
 from flight_forecaster.features import (
     ONTIME_CATEGORICAL_FEATURES,
     ONTIME_NUMERIC_FEATURES,
+    ONTIME_NUMERIC_FEATURES_WITHOUT_WEATHER,
     PRICE_CATEGORICAL_FEATURES,
     PRICE_NUMERIC_FEATURES,
     build_ontime_features,
+    build_ontime_features_without_weather,
     build_price_features,
 )
 
 ARTIFACT_FILENAME = "model_bundle.joblib"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -111,10 +113,14 @@ def _price_pipeline(random_state: int) -> Pipeline:
     )
 
 
-def _ontime_pipeline(random_state: int) -> Pipeline:
+def _ontime_pipeline(
+    random_state: int,
+    *,
+    numeric_features: list[str] = ONTIME_NUMERIC_FEATURES,
+) -> Pipeline:
     return Pipeline(
         [
-            ("preprocess", _preprocessor(ONTIME_CATEGORICAL_FEATURES, ONTIME_NUMERIC_FEATURES)),
+            ("preprocess", _preprocessor(ONTIME_CATEGORICAL_FEATURES, numeric_features)),
             (
                 "model",
                 LogisticRegression(
@@ -163,6 +169,30 @@ def _ontime_metrics(
     }
 
 
+def _context_priors(frame: pd.DataFrame, *, data_mode: str) -> dict[str, Any]:
+    """Build fallback averages from training rows only, never from held-out future rows."""
+
+    working = frame.copy()
+    departure = pd.to_datetime(working["scheduled_departure"], utc=True, errors="raise")
+    weather = pd.to_numeric(working["weather_severity_forecast"], errors="raise").clip(0, 1)
+    operations = pd.to_numeric(working["origin_congestion_index"], errors="raise").clip(0, 1)
+    weather_by_month = weather.groupby(departure.dt.month).mean()
+    operations_by_origin = operations.groupby(working["origin"].astype(str).str.upper()).mean()
+    source = f"{data_mode}_training_average"
+    return {
+        "status": "proxy",
+        "source": source,
+        "weather_global": round(float(weather.mean()), 4),
+        "weather_by_month": {
+            str(int(month)): round(float(value), 4) for month, value in weather_by_month.items()
+        },
+        "operations_global": round(float(operations.mean()), 4),
+        "operations_by_origin": {
+            str(origin): round(float(value), 4) for origin, value in operations_by_origin.items()
+        },
+    }
+
+
 def train_models(
     price_data: pd.DataFrame,
     ontime_data: pd.DataFrame,
@@ -171,7 +201,7 @@ def train_models(
     data_mode: str,
     random_state: int = 42,
 ) -> dict[str, Any]:
-    """Train both models, evaluate on future rows, and persist a versioned bundle."""
+    """Train the fare model and both on-time variants, then persist a versioned bundle."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -220,7 +250,31 @@ def train_models(
     ontime_baseline = float(np.mean(y_ontime_train))
     ontime_metrics = _ontime_metrics(y_ontime_test, ontime_probability, ontime_baseline)
 
-    metrics = {"price": price_metrics, "on_time": ontime_metrics}
+    ontime_model_without_weather = _ontime_pipeline(
+        random_state,
+        numeric_features=ONTIME_NUMERIC_FEATURES_WITHOUT_WEATHER,
+    )
+    x_ontime_train_without_weather = build_ontime_features_without_weather(ontime_split.train)
+    ontime_model_without_weather.fit(
+        x_ontime_train_without_weather,
+        y_ontime_train,
+    )
+    x_ontime_test_without_weather = build_ontime_features_without_weather(ontime_split.test)
+    ontime_probability_without_weather = ontime_model_without_weather.predict_proba(
+        x_ontime_test_without_weather
+    )[:, 1]
+    ontime_metrics_without_weather = _ontime_metrics(
+        y_ontime_test,
+        ontime_probability_without_weather,
+        ontime_baseline,
+    )
+    context_priors = _context_priors(ontime_split.train, data_mode=data_mode)
+
+    metrics = {
+        "price": price_metrics,
+        "on_time": ontime_metrics,
+        "on_time_without_weather": ontime_metrics_without_weather,
+    }
     trained_at = datetime.now(UTC).isoformat()
     metadata = {
         "artifact_schema_version": SCHEMA_VERSION,
@@ -257,6 +311,23 @@ def train_models(
             "price": "USD fare estimate conditional on itinerary and booking lead time",
             "on_time": "not cancelled and arrival delay below 15 minutes",
         },
+        "runtime_context_features": {
+            "news_disruption_index": (
+                "bounded recent-news signal; synthetic relationship in demo training"
+            ),
+            "weather_severity_forecast": (
+                "used only when live or forecast weather is usable; otherwise the "
+                "separate no-weather on-time model is selected"
+            ),
+            "origin_congestion_index": "resolved automatically at prediction time",
+        },
+        "context_prior": {
+            "source": context_priors["source"],
+            "status": context_priors["status"],
+            "weather_month_groups": len(context_priors["weather_by_month"]),
+            "operations_airport_groups": len(context_priors["operations_by_origin"]),
+            "training_rows_only": True,
+        },
     }
     bundle = {
         "artifact_schema_version": SCHEMA_VERSION,
@@ -264,8 +335,10 @@ def train_models(
         "price_model": price_model,
         "price_interval_half_width_usd": interval_half_width,
         "ontime_model": ontime_model,
+        "ontime_model_without_weather": ontime_model_without_weather,
         "metrics": metrics,
         "metadata": metadata,
+        "context_priors": context_priors,
     }
     joblib.dump(bundle, output_path / ARTIFACT_FILENAME, compress=3)
     (output_path / "metrics.json").write_text(
@@ -285,6 +358,7 @@ def _render_report(
 ) -> str:
     price = metrics["price"]
     on_time = metrics["on_time"]
+    on_time_without_weather = metrics["on_time_without_weather"]
     return f"""# Demo training report
 
 Generated at `{metadata["trained_at_utc"]}` using `{metadata["data_mode"]}` data.
@@ -304,6 +378,17 @@ Generated at `{metadata["trained_at_utc"]}` using `{metadata["data_mode"]}` data
 - Naive-rate baseline Brier score: `{on_time["baseline_brier_score"]:.4f}`
 - ROC AUC: `{on_time["roc_auc"]:.4f}`
 - Log loss: `{on_time["log_loss"]:.4f}`
+
+## On-time model without weather
+
+- Brier score: `{on_time_without_weather["brier_score"]:.4f}` (lower is better)
+- Naive-rate baseline Brier score: `{on_time_without_weather["baseline_brier_score"]:.4f}`
+- ROC AUC: `{on_time_without_weather["roc_auc"]:.4f}`
+- Log loss: `{on_time_without_weather["log_loss"]:.4f}`
+
+The weather-enhanced model is used only for usable live or forecast weather.
+All other weather states select this separate no-weather model; no proxy value is
+inserted into the prediction.
 
 > These numbers describe a deterministic synthetic-data demo. They are pipeline checks,
 > not evidence of production performance. Retrain and re-evaluate on representative data.
