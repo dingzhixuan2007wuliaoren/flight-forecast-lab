@@ -28,6 +28,7 @@ from flight_forecaster.hotel_prices import (
     SerpApiHotelPriceProvider,
     hotel_price_provider_from_env,
 )
+from flight_forecaster.serpapi_transit import serpapi_transit_provider_from_env
 
 router = APIRouter()
 
@@ -56,7 +57,7 @@ class DestinationPlacesRequest(_RequestModel):
     destination: str = Field(pattern=r"^[A-Za-z]{3}$")
     kind: PlaceKind
     category: PlaceCategory = "all"
-    limit: int = Field(default=30, ge=1, le=30)
+    limit: int = Field(default=300, ge=1, le=300)
     language: Language = "zh"
 
 
@@ -70,6 +71,7 @@ class DestinationPlaceDetailRequest(_RequestModel):
     )
     language: Language = "zh"
     transit_departure_at: AwareDatetime | None = None
+    include_live_transit: bool = False
 
 
 class HotelPricesRequest(_RequestModel):
@@ -91,6 +93,7 @@ class HotelPriceDetailRequest(HotelPricesRequest):
         pattern=r"^osm_hotel_(?:node|way|relation)_[1-9][0-9]{0,18}$",
     )
     transit_departure_at: AwareDatetime | None = None
+    include_live_transit: bool = False
 
     @model_validator(mode="after")
     def requires_one_hotel_identity(self) -> HotelPriceDetailRequest:
@@ -105,7 +108,11 @@ def _runtime_dir() -> Path:
 
 @lru_cache(maxsize=1)
 def get_destination_guide_service() -> DestinationGuideService:
-    return build_destination_guide_service()
+    return build_destination_guide_service(
+        serpapi_transit_provider=serpapi_transit_provider_from_env(
+            _runtime_dir() / "serpapi-usage.sqlite3"
+        )
+    )
 
 
 @lru_cache(maxsize=1)
@@ -117,15 +124,39 @@ def _language(value: Language) -> Literal["zh-cn", "en"]:
     return "en" if value == "en" else "zh-cn"
 
 
-def _transport_payload(transport: object) -> tuple[dict[str, object], list[dict], str]:
+def _transport_payload(
+    transport: object,
+) -> tuple[dict[str, object], list[dict[str, object]], str, str]:
     payload = transport.model_dump(mode="json")  # type: ignore[attr-defined]
-    options = list(payload["options"])
+    options = [
+        item
+        for item in payload["options"]
+        if isinstance(item, dict)
+    ]
     transit = next(
         (item for item in options if item.get("mode") == "public_transit"),
         None,
     )
     notice = str(transit.get("notice", "")) if transit else ""
-    return payload, options, notice
+    source = "+".join(
+        dict.fromkeys(
+            value
+            for item in options
+            if (value := str(item.get("data_source") or "").strip())
+        )
+    )
+    return payload, options, notice, source
+
+
+def _source_chain(*values: str) -> str:
+    return "+".join(
+        dict.fromkeys(
+            component
+            for value in values
+            for component in value.split("+")
+            if component
+        )
+    )
 
 
 def _formatted_usd(value: float | None, *, suffix: str = "") -> str | None:
@@ -255,8 +286,14 @@ def destination_places(request: DestinationPlacesRequest) -> dict[str, object]:
         {
             "destination_airport": listing.city.destination_airport,
             "status": "available" if listing.places else "no_results",
-            "source": listing.data_source,
+            "source": (
+                "openstreetmap_overpass+wikimedia"
+                if listing.kind == "attraction"
+                else listing.data_source
+            ),
             "observed_at": listing.fetched_at.isoformat(),
+            "available_result_count": listing.result_count,
+            "result_limit": request.limit,
         }
     )
     return payload
@@ -275,6 +312,7 @@ def destination_place_detail(
             request.destination,
             request.place_id,
             transit_departure_at=request.transit_departure_at,
+            include_live_transit=request.include_live_transit,
         )
     except (
         DestinationValidationError,
@@ -284,7 +322,9 @@ def destination_place_detail(
     ) as exc:
         raise _destination_error(exc) from exc
     payload = detail.model_dump(mode="json")
-    transport, routes, transit_notice = _transport_payload(detail.transport)
+    transport, routes, transit_notice, transport_source = _transport_payload(
+        detail.transport
+    )
     observed_at = max(option.observed_at for option in detail.transport.options)
     payload.update(
         {
@@ -292,8 +332,13 @@ def destination_place_detail(
             "transport": transport,
             "routes": routes,
             "transit_notice": transit_notice,
-            "source": (
-                "openstreetmap_overpass+routing_openstreetmap_de+transitous_motis"
+            "source": _source_chain(
+                (
+                    "openstreetmap_overpass+wikimedia"
+                    if request.kind == "attraction"
+                    else "openstreetmap_overpass"
+                ),
+                transport_source,
             ),
             "observed_at": observed_at.isoformat(),
         }
@@ -381,6 +426,7 @@ def destination_hotel_price_detail(
                 city.destination_airport,
                 request.place_id,
                 transit_departure_at=request.transit_departure_at,
+                include_live_transit=request.include_live_transit,
             )
         except (
             DestinationValidationError,
@@ -451,6 +497,7 @@ def destination_hotel_price_detail(
                 offer.latitude,
                 offer.longitude,
                 transit_departure_at=request.transit_departure_at,
+                include_live_transit=request.include_live_transit,
             )
         except (
             DestinationValidationError,
@@ -458,7 +505,9 @@ def destination_hotel_price_detail(
             DestinationDataUnavailable,
         ) as exc:
             raise _destination_error(exc) from exc
-    transport, routes, transit_notice = _transport_payload(route_result)
+    transport, routes, transit_notice, transport_source = _transport_payload(
+        route_result
+    )
     price = _safe_offer(offer, language=_language(request.language))
     if osm_place is None:
         hotel = {
@@ -468,7 +517,7 @@ def destination_hotel_price_detail(
             "address": None,
             "opening_hours": None,
         }
-        source = "serpapi_google_hotels+routing_openstreetmap_de+transitous_motis"
+        source = _source_chain("serpapi_google_hotels", transport_source)
     else:
         hotel = {
             **price,
@@ -480,9 +529,10 @@ def destination_hotel_price_detail(
             "phone": osm_place.phone,
             "source_url": osm_place.source_url,
         }
-        source = (
-            "openstreetmap_overpass+serpapi_google_hotels+"
-            "routing_openstreetmap_de+transitous_motis"
+        source = _source_chain(
+            "openstreetmap_overpass",
+            "serpapi_google_hotels",
+            transport_source,
         )
     return {
         "city": city.model_dump(mode="json"),

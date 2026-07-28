@@ -1956,6 +1956,8 @@
           coverageQuotaLimited: "实际免费额度不足使部分候选未验证，当前列表已截断。",
           coverageProviderIncomplete: "部分候选因供应商响应失败而未能完成验证，当前列表不完整。",
           coverageQuotaAndProviderIncomplete: "实际免费额度或供应商响应限制了验证，当前列表已截断且不完整。",
+          coverageQuotaCause: "本次真实{quota}仅允许验证 {attempted}/{eligible} 个候选；这个数量不是应用固定上限。",
+          coverageDirectPriority: "额度不足时，验证队列优先覆盖直飞，并在各舱位间轮转；其余候选不会伪装成可预订航班。",
           coverageCacheSnapshot: "以下覆盖统计来自 5 分钟严格缓存的原查询；本次没有新增供应商调用。",
           coverageCounts: "发现 {eligible} 个候选；尝试 {attempted} 个，验证通过 {verified} 个，严格排除 {rejected} 个，供应商失败 {failed} 个，额度跳过 {skipped} 个；同航程同舱位去重 {deduplicated} 个，最终显示 {displayed} 个最低价选项。",
           quotaLimitHourly: "小时额度",
@@ -2205,6 +2207,8 @@
           coverageQuotaLimited: "Actual free quota left candidates unverified, so the current list is truncated.",
           coverageProviderIncomplete: "Some candidates could not complete verification because of provider-response failures, so the current list is incomplete.",
           coverageQuotaAndProviderIncomplete: "Actual free quota or provider responses limited verification, so the current list is truncated and incomplete.",
+          coverageQuotaCause: "The real {quota} allowed {attempted}/{eligible} candidates to be verified in this run; that number is not a fixed application cap.",
+          coverageDirectPriority: "When quota is insufficient, the verification queue covers nonstop itineraries first and round-robins cabins; remaining candidates are never presented as bookable.",
           coverageCacheSnapshot: "These coverage counts come from the original search in the five-minute strict cache; this response made no new provider calls.",
           coverageCounts: "Found {eligible} candidates; attempted {attempted}, verified {verified}, strictly rejected {rejected}, provider failed {failed}, and quota skipped {skipped}; deduplicated {deduplicated} same-itinerary/cabin results and display {displayed} lowest-price options.",
           quotaLimitHourly: "hourly quota",
@@ -2394,6 +2398,7 @@
       };
 
       var currentLanguage = "zh";
+      var MAX_STRICT_ITINERARY_SEGMENTS = 8;
       var activeRanking = "direct_first";
       var activeCabin = "all";
       var lastData = null;
@@ -3024,9 +3029,19 @@
         var skipped = coverageCount(metadata.quota_skipped_candidate_count);
         var deduplicated = coverageCount(metadata.deduplicated_verified_count);
         var displayed = Array.isArray(data && data.offers) ? data.offers.length : 0;
+        var quotaLimited = coverageStatus === "quota_limited" ||
+          coverageStatus === "quota_and_provider_incomplete";
+        var statusText = t(statusKey);
+        if (quotaLimited) {
+          statusText += " " + fillTemplate("coverageQuotaCause", {
+            quota: coverageQuotaLabel(metadata.quota_limit),
+            attempted: attempted,
+            eligible: eligible
+          });
+        }
         var parts = [
           t("coverageScope"),
-          t(statusKey),
+          statusText,
           fillTemplate("coverageCounts", {
             eligible: eligible,
             attempted: attempted,
@@ -3046,8 +3061,8 @@
               localizeStatus(run && run.status) + ")";
           }).filter(hasValue).join("; "));
         }
-        if (coverageStatus === "quota_limited" || coverageStatus === "quota_and_provider_incomplete") {
-          parts.push("(" + coverageQuotaLabel(metadata.quota_limit) + ")");
+        if (quotaLimited) {
+          parts.push(t("coverageDirectPriority"));
         }
         textNode.textContent = parts.join(" ");
         root.classList.add("visible");
@@ -3225,7 +3240,7 @@
         var fare = fareFor(offer);
         var segments = Array.isArray(offer && offer.segments) ? offer.segments :
           (fare && Array.isArray(fare.segments) ? fare.segments : []);
-        return segments.filter(function (segment) { return segment && typeof segment === "object"; }).slice(0, 4);
+        return segments.filter(function (segment) { return segment && typeof segment === "object"; }).slice(0, MAX_STRICT_ITINERARY_SEGMENTS + 1);
       }
 
       function fareProviderLabel(fare) {
@@ -3287,9 +3302,9 @@
              !hasValue(fare.cabin_summary) || !safeArticleUrl(fare.source_url) ||
              (seats !== null && seats !== undefined && (asNumber(seats) === null || asNumber(seats) < 1 || asNumber(seats) > 9)) ||
             (fare.seat_count_capped === true && asNumber(seats) !== 9) || !hasValue(offer && offer.stops) ||
-            stops === null || stops !== Math.round(stops) || stops < 0 || stops > 3 || segments.length !== stops + 1 ||
+            stops === null || stops !== Math.round(stops) || stops < 0 || stops >= MAX_STRICT_ITINERARY_SEGMENTS || segments.length !== stops + 1 ||
             normalizeKey(fare.cabin_summary) !== normalizeKey(offer && offer.cabin) ||
-            segments.length < 1 || segments.length > 4) return false;
+            segments.length < 1 || segments.length > MAX_STRICT_ITINERARY_SEGMENTS) return false;
         return segments.every(function (segment, index) {
           return hasValue(segment.origin) && hasValue(segment.destination) && hasValue(segmentFlightNumber(segment)) &&
             asNumber(segment.sequence) === index + 1 && hasValue(segment.marketing_airline_code) &&

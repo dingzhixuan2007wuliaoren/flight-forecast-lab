@@ -156,6 +156,147 @@ def _confirmed_offer(
     )
 
 
+def _multi_segment_confirmed_offer(
+    *,
+    segment_count: int,
+    selected_date: date,
+    verified_at: datetime,
+) -> ConfirmedFlightOffer:
+    airports = (
+        ("YYZ", ZoneInfo("America/Toronto")),
+        ("YUL", ZoneInfo("America/Toronto")),
+        ("JFK", ZoneInfo("America/New_York")),
+        ("BOS", ZoneInfo("America/New_York")),
+        ("IAD", ZoneInfo("America/New_York")),
+        ("ATL", ZoneInfo("America/New_York")),
+        ("MIA", ZoneInfo("America/New_York")),
+        ("DFW", ZoneInfo("America/Chicago")),
+        ("DEN", ZoneInfo("America/Denver")),
+        ("LAX", ZoneInfo("America/Los_Angeles")),
+    )
+    start = datetime.combine(selected_date, time(12), tzinfo=UTC)
+    segments: list[FlightOfferSegment] = []
+    for index in range(segment_count):
+        departure_utc = start + timedelta(hours=index * 4)
+        arrival_utc = departure_utc + timedelta(hours=2)
+        origin, origin_zone = airports[index]
+        destination, destination_zone = airports[index + 1]
+        segments.append(
+            FlightOfferSegment(
+                segment_id=f"strict-{index + 1}",
+                origin=origin,
+                destination=destination,
+                departure_at=departure_utc.astimezone(origin_zone).replace(tzinfo=None),
+                arrival_at=arrival_utc.astimezone(destination_zone).replace(tzinfo=None),
+                marketing_airline_code="AC",
+                operating_airline_code="AC",
+                flight_number=str(800 + index),
+                departure_terminal=None,
+                arrival_terminal=None,
+                aircraft_icao=None,
+                cabin="economy",
+                booking_class="K",
+                fare_basis="KFLEX",
+                fare_brand="FLEX",
+                checked_bags_quantity=1,
+                checked_bags_weight=None,
+                checked_bags_weight_unit=None,
+            )
+        )
+    return ConfirmedFlightOffer(
+        provider_offer_id=f"priced-multi-{segment_count}",
+        validating_airline_code="AC",
+        airline_name="Air Canada",
+        cabin="economy",
+        total_amount_usd=900.0,
+        base_amount_usd=800.0,
+        last_ticketing_date=selected_date,
+        number_of_bookable_seats=4,
+        seat_count_capped=False,
+        verified_at=verified_at,
+        provider_cache_hit=False,
+        provider_cache_age_seconds=0,
+        booking_provider="Air Canada",
+        booking_url="https://www.google.com/travel/flights/booking/multi-segment",
+        booking_url_kind="direct_get",
+        booking_verified=True,
+        segments=tuple(segments),
+        refundable_fare=True,
+        no_penalty_fare=True,
+        no_restriction_fare=None,
+    )
+
+
+def test_service_accepts_eight_segments_and_rejects_nine(
+    trained_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    generated_at = datetime(2026, 8, 1, 12, tzinfo=UTC)
+    selected_date = date(2026, 8, 10)
+    service = PredictionService(
+        trained_model_dir,
+        context_provider=ContextProvider(),
+        schedule_provider=_StaticScheduleProvider(ScheduleSearchResult((), frozenset())),  # type: ignore[arg-type]
+        now_provider=lambda: generated_at,
+    )
+    accepted = _multi_segment_confirmed_offer(
+        segment_count=8,
+        selected_date=selected_date,
+        verified_at=generated_at,
+    )
+
+    segments, distance_km, duration_minutes = service._strict_provider_segments(
+        accepted,
+        origin="YYZ",
+        destination="DEN",
+        departure_date=selected_date,
+        generated_at=generated_at,
+    )
+
+    assert len(segments) == 8
+    assert distance_km > 0
+    assert duration_minutes == 1_800
+    service.flight_offer_provider = _StaticFareProvider(
+        _fare_result(accepted, observed_at=generated_at)
+    )
+    comparison = service.compare(
+        ComparisonRequest(
+            origin="YYZ",
+            destination="DEN",
+            departure_date=selected_date,
+        )
+    )
+    assert len(comparison.offers) == 1
+    strict_offer = comparison.offers[0]
+    assert strict_offer.stops == 7
+    assert len(strict_offer.segments) == 8
+    detail = service.offer_detail(
+        OfferDetailRequest(
+            origin="YYZ",
+            destination="DEN",
+            departure_date=selected_date,
+            offer_id=strict_offer.id,
+        )
+    )
+    assert detail.itinerary.kind == "multi_stop"
+    assert len(detail.itinerary.legs) == 8
+    assert len(detail.itinerary.layovers) == 7
+    rejected = _multi_segment_confirmed_offer(
+        segment_count=9,
+        selected_date=selected_date,
+        verified_at=generated_at,
+    )
+    with pytest.raises(RouteLookupError, match="one to eight segments"):
+        service._strict_provider_segments(
+            rejected,
+            origin="YYZ",
+            destination="LAX",
+            departure_date=selected_date,
+            generated_at=generated_at,
+        )
+
+
 def _fare_result(
     offer: ConfirmedFlightOffer,
     *,

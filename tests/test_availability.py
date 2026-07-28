@@ -17,6 +17,8 @@ from flight_forecaster.availability import (
     SERPAPI_SEARCH_URL,
     NullFlightOfferProvider,
     SerpApiFlightOfferProvider,
+    _google_market_for_origin,
+    _parse_google_segments,
     flight_offer_provider_from_env,
 )
 
@@ -24,6 +26,13 @@ _FETCHED_AT = datetime(2026, 7, 15, 12, tzinfo=UTC)
 _PROVIDER_CREATED_AT = "2026-07-15 12:00:00 UTC"
 _BILLING_CYCLE_KEY = "renewal:2026-08-01"
 _HOUR_BUCKET_KEY = "2026-07-15T12"
+
+
+def test_google_market_uses_origin_country_with_safe_fallback() -> None:
+    assert _google_market_for_origin("YYZ") == "ca"
+    assert _google_market_for_origin("lhr") == "uk"
+    assert _google_market_for_origin("JFK") == "us"
+    assert _google_market_for_origin("ZZZ") == "us"
 
 
 class _Response:
@@ -66,6 +75,42 @@ def _flight(cabin: str, suffix: int = 0) -> dict[str, Any]:
         "travel_class": cabin,
         "flight_number": f"AC {class_number + suffix}",
     }
+
+
+def _multi_segment_google_rows(count: int) -> list[dict[str, Any]]:
+    airports = ("YYZ", "YUL", "JFK", "BOS", "IAD", "ATL", "MIA", "DFW", "DEN", "LAX")
+    start = datetime(2026, 8, 20, 8)
+    rows: list[dict[str, Any]] = []
+    for index in range(count):
+        departure = start + timedelta(hours=index * 3)
+        arrival = departure + timedelta(hours=1)
+        rows.append(
+            {
+                "departure_airport": {
+                    "id": airports[index],
+                    "time": departure.strftime("%Y-%m-%d %H:%M"),
+                },
+                "arrival_airport": {
+                    "id": airports[index + 1],
+                    "time": arrival.strftime("%Y-%m-%d %H:%M"),
+                },
+                "duration": 60,
+                "airline": "Air Canada",
+                "travel_class": "Economy",
+                "flight_number": f"AC {800 + index}",
+            }
+        )
+    return rows
+
+
+def test_google_segment_parser_accepts_eight_and_rejects_nine_segments() -> None:
+    accepted = _parse_google_segments(_multi_segment_google_rows(8), "economy")
+
+    assert len(accepted) == 8
+    assert [segment.segment_id.rsplit("-", 1)[-1] for segment in accepted] == [
+        str(index) for index in range(1, 9)
+    ]
+    assert _parse_google_segments(_multi_segment_google_rows(9), "economy") == ()
 
 
 def _search_payload(travel_class: int) -> dict[str, Any]:
@@ -333,11 +378,13 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
         assert call["params"]["type"] == 2
         assert call["params"]["adults"] == 1
         assert call["params"]["currency"] == "USD"
+        assert call["params"]["gl"] == "ca"
         assert call["params"]["show_hidden"] == "true"
         assert call["params"]["deep_search"] == "true"
+        assert call["params"]["async"] == "true"
         assert "no_cache" not in call["params"]
         assert call["params"]["api_key"] == "serpapi-key"
-        assert call["timeout"] == 15.0
+        assert call["timeout"] == 45.0
     for call in client.booking_calls:
         assert "booking_token" in call["params"]
         assert call["params"]["engine"] == "google_flights"
@@ -349,6 +396,7 @@ def test_search_then_booking_options_returns_only_strictly_verified_offers(
             str(call["params"]["booking_token"]).split("-")[2]
         )
         assert call["params"]["adults"] == 1
+        assert call["params"]["gl"] == "ca"
         assert "departure_token" not in call["params"]
         assert "return_date" not in call["params"]
         assert "no_cache" not in call["params"]
@@ -449,6 +497,75 @@ def test_booking_verification_attempts_all_candidates_and_options_in_each_respon
     assert len(result.offers) == 1
     assert result.offers[0].total_amount_usd == 199
     assert result.offers[0].booking_provider == "Seller 41"
+
+
+def test_quota_limited_verification_prioritizes_nonstop_and_round_robins_cabins(
+    tmp_path: Path,
+) -> None:
+    class _CheapConnectionsClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            params = kwargs.get("params", {})
+            if url != SERPAPI_SEARCH_URL or "booking_token" in params:
+                return response
+            travel_class = int(params["travel_class"])
+            cabin = {
+                1: "Economy",
+                2: "Premium economy",
+                3: "Business",
+                4: "First",
+            }[travel_class]
+            first = _flight(cabin)
+            first["arrival_airport"] = {
+                "name": "John F. Kennedy International Airport",
+                "id": "JFK",
+                "time": "2026-08-20 22:20",
+                "terminal": "4",
+            }
+            first["duration"] = 245
+            second = _flight(cabin, suffix=1)
+            second["departure_airport"] = {
+                "name": "John F. Kennedy International Airport",
+                "id": "JFK",
+                "time": "2026-08-21 01:15",
+                "terminal": "4",
+            }
+            second["arrival_airport"]["time"] = "2026-08-21 13:20"
+            second["duration"] = 425
+            response.payload["best_flights"].insert(
+                0,
+                {
+                    "flights": [first, second],
+                    "price": 1,
+                    "type": "One way",
+                    "booking_token": f"cheap-connection-{travel_class}",
+                },
+            )
+            response.content = json.dumps(response.payload).encode("utf-8")
+            return response
+
+    # Four cabin searches leave six real hourly calls.  The value six is quota
+    # capacity, not an application candidate cap.
+    client = _CheapConnectionsClient(hourly_usage=40)
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    attempted_tokens = {call["params"]["booking_token"] for call in client.booking_calls}
+    assert attempted_tokens == {
+        "booking-token-1",
+        "booking-token-2",
+        "booking-token-3",
+        "booking-token-4",
+        "booking-token-1-high",
+        "booking-token-2-high",
+    }
+    assert not any(token.startswith("cheap-connection-") for token in attempted_tokens)
+    assert result.eligible_candidate_count == 12
+    assert result.verification_attempted_count == 6
+    assert result.quota_skipped_candidate_count == 6
+    assert result.coverage_status == "quota_limited"
+    assert result.quota_limit == "hourly"
 
 
 def test_duplicate_tokens_are_called_once_and_conflicting_tokens_are_excluded(

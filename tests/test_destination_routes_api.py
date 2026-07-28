@@ -124,6 +124,7 @@ class _Guide:
     def __init__(self) -> None:
         self.route_coordinates: tuple[float, float] | None = None
         self.transit_departure_at: datetime | None = None
+        self.include_live_transit: bool | None = None
 
     def resolve_city(self, destination: str) -> DestinationCity:
         assert destination.upper() == "YYZ"
@@ -134,12 +135,12 @@ class _Guide:
         destination: str,
         kind: str,
         category: str = "all",
-        limit: int = 30,
+        limit: int = 300,
     ) -> DestinationPlaceList:
         assert destination.upper() == "YYZ"
         assert kind == "attraction"
         assert category == "all"
-        assert limit == 30
+        assert limit == 300
         return DestinationPlaceList(
             city=_city(),
             kind="attraction",
@@ -164,11 +165,13 @@ class _Guide:
         place_id: str,
         *,
         transit_departure_at: datetime | None = None,
+        include_live_transit: bool = False,
     ) -> DestinationPlaceDetail:
         assert destination.upper() == "YYZ"
         place = _hotel_place() if place_id == _hotel_place().place_id else _place()
         assert place_id == place.place_id
         self.transit_departure_at = transit_departure_at
+        self.include_live_transit = include_live_transit
         return DestinationPlaceDetail(
             city=_city(),
             place=place,
@@ -182,10 +185,12 @@ class _Guide:
         longitude: float,
         *,
         transit_departure_at: datetime | None = None,
+        include_live_transit: bool = False,
     ) -> DestinationTransport:
         assert destination == "YYZ"
         self.route_coordinates = (latitude, longitude)
         self.transit_departure_at = transit_departure_at
+        self.include_live_transit = include_live_transit
         return _transport(latitude, longitude)
 
 
@@ -294,6 +299,9 @@ def test_places_and_detail_expose_source_backed_routes(monkeypatch) -> None:
     assert places.json()["coverage_status"] == "complete"
     assert places.json()["partial"] is False
     assert places.json()["coverage_notice"]["en"].startswith("The full 30 km")
+    assert places.json()["source"] == "openstreetmap_overpass+wikimedia"
+    assert places.json()["available_result_count"] == 1
+    assert places.json()["result_limit"] == 300
 
     detail = client.post(
         "/v1/destination/place-detail",
@@ -303,6 +311,7 @@ def test_places_and_detail_expose_source_backed_routes(monkeypatch) -> None:
             "place_id": _place().place_id,
             "language": "en",
             "transit_departure_at": transit_departure.isoformat(),
+            "include_live_transit": True,
         },
     )
     assert detail.status_code == 200
@@ -316,7 +325,9 @@ def test_places_and_detail_expose_source_backed_routes(monkeypatch) -> None:
     assert body["routes"][3]["duration_minutes"] is None
     assert body["transit_notice"]
     assert guide.transit_departure_at == transit_departure
-    assert "transitous_motis" in body["source"]
+    assert guide.include_live_transit is True
+    assert "open_transit_coverage_unavailable" in body["source"]
+    assert "transitous_motis" not in body["source"]
 
 
 def test_destination_detail_rejects_naive_transit_departure_time(monkeypatch) -> None:
@@ -375,6 +386,7 @@ def test_hotel_price_detail_uses_cached_offer_coordinates_for_routes(monkeypatch
     assert response.status_code == 200
     assert hotel.detail_calls == 1
     assert guide.route_coordinates == (_offer().latitude, _offer().longitude)
+    assert guide.include_live_transit is False
     body = response.json()
     assert body["place"]["place_id"] is None
     assert body["offer"]["hotel_id"] == _offer().hotel_id
@@ -394,6 +406,7 @@ def test_hotel_price_detail_resolves_exact_osm_hotel_and_reuses_routes(monkeypat
             "adults": 1,
             "language": "en",
             "transit_departure_at": transit_departure.isoformat(),
+            "include_live_transit": True,
         },
     )
 
@@ -402,6 +415,7 @@ def test_hotel_price_detail_resolves_exact_osm_hotel_and_reuses_routes(monkeypat
     assert hotel.detail_calls == 0
     assert guide.route_coordinates is None
     assert guide.transit_departure_at == transit_departure
+    assert guide.include_live_transit is True
     body = response.json()
     assert body["place"]["place_id"] == _hotel_place().place_id
     assert body["place"]["address"] == _hotel_place().address

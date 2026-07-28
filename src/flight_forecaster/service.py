@@ -45,6 +45,7 @@ from flight_forecaster.route_info import (
 )
 from flight_forecaster.schedules import ScheduleProvider
 from flight_forecaster.schemas import (
+    MAX_STRICT_ITINERARY_SEGMENTS,
     BilingualText,
     BilingualWarning,
     ComparisonOffer,
@@ -503,8 +504,8 @@ class PredictionService:
         departure_date: date,
         generated_at: datetime,
     ) -> tuple[tuple[ProviderOfferSegment, ...], float, int]:
-        if not 1 <= len(offer.segments) <= 4:
-            raise RouteLookupError("strict offers require one to four segments")
+        if not 1 <= len(offer.segments) <= MAX_STRICT_ITINERARY_SEGMENTS:
+            raise RouteLookupError("strict offers require one to eight segments")
 
         segments: list[ProviderOfferSegment] = []
         total_distance_km = 0.0

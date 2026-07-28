@@ -101,6 +101,71 @@ def _confirmed_offer_payload() -> dict[str, object]:
     }
 
 
+def _confirmed_offer_payload_with_segment_count(count: int) -> dict[str, object]:
+    payload = _confirmed_offer_payload()
+    airports = ("YYZ", "YUL", "JFK", "BOS", "IAD", "ATL", "MIA", "DFW", "DEN", "LAX")
+    start = datetime(2026, 8, 15, 12, tzinfo=UTC)
+    segments: list[dict[str, object]] = []
+    for index in range(count):
+        departure = start + timedelta(hours=index * 2)
+        arrival = departure + timedelta(hours=1)
+        segments.append(
+            {
+                "sequence": index + 1,
+                "origin": airports[index],
+                "destination": airports[index + 1],
+                "flight_number": f"AC{800 + index}",
+                "marketing_airline_code": "AC",
+                "operating_airline_code": "AC",
+                "departure_local": departure.isoformat(),
+                "arrival_local": arrival.isoformat(),
+                "departure_utc": departure.isoformat(),
+                "arrival_utc": arrival.isoformat(),
+                "duration_minutes": 60,
+                "cabin": "economy",
+                "booking_class": "K",
+                "included_checked_bag_quantity": 1,
+            }
+        )
+    final_arrival = start + timedelta(hours=(count - 1) * 2 + 1)
+    payload.update(
+        {
+            "stops": count - 1,
+            "duration_minutes": round((final_arrival - start).total_seconds() / 60),
+            "flight_number": "AC800",
+            "scheduled_departure_local": start.isoformat(),
+            "scheduled_arrival_local": final_arrival.isoformat(),
+            "scheduled_departure_utc": start.isoformat(),
+            "scheduled_arrival_utc": final_arrival.isoformat(),
+            "segments": segments,
+        }
+    )
+    return payload
+
+
+def test_strict_offer_schema_accepts_eight_and_rejects_nine_segments() -> None:
+    accepted = ComparisonOffer.model_validate(_confirmed_offer_payload_with_segment_count(8))
+
+    assert accepted.stops == 7
+    assert len(accepted.segments) == 8
+    with pytest.raises(ValidationError):
+        ComparisonOffer.model_validate(_confirmed_offer_payload_with_segment_count(9))
+
+
+def test_price_request_accepts_seven_stops_and_rejects_eight() -> None:
+    payload = {
+        "origin": "JFK",
+        "destination": "LAX",
+        "airline": "DL",
+        "cabin": "economy",
+        "departure_time": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+    }
+
+    assert PriceRequest.model_validate({**payload, "stops": 7}).stops == 7
+    with pytest.raises(ValidationError):
+        PriceRequest.model_validate({**payload, "stops": 8})
+
+
 def test_price_request_rejects_naive_datetimes() -> None:
     with pytest.raises(ValidationError, match="timezone"):
         PriceRequest(

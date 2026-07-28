@@ -49,6 +49,20 @@ def test_destination_list_pages_have_bilingual_category_controls() -> None:
     assert '["all","landmark","museum","nature","entertainment","shopping"]' in attractions
     assert '["all","hotel","hostel","guest_house","motel","apartment"]' in hotels
     assert 'kind:"attraction"' in attractions
+    assert "limit:300" in attractions
+    assert "description_en" in attractions
+    assert "description_zh" in attractions
+    assert "ratingsUnavailable" in attractions
+    assert "rating.platform_en" in attractions
+    assert "ratings.forEach" in attractions
+    assert "ratings.slice(0,3)" not in attractions
+    assert "query_parts_succeeded" in attractions
+    assert "query_parts_total" in attractions
+    assert "provider_truncated" in attractions
+    assert "Completed all " in attractions
+    assert "not a complete city inventory" in attractions
+    assert "gaps in geographic coverage" in attractions
+    assert "requestTimeoutMs=65000" in attractions
     assert 'kind:"hotel"' in hotels
     assert '"/details/place?"' in attractions
     assert '"/details/place?"' in hotels
@@ -92,8 +106,26 @@ def test_place_detail_is_source_safe_and_renders_airport_routes() -> None:
         'transit.departure_time_basis==="user_supplied"&&transitDepartureAt'
         ")return transitDepartureAt"
     ) in detail
-    assert 'transitTime(leg.departure_at,leg.from_timezone)' in detail
-    assert 'transitTime(leg.arrival_at,leg.to_timezone)' in detail
+    assert (
+        "transitClock(leg.departure_at,leg.departure_time_label,leg.from_timezone)"
+        in detail
+    )
+    assert "serpapi_google_maps_directions" in detail
+    assert "googleMapsSource" in detail
+    assert "openstreetmap_overpass_transit_reference" in detail
+    assert "route_reference_only" in detail
+    assert "route_references" in detail
+    assert "renderTransitReferences" in detail
+    assert "reference.source_url" in detail
+    assert "reference.stops" in detail
+    assert "reference.operator" in detail
+    assert "reference.network" in detail
+    assert "附近真实公共交通线路参考" in detail
+    assert "route references only" in detail
+    assert (
+        "transitClock(leg.arrival_at,leg.arrival_time_label,leg.to_timezone)"
+        in detail
+    )
     assert 'kind==="priced_hotel"' in detail
     assert "nightly_price" in detail
     assert "website_url" in detail
@@ -105,6 +137,20 @@ def test_place_detail_is_source_safe_and_renders_airport_routes() -> None:
     assert "sessionStorage" not in detail
     assert "数据源未提供" in detail
     assert "Not provided by the data source" in detail
+    assert 'id="attraction-review-section"' in detail
+    assert "place.ratings_status" in detail
+    assert "rating.source_url" in detail
+    assert "publicRatingUnavailable" in detail
+    assert "ratingProviderUnavailable" in detail
+    assert "place.description_en" in detail
+    assert "place.description_zh" in detail
+    assert 'if(includeLiveTransit===true)payload.include_live_transit=true' in detail
+    assert "await loadPrice(true)" in detail
+    assert "await loadDetail(true)" in detail
+    assert "loadPrice(false)" in detail
+    assert "loadDetail(false)" in detail
+    assert "查询实时公交（使用额度）" in detail
+    assert "Check live transit (uses quota)" in detail
 
 
 def test_destination_fetches_are_bounded_and_language_switches_do_not_refetch() -> None:

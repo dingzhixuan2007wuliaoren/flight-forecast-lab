@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Cabin = Literal["economy", "premium_economy", "business", "first"]
 RiskLevel = Literal["low", "medium", "high"]
+MAX_STRICT_ITINERARY_SEGMENTS = 8
+MAX_STRICT_ITINERARY_STOPS = MAX_STRICT_ITINERARY_SEGMENTS - 1
 SignalStatus = Literal[
     "live",
     "forecast",
@@ -87,7 +89,7 @@ class PriceRequest(BaseModel):
     destination: str = Field(examples=["LAX"])
     airline: str = Field(examples=["DL"])
     cabin: Cabin = "economy"
-    stops: int = Field(default=0, ge=0, le=3)
+    stops: int = Field(default=0, ge=0, le=MAX_STRICT_ITINERARY_STOPS)
     departure_time: datetime
 
     @field_validator("origin", "destination")
@@ -670,7 +672,7 @@ class ProviderOfferSegment(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    sequence: int = Field(ge=1, le=4)
+    sequence: int = Field(ge=1, le=MAX_STRICT_ITINERARY_SEGMENTS)
     origin: str = Field(min_length=3, max_length=3)
     destination: str = Field(min_length=3, max_length=3)
     flight_number: str = Field(pattern=r"^[A-Z0-9]{3,12}$")
@@ -1144,7 +1146,7 @@ class ComparisonOffer(BaseModel):
     airline_code: str
     airline_name: str
     cabin: Cabin
-    stops: int | None = Field(default=None, ge=0, le=3)
+    stops: int | None = Field(default=None, ge=0, le=MAX_STRICT_ITINERARY_STOPS)
     duration_minutes: int = Field(gt=0)
     estimated_price_usd: float = Field(ge=0.0)
     interval_80_low_usd: float = Field(ge=0.0)
@@ -1189,7 +1191,10 @@ class ComparisonOffer(BaseModel):
     aircraft_icao: str | None = Field(default=None, max_length=12)
     bookability_status: Literal["unverified", "booking_option_verified"] = "unverified"
     live_fare: LiveFare | None = None
-    segments: list[ProviderOfferSegment] = Field(default_factory=list, max_length=4)
+    segments: list[ProviderOfferSegment] = Field(
+        default_factory=list,
+        max_length=MAX_STRICT_ITINERARY_SEGMENTS,
+    )
 
     @model_validator(mode="after")
     def validate_schedule_claims(self) -> ComparisonOffer:
@@ -1201,11 +1206,12 @@ class ComparisonOffer(BaseModel):
         if self.routing_status == "provider_itinerary":
             if (
                 self.route_status != "provider_confirmed"
-                or self.stops not in {1, 2, 3}
+                or self.stops is None
+                or not 1 <= self.stops <= MAX_STRICT_ITINERARY_STOPS
                 or self.punctuality_basis != "multi_leg_independence_model"
             ):
                 raise ValueError(
-                    "provider itineraries require one to three stops and the multi-leg basis"
+                    "provider itineraries require one to seven stops and the multi-leg basis"
                 )
         else:
             expected_routing = {
@@ -1543,7 +1549,7 @@ class OfferDetailRequest(BaseModel):
 
 
 class ItineraryLeg(BaseModel):
-    sequence: int = Field(ge=1, le=4)
+    sequence: int = Field(ge=1, le=MAX_STRICT_ITINERARY_SEGMENTS)
     origin: str = Field(min_length=3, max_length=3)
     destination: str = Field(min_length=3, max_length=3)
     date_context: date
@@ -1649,7 +1655,7 @@ class ItineraryLeg(BaseModel):
 class ItineraryLayover(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    sequence: int = Field(ge=1, le=3)
+    sequence: int = Field(ge=1, le=MAX_STRICT_ITINERARY_STOPS)
     airport: str = Field(min_length=3, max_length=3)
     duration_minutes: int = Field(ge=0, le=1_440)
 
@@ -1671,8 +1677,14 @@ class OfferItinerary(BaseModel):
         "model_assumption",
         "provider_confirmed",
     ]
-    legs: list[ItineraryLeg] = Field(default_factory=list, max_length=4)
-    layovers: list[ItineraryLayover] = Field(default_factory=list, max_length=3)
+    legs: list[ItineraryLeg] = Field(
+        default_factory=list,
+        max_length=MAX_STRICT_ITINERARY_SEGMENTS,
+    )
+    layovers: list[ItineraryLayover] = Field(
+        default_factory=list,
+        max_length=MAX_STRICT_ITINERARY_STOPS,
+    )
 
     @field_validator("layover_airport")
     @classmethod
@@ -1719,14 +1731,14 @@ class OfferItinerary(BaseModel):
             if provider_layover and self.layover_status != "provider_confirmed":
                 raise ValueError("provider one-stop layovers must be provider confirmed")
         elif (
-            len(self.legs) not in {3, 4}
+            not 3 <= len(self.legs) <= MAX_STRICT_ITINERARY_SEGMENTS
             or len(self.layovers) != len(self.legs) - 1
             or self.layover_airport is not None
             or self.layover_minutes is not None
             or self.layover_status != "provider_confirmed"
         ):
             raise ValueError(
-                "multi-stop itineraries require three or four legs and provider layovers"
+                "multi-stop itineraries require three to eight legs and provider layovers"
             )
 
         if [leg.sequence for leg in self.legs] != list(range(1, len(self.legs) + 1)):

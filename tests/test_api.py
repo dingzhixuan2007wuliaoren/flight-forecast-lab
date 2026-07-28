@@ -77,6 +77,9 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     ):
         assert field in dashboard
     assert "attempts every eligible candidate" in dashboard
+    assert "MAX_STRICT_ITINERARY_SEGMENTS = 8" in dashboard
+    assert ".slice(0, MAX_STRICT_ITINERARY_SEGMENTS + 1)" in dashboard
+    assert "stops >= MAX_STRICT_ITINERARY_SEGMENTS" in dashboard
     for obsolete_claim in (
         "最多 10 次",
         "at most 10 provider requests",
@@ -85,6 +88,9 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
         assert obsolete_claim not in dashboard
     offer_page = client.get("/details/offer").text
     assert 'id="price-curve"' in offer_page
+    assert "MAX_STRICT_ITINERARY_SEGMENTS=8" in offer_page
+    assert "segments.slice(0,MAX_STRICT_ITINERARY_SEGMENTS+1)" in offer_page
+    assert "segments.length<=MAX_STRICT_ITINERARY_SEGMENTS" in offer_page
     assert 'id="curve-chart"' in offer_page
     assert "historical_prices_available" in offer_page
     assert "本次准点预测已忽略天气变量。" in offer_page

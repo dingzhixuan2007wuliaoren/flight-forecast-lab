@@ -88,7 +88,17 @@ SerpApi cabin searches and requests booking-option validation for every eligible
 candidate returned by the provider. SearchAPI and released Ignav do the same independently for each
 source. The atomic ledger admits only calls covered by the account's actual remaining quota; candidates
 skipped for that reason are reported as partial, quota-limited coverage rather than no flights. Worker
-concurrency is bounded to protect providers but is not a candidate-count cap. Results remain bounded by
+concurrency is bounded to protect providers but is not a candidate-count cap. When real quota admits
+only a prefix, nonstop candidates are round-robined across cabins before connecting candidates. This
+changes only which real candidate receives scarce secondary verification first; it does not promote a
+timetable row or invent an unreturned flight. The worker value six is only concurrency control, not
+a six-candidate application limit; strict eligibility currently accepts one to eight continuous
+segments. SerpApi `deep_search=true` and `show_hidden=true` remain
+enabled for all four cabin searches. The Google market is derived from the origin airport country
+(`ca` for YYZ, `uk` for GB airports, and `us` only as the unknown-country fallback) and remains the
+same for search and booking verification. SerpApi deep searches also send `async=true`, retain a
+45-second transport ceiling, and poll only the original Search ID when queued; ordinary
+booking-option requests retain the 15-second timeout. Results remain bounded by
 provider coverage, provider responses, and the configured free quota; they are not a complete global
 list of airlines or flights.
 SearchAPI's local wall is the one-time 100-request signup allocation for the installation/account;
@@ -235,8 +245,8 @@ followed by a booking-options request. Only a response
 whose `selected_flights` exactly matches the original segment sequence and contains a seller,
 matching flight numbers, positive one-way USD price, and HTTPS `booking_request.url` can enter
 `offers`. The itinerary must also remain continuous, use one provider-confirmed cabin throughout,
-contain real flight numbers and complete local/UTC times, and have one to four segments (zero to
-three stops). Its `live_fare` is independent of `estimated_price_usd` and its 80% model interval.
+contain real flight numbers and complete local/UTC times, and have one to eight segments (zero to
+seven stops). Its `live_fare` is independent of `estimated_price_usd` and its 80% model interval.
 The free response does not reliably establish whether taxes are included, so `taxes_included` is
 unknown rather than asserted true. After all configured strict sources run, equivalent offers are
 grouped by the complete ordered segment identity and cabin (not merely validating airline or route).
@@ -245,7 +255,7 @@ retained row keeps the provider identity that supplied its evidence.
 
 If a SerpApi response is `Processing` or `Queued`, the adapter validates the opaque Search ID
 against an allowlist and polls only the fixed `https://serpapi.com/searches/{search_id}.json`
-archive path with bounded 0.5, 1, 1.5, and 2 second backoff. It never follows the response's arbitrary
+archive path with bounded 0.5, 1, 2, 4, and 8 second backoff. It never follows the response's arbitrary
 archive URL. Archive reads are reported as `archive_poll_count`; they do not increase `call_count` or
 the conservative quota reservation. After an unresolved poll, provider search error, transport
 failure, or HTTP 408/425/5xx, the adapter may resubmit that cabin-search or booking-options request
@@ -325,7 +335,7 @@ offer is a complete provider `priced_offer` with `cabin_status=provider_confirme
 `ignav_verified_booking` only for explicitly released `ignav_verified_fares`; offer-detail legs use
 the matching `serpapi_booking_confirmed`, `searchapi_booking_confirmed`, or
 `ignav_verified_booking_confirmed` basis. `provider_direct` represents one segment;
-`provider_itinerary` represents two to four continuous segments. `route_airlines`, model hubs,
+`provider_itinerary` represents two to eight continuous segments. `route_airlines`, model hubs,
 catalogue cabin expansion, and unresolved O&D scenarios cannot populate the main list. The schema
 retains older enum values for compatibility, but strict responses do not generate those offers.
 
@@ -384,20 +394,23 @@ This is deliberately conservative:
 ## Destination-guide evidence and routing
 
 `POST /v1/destination/places` accepts a destination IATA code plus `kind=attraction|hotel`. The
-service resolves the airport first, identifies its served city, and queries named, geolocated OSM
-nodes at progressive 5, 15, and 30 km city-centre radii. Expansion stops once 30 sanitized unique
-places are available. Every response carries the last successfully queried radius plus a strict
-complete/partial status and bilingual notice; only a successful 30 km query is complete. It returns at most 30 objects per list and
-keeps OSM IDs behind bounded application place IDs. Nominatim and Overpass results are sanitized and
-cached for 24 hours. They are community map observations, not proof of popularity, current opening,
-hotel availability, or complete global coverage. Missing tags remain null.
+service resolves the airport first and identifies its served city. Attraction discovery divides the
+30 km city-centred area into four bounded Overpass parts so one large-city provider failure does not
+erase the other real results; it retains at most 300 named, geolocated features. Hotel discovery
+retains progressive 5, 15, and 30 km radii and its smaller result target. Every response reports the
+actual coverage status and bilingual notice. A full four-part attraction query is complete only when
+no provider response or 300-record safety cap truncated it.
 
-Overpass discovery uses the main `overpass-api.de` endpoint and exactly one controlled fallback to
-the globally covered VK Maps (`maps.mail.ru`) public instance listed by the OpenStreetMap Wiki. A
-primary success, including a genuine empty element list, is never retried at that radius. Transport
-failures, invalid payloads, and provider `remark` failures receive at most one fallback attempt for
-the entire list operation, under a 24-second overall budget. Both
-failures remain uncached; successful source-backed aggregates use the existing 24-hour cache.
+Each attraction part prefers the fixed Overpass endpoint that most recently succeeded and may try
+the other fixed public endpoint once within the overall operation budget. Complete aggregates cache
+for 24 hours; provider failure, missing parts, response truncation, or the local safety cap produces
+explicit partial coverage cached for only 10 minutes. Place IDs remain bounded application IDs.
+Attraction introduction enrichment requires the exact OSM `wikidata` identity: Wikipedia extracts
+or Wikidata descriptions are preferred, and otherwise a factual OSM-tag summary is labelled as such.
+Platform ratings require P444 review-score evidence on that same Wikidata item and preserve the P447
+issuer, score text/scale, review count, point in time, and evidence URL. Missing evidence remains
+unavailable. These are community/public observations within a bounded area, not complete commercial
+city inventory or proof of current popularity and opening.
 
 `POST /v1/destination/place-detail` resolves only an ID from the corresponding sanitized place
 snapshot. It then obtains airport-to-place car, bicycle, and foot routes from the fixed HTTPS
@@ -405,19 +418,24 @@ snapshot. It then obtains airport-to-place car, bicycle, and foot routes from th
 five-second timeout per mode. Successful routes are cached for 24 hours; transient failures are not
 cached. Distance and duration are static road-graph estimates, not live traffic.
 
-Public transit is queried through the fixed `https://api.transitous.org/api/v5/plan` endpoint with an
-identifying User-Agent and a visible link to `https://transitous.org/sources/`. The request sends an
-empty `directModes` value so MOTIS does not prune a real transit itinerary merely because direct
-walking is faster. The optional `transit_departure_at` must be timezone-aware; when absent, the
-request-time minute is used and labelled. User-supplied instants are normalized to UTC minutes for
-the provider/cache key while the page preserves the original offset-bearing input for display.
-Only a complete itinerary containing at least one transit leg can be `available`. The safe response
-contains provider times, transfers, line/operator names, endpoints, up to 100 intermediate stop names,
-and realtime flags. A genuine empty itinerary is `no_itinerary`; transport/parse failure is
-`provider_unavailable`. Neither state gets a fabricated route or duration. Successful and no-itinerary
-results are cached for 30 minutes in a 512-entry bounded cache, provider failures are retried on a
-later user request, response size is bounded, and Transitous calls are serialized to at most one per
-second. Coverage remains limited to the local GTFS feeds listed by Transitous.
+Initial public transit uses only the fixed no-key
+`https://api.transitous.org/api/v5/plan` endpoint, an identifying User-Agent, and a visible
+`https://transitous.org/sources/` link. `directModes` is empty so MOTIS does not prune a real transit
+itinerary merely because walking is faster. When no complete timed itinerary is available, an
+OpenStreetMap Overpass query may return real `route` relations near the airport or destination.
+Only relation members with stop/platform roles are retained; this output is labelled
+`route_reference_only` and never presented as proof that both endpoints connect or as an exact
+departure, arrival, transfer, or duration.
+
+Only a request with `include_live_transit=true`, sent by the explicit live-transit button, may fall
+back to the configured SerpApi Google Maps Directions adapter after Transitous has no itinerary.
+This call shares the airfare/hotel SQLite quota ledger, submits with `async=true`, and polls only the
+validated original Search ID for a bounded 12.5 seconds. A still-pending search may be resubmitted at
+most once after a separate quota reservation. The optional `transit_departure_at` must be
+timezone-aware; user-supplied instants are normalized to UTC minutes for provider/cache keys while
+the page preserves the original offset. Only provider-returned times, transfers, line/operator
+names, endpoints, stops, and realtime markers are displayed. No source failure is replaced by a
+straight-line transit estimate.
 
 `POST /v1/destination/hotel-prices` and the explicit hotel-detail action are the only hotel-data
 triggers. Merely opening the base OpenStreetMap guide page never calls SerpApi. The request validates
@@ -469,7 +487,7 @@ Refresh and re-query button sends `force_refresh=true`, which reruns the four ca
 requests validation for every eligible returned candidate per strict source, subject to the remaining
 free quota and provider response. The main comparison request has a 600-second browser wait limit and retains a
 visible timeout or failure message instead of spinning indefinitely. Its response repeats the selected
-strict provider offer and returns the complete one-to-four segment itinerary, including flight numbers,
+strict provider offer and returns the complete one-to-eight segment itinerary, including flight numbers,
 local/UTC times, confirmed cabin, booking/fare fields when supplied, and provider-confirmed layovers. AirLabs
 timetable and model-only rows have no offer
 ID or detail link; an expired or no-longer-confirmed ID returns 404. A confirmed price is still a

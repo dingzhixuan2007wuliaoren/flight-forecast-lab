@@ -25,6 +25,8 @@ from typing import Any, Literal
 from urllib import error, parse, request
 
 from flight_forecaster.quota_status import QuotaLedgerSnapshot
+from flight_forecaster.route_info import AIRPORTS
+from flight_forecaster.schemas import MAX_STRICT_ITINERARY_SEGMENTS
 
 Cabin = Literal["economy", "premium_economy", "business", "first"]
 BookingUrlKind = Literal["direct_get", "google_flights_itinerary"]
@@ -71,6 +73,11 @@ SERPAPI_MAX_MONTHLY_LIMIT = 250
 FLIGHT_OFFER_CACHE_TTL_SECONDS = 300.0
 MAX_PROVIDER_RESPONSE_BYTES = 5_000_000
 REQUEST_TIMEOUT_SECONDS = 15.0
+# SerpApi documents ``deep_search=true`` as the browser-equivalent, fuller
+# search path and warns that it takes longer.  Keep booking-option requests at
+# the ordinary timeout, but do not turn a slow deep cabin search into a false
+# provider failure after only 15 seconds.
+DEEP_SEARCH_REQUEST_TIMEOUT_SECONDS = 45.0
 ACCOUNT_REQUEST_TIMEOUT_SECONDS = 8.0
 SEARCH_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 2.0
 MAX_CACHE_ENTRIES = 128
@@ -82,7 +89,10 @@ SERPAPI_MAX_HOURLY_LIMIT = 50
 MAX_PROVIDER_CACHE_AGE_SECONDS = 65 * 60
 MAX_PROVIDER_FUTURE_SKEW_SECONDS = 5 * 60
 PROVIDER_CACHE_HIT_AGE_SECONDS = 60
-PROVIDER_POLL_DELAYS_SECONDS = (0.5, 1.0, 1.5, 2.0)
+# Poll only the original allowlisted Search ID.  The roughly 15-second bounded
+# window is long enough for asynchronous deep searches without submitting a
+# second paid search just because the ordinary five-second window was short.
+PROVIDER_POLL_DELAYS_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0)
 MAX_PROVIDER_DIAGNOSTICS = 10
 MAX_PERSISTED_PROVIDER_DIAGNOSTICS = 500
 
@@ -111,6 +121,24 @@ _FULL_FLIGHT_NUMBER_PATTERN = re.compile(r"^([A-Z0-9]{2,3})\s+([A-Z0-9]{1,8})$")
 _SAFE_SHORT_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]+$")
 _SEARCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _EXCEPTION_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
+def _google_market_for_origin(origin: str) -> str:
+    """Return a safe Google Flights ``gl`` market from the origin airport.
+
+    Google uses ``uk`` for the United Kingdom even though the airport catalog
+    carries the ISO country code ``GB``.  Unknown airports deliberately retain
+    the prior US-market fallback rather than guessing from the destination.
+    """
+
+    code = _iata(origin)
+    airport = AIRPORTS.get(code) if code is not None else None
+    country = airport.country.strip().upper() if airport is not None else ""
+    if country == "GB":
+        return "uk"
+    if re.fullmatch(r"[A-Z]{2}", country):
+        return country.lower()
+    return "us"
 
 DiagnosticStage = Literal[
     "account",
@@ -1565,9 +1593,10 @@ class SerpApiFlightOfferProvider:
             "adults": 1,
             "currency": "USD",
             "hl": "en",
-            "gl": "us",
+            "gl": _google_market_for_origin(origin),
             "show_hidden": "true",
             "deep_search": "true",
+            "async": "true",
             "api_key": self._api_key,
         }
         if force_refresh:
@@ -1578,6 +1607,7 @@ class SerpApiFlightOfferProvider:
             stage="cabin_search",
             diagnostics=diagnostics,
             account=account,
+            timeout_seconds=DEEP_SEARCH_REQUEST_TIMEOUT_SECONDS,
         )
         try:
             _provider_observation(payload, received_at)
@@ -1625,7 +1655,7 @@ class SerpApiFlightOfferProvider:
             "adults": 1,
             "currency": "USD",
             "hl": "en",
-            "gl": "us",
+            "gl": _google_market_for_origin(origin),
             "api_key": self._api_key,
         }
         if force_refresh:
@@ -1665,6 +1695,7 @@ class SerpApiFlightOfferProvider:
         stage: Literal["cabin_search", "booking_options"],
         diagnostics: _DiagnosticCollector,
         account: _AccountQuota,
+        timeout_seconds: float | None = None,
     ) -> tuple[dict[str, Any], datetime, int]:
         """Submit once, then re-submit at most once after a transient failure.
 
@@ -1679,6 +1710,7 @@ class SerpApiFlightOfferProvider:
                 params=params,
                 stage=stage,
                 diagnostics=diagnostics,
+                timeout_seconds=timeout_seconds,
             )
         except (
             _ProviderProcessingError,
@@ -1719,6 +1751,7 @@ class SerpApiFlightOfferProvider:
                 params=params,
                 stage=stage,
                 diagnostics=diagnostics,
+                timeout_seconds=timeout_seconds,
             )
 
     def _request_json(
@@ -1968,35 +2001,7 @@ class SerpApiFlightOfferProvider:
                 elif candidate.search_price_usd < existing.search_price_usd:
                     by_token[candidate.booking_token] = candidate
             by_cabin[cabin].extend(by_token.values())
-            by_cabin[cabin].sort(
-                key=lambda item: (
-                    item.search_price_usd,
-                    len(item.segments),
-                    item.identity,
-                    _opaque_token_digest(item.booking_token),
-                )
-            )
-
-        # Give each returned cabin one chance first, then order the remainder by
-        # provider price. This ordering matters only if the real provider/account
-        # quota cannot cover every eligible candidate; it is not an application
-        # candidate-count limit.
-        selected: list[_SearchCandidate] = []
-        for cabin in _CABINS:
-            if by_cabin[cabin]:
-                selected.append(by_cabin[cabin][0])
-        remainder = [candidate for cabin in _CABINS for candidate in by_cabin[cabin][1:]]
-        remainder.sort(
-            key=lambda item: (
-                item.search_price_usd,
-                len(item.segments),
-                _CABINS.index(item.cabin),
-                item.identity,
-                _opaque_token_digest(item.booking_token),
-            )
-        )
-        selected.extend(remainder)
-        return tuple(selected)
+        return _direct_first_cabin_round_robin(by_cabin)
 
     def _cached(
         self,
@@ -2394,7 +2399,7 @@ def _parse_google_segments(
     rows: list[Any],
     searched_cabin: Cabin,
 ) -> tuple[FlightOfferSegment, ...]:
-    if not 1 <= len(rows) <= 4:
+    if not 1 <= len(rows) <= MAX_STRICT_ITINERARY_SEGMENTS:
         return ()
     segments: list[FlightOfferSegment] = []
     for index, row in enumerate(rows, start=1):
@@ -2813,6 +2818,52 @@ def _failure_status(failures: list[BaseException]) -> SearchStatus | None:
     if failures:
         return "provider_unavailable"
     return None
+
+
+def _direct_first_cabin_round_robin(
+    by_cabin: dict[Cabin, list[Any]],
+) -> tuple[Any, ...]:
+    """Order every candidate without imposing a result-count ceiling.
+
+    A provider/account quota can still admit only a prefix of this sequence.
+    Put all nonstop itineraries before connections so an expensive nonstop is
+    not hidden behind cheaper connecting trips, and round-robin cabins inside
+    each routing tier so one cabin cannot consume the whole remaining quota.
+    """
+
+    ordered: list[Any] = []
+    for direct_only in (True, False):
+        buckets: dict[Cabin, list[Any]] = {}
+        for cabin in _CABINS:
+            candidates = [
+                candidate
+                for candidate in by_cabin.get(cabin, [])
+                if (len(candidate.segments) == 1) is direct_only
+            ]
+            candidates.sort(
+                key=lambda item: (
+                    len(item.segments),
+                    item.search_price_usd,
+                    item.identity,
+                    _opaque_token_digest(
+                        str(
+                            getattr(
+                                item,
+                                "booking_token",
+                                getattr(item, "ignav_id", ""),
+                            )
+                        )
+                    ),
+                )
+            )
+            buckets[cabin] = candidates
+        round_count = max((len(items) for items in buckets.values()), default=0)
+        for position in range(round_count):
+            for cabin in _CABINS:
+                candidates = buckets[cabin]
+                if position < len(candidates):
+                    ordered.append(candidates[position])
+    return tuple(ordered)
 
 
 def _candidate_coverage_status(

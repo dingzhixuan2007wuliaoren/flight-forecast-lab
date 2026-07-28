@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 from typing import Any
@@ -17,6 +17,8 @@ from flight_forecaster.alternate_fare_providers import (
     FallbackFlightOfferProvider,
     IgnavQuarantineFlightOfferProvider,
     SearchApiFlightOfferProvider,
+    _parse_ignav_segments,
+    _parse_searchapi_segments,
 )
 from flight_forecaster.availability import (
     AGGREGATE_PROVIDER_CODE,
@@ -340,6 +342,73 @@ def _searchapi_flight(cabin: str) -> dict[str, Any]:
     }
 
 
+def _multi_segment_searchapi_rows(count: int) -> list[dict[str, Any]]:
+    airports = ("YYZ", "YUL", "JFK", "BOS", "IAD", "ATL", "MIA", "DFW", "DEN", "LAX")
+    start = datetime(2026, 8, 2, 8)
+    rows: list[dict[str, Any]] = []
+    for index in range(count):
+        departure = start + timedelta(hours=index * 3)
+        arrival = departure + timedelta(hours=1)
+        rows.append(
+            {
+                "departure_airport": {
+                    "id": airports[index],
+                    "date": departure.date().isoformat(),
+                    "time": departure.strftime("%H:%M"),
+                },
+                "arrival_airport": {
+                    "id": airports[index + 1],
+                    "date": arrival.date().isoformat(),
+                    "time": arrival.strftime("%H:%M"),
+                },
+                "airline": "Air Canada",
+                "flight_number": f"AC {800 + index}",
+                "travel_class": "Economy",
+                "duration": 60,
+            }
+        )
+    return rows
+
+
+def _multi_segment_ignav_rows(count: int) -> list[dict[str, Any]]:
+    airports = ("YYZ", "YUL", "JFK", "BOS", "IAD", "ATL", "MIA", "DFW", "DEN", "LAX")
+    start = datetime(2026, 8, 2, 8, tzinfo=UTC)
+    rows: list[dict[str, Any]] = []
+    for index in range(count):
+        departure = start + timedelta(hours=index * 3)
+        arrival = departure + timedelta(hours=1)
+        rows.append(
+            {
+                "departure_airport": airports[index],
+                "arrival_airport": airports[index + 1],
+                "marketing_carrier_code": "AC",
+                "flight_number": str(800 + index),
+                "departure_time_local": departure.replace(tzinfo=None).isoformat(
+                    timespec="minutes"
+                ),
+                "arrival_time_local": arrival.replace(tzinfo=None).isoformat(
+                    timespec="minutes"
+                ),
+                "departure_time_utc": departure.isoformat().replace("+00:00", "Z"),
+                "arrival_time_utc": arrival.isoformat().replace("+00:00", "Z"),
+                "departure_timezone": "UTC",
+                "arrival_timezone": "UTC",
+                "duration_minutes": 60,
+            }
+        )
+    return rows
+
+
+def test_alternate_segment_parsers_accept_eight_and_reject_nine_segments() -> None:
+    searchapi = _parse_searchapi_segments(_multi_segment_searchapi_rows(8), "economy")
+    ignav = _parse_ignav_segments(_multi_segment_ignav_rows(8), "economy")
+
+    assert len(searchapi) == 8
+    assert ignav is not None and len(ignav[0]) == 8
+    assert _parse_searchapi_segments(_multi_segment_searchapi_rows(9), "economy") == ()
+    assert _parse_ignav_segments(_multi_segment_ignav_rows(9), "economy") is None
+
+
 def _metadata(suffix: str) -> dict[str, Any]:
     return {
         "status": "Success",
@@ -527,6 +596,13 @@ def test_searchapi_strictly_searches_four_one_way_cabins_and_verifies_booking(
         _TRAVEL_CLASSES.values()
     )
     assert all(call["flight_type"] == "one_way" for call in cabin_calls)
+    assert all(call["gl"] == "ca" for call in cabin_calls)
+    booking_calls = [
+        params
+        for url, params in client.calls
+        if url == SEARCHAPI_SEARCH_URL and "booking_token" in params
+    ]
+    assert all(call["gl"] == "ca" for call in booking_calls)
     assert len(client.calls) == 5
     assert all(url == SEARCHAPI_SEARCH_URL for url, _ in client.calls)
 

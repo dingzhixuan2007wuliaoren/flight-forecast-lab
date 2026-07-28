@@ -51,7 +51,9 @@ from flight_forecaster.availability import (
     _airline_code,
     _candidate_coverage_status,
     _checked_bags_quantity,
+    _direct_first_cabin_round_robin,
     _finite_amount,
+    _google_market_for_origin,
     _iata,
     _normalized_phrase,
     _opaque_token,
@@ -70,6 +72,7 @@ from flight_forecaster.availability import (
     _verified_offer_preference,
 )
 from flight_forecaster.quota_status import QuotaLedgerSnapshot
+from flight_forecaster.schemas import MAX_STRICT_ITINERARY_SEGMENTS
 
 SEARCHAPI_SEARCH_URL = "https://www.searchapi.io/api/v1/search"
 SEARCHAPI_FREE_CALL_LIMIT = 100
@@ -1156,7 +1159,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
             "adults": 1,
             "currency": "USD",
             "hl": "en",
-            "gl": "us",
+            "gl": _google_market_for_origin(origin),
             "show_hidden_flights": "true",
         }
         payload, received_at, http_status = self._request_json(
@@ -1212,7 +1215,7 @@ class SearchApiFlightOfferProvider(_AdapterBase):
             "adults": 1,
             "currency": "USD",
             "hl": "en",
-            "gl": "us",
+            "gl": _google_market_for_origin(origin),
             "booking_token": candidate.booking_token,
         }
         payload, received_at, http_status = self._request_json(
@@ -1346,28 +1349,8 @@ def _select_searchapi_candidates(
                 conflicting.add(candidate.booking_token)
             elif candidate.search_price_usd < existing.search_price_usd:
                 by_token[candidate.booking_token] = candidate
-        by_cabin[cabin] = sorted(
-            by_token.values(),
-            key=lambda item: (
-                item.search_price_usd,
-                len(item.segments),
-                item.identity,
-                _opaque_token_digest(item.booking_token),
-            ),
-        )
-    selected = [by_cabin[cabin][0] for cabin in _CABINS if by_cabin[cabin]]
-    remainder = [candidate for cabin in _CABINS for candidate in by_cabin[cabin][1:]]
-    remainder.sort(
-        key=lambda item: (
-            item.search_price_usd,
-            len(item.segments),
-            _CABINS.index(item.cabin),
-            item.identity,
-            _opaque_token_digest(item.booking_token),
-        )
-    )
-    selected.extend(remainder)
-    return tuple(selected)
+        by_cabin[cabin] = list(by_token.values())
+    return _direct_first_cabin_round_robin(by_cabin)
 
 
 def _parse_searchapi_candidate(
@@ -1403,7 +1386,7 @@ def _parse_searchapi_segments(
     rows: list[Any],
     searched_cabin: Cabin,
 ) -> tuple[FlightOfferSegment, ...]:
-    if not 1 <= len(rows) <= 4:
+    if not 1 <= len(rows) <= MAX_STRICT_ITINERARY_SEGMENTS:
         return ()
     segments: list[FlightOfferSegment] = []
     for index, row in enumerate(rows):
@@ -2355,28 +2338,7 @@ def _select_ignav_candidates(
             seen_ids[candidate.ignav_id] = candidate.identity
             by_cabin[cabin].append(candidate)
 
-    for cabin in _CABINS:
-        by_cabin[cabin].sort(
-            key=lambda item: (
-                item.search_price_usd,
-                len(item.segments),
-                item.identity,
-                _opaque_token_digest(item.ignav_id),
-            )
-        )
-    selected = [by_cabin[cabin][0] for cabin in _CABINS if by_cabin[cabin]]
-    remainder = [candidate for cabin in _CABINS for candidate in by_cabin[cabin][1:]]
-    remainder.sort(
-        key=lambda item: (
-            item.search_price_usd,
-            len(item.segments),
-            _CABINS.index(item.cabin),
-            item.identity,
-            _opaque_token_digest(item.ignav_id),
-        )
-    )
-    selected.extend(remainder)
-    return tuple(selected), invalid_rows
+    return _direct_first_cabin_round_robin(by_cabin), invalid_rows
 
 
 def _parse_ignav_candidate(
@@ -2434,7 +2396,7 @@ def _parse_ignav_segments(
     rows: list[Any],
     cabin: Cabin,
 ) -> tuple[tuple[FlightOfferSegment, ...], int] | None:
-    if not 1 <= len(rows) <= 4:
+    if not 1 <= len(rows) <= MAX_STRICT_ITINERARY_SEGMENTS:
         return None
     segments: list[FlightOfferSegment] = []
     first_departure_utc: datetime | None = None

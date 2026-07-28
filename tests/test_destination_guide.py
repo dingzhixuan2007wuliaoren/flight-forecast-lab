@@ -10,15 +10,19 @@ from pydantic import ValidationError
 
 import flight_forecaster.destination_guide as destination_guide
 from flight_forecaster.destination_guide import (
+    ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS,
+    ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS,
+    ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS,
     OVERPASS_ENDPOINTS,
     OVERPASS_FALLBACK_URL,
-    OVERPASS_OPERATION_BUDGET_SECONDS,
     OVERPASS_RADIUS_METERS,
-    OVERPASS_REQUEST_TIMEOUT_SECONDS,
     OVERPASS_URL,
+    PARTIAL_DESTINATION_CACHE_TTL,
     ROUTING_REQUEST_TIMEOUT_SECONDS,
     TRANSITOUS_PLAN_URL,
     TRANSITOUS_REQUEST_TIMEOUT_SECONDS,
+    WIKIDATA_API_URL,
+    WIKIPEDIA_API_URLS,
     BoundedJsonHttpClient,
     DestinationAirportNotFound,
     DestinationDataUnavailable,
@@ -28,6 +32,7 @@ from flight_forecaster.destination_guide import (
     DestinationValidationError,
     OurAirportsMunicipalityResolver,
     _assert_allowed_outbound_url,
+    _parse_osm_transit_reference_payload,
     _TtlCache,
 )
 from flight_forecaster.route_info import Airport
@@ -74,6 +79,8 @@ class FakeTransport:
         self.overpass_call_hook: Callable[[], None] | None = None
         self.transit_payload: Any = {"itineraries": []}
         self.fail_transit = False
+        self.wikidata_entities: dict[str, dict[str, Any]] = {}
+        self.wikipedia_pages: dict[str, list[dict[str, Any]]] = {"zh": [], "en": []}
 
     def request_json(
         self,
@@ -119,6 +126,18 @@ class FakeTransport:
             query = str((data or {}).get("data") or "")
             elements = self.hotels if "guest_house" in query else self.attractions
             return {"elements": elements}
+        if url == WIKIDATA_API_URL:
+            requested = str((params or {}).get("ids") or "").split("|")
+            return {
+                "entities": {
+                    entity_id: self.wikidata_entities[entity_id]
+                    for entity_id in requested
+                    if entity_id in self.wikidata_entities
+                }
+            }
+        if url in WIKIPEDIA_API_URLS.values():
+            language = "zh" if url == WIKIPEDIA_API_URLS["zh"] else "en"
+            return {"query": {"pages": self.wikipedia_pages[language]}}
         if "routing.openstreetmap.de" in url:
             mode = next(
                 value for value in ("car", "bike", "foot") if f"routed-{value}" in url
@@ -354,21 +373,20 @@ def test_served_city_centre_drives_real_attraction_query() -> None:
     assert park.address is None
     assert park.website is None
     overpass_calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert len(overpass_calls) == 3
+    assert len(overpass_calls) == 4
     assert OVERPASS_RADIUS_METERS == (5_000, 15_000, 30_000)
-    latitude_spans: list[float] = []
+    tile_bounds: set[tuple[float, float, float, float]] = set()
     for call in overpass_calls:
         query = call["data"]["data"]
         assert "around:" not in query
-        bounds_text = query.split("node(", 1)[1].split(")", 1)[0]
+        bounds_text = query.split("nwr(", 1)[1].split(")", 1)[0]
         south, west, north, east = (float(value) for value in bounds_text.split(","))
-        assert south < 43.6532 < north
-        assert west < -79.3832 < east
-        assert query.count(f"node({bounds_text})") == 7
-        assert "nwr(" not in query
-        assert query.endswith("out body 100;")
-        latitude_spans.append(north - south)
-    assert latitude_spans[0] < latitude_spans[1] < latitude_spans[2]
+        assert south <= 43.6532 <= north
+        assert west <= -79.3832 <= east
+        assert query.count(f"nwr({bounds_text})") == 7
+        assert query.endswith("out center 350;")
+        tile_bounds.add((south, west, north, east))
+    assert len(tile_bounds) == 4
     assert all('["name"]' in call["data"]["data"] for call in overpass_calls)
     overpass_call = overpass_calls[0]
     assert overpass_call["method"] == "POST"
@@ -385,7 +403,130 @@ def test_category_buttons_can_filter_cached_results_without_new_network_calls() 
     assert museums.result_count == 1
     assert museums.places[0].name == "Verified Museum"
     assert len(_calls(transport, "nominatim")) == 1
-    assert len(_calls(transport, "overpass-api.de")) == 3
+    assert len(_calls(transport, "overpass-api.de")) == 4
+
+
+def test_exact_wikimedia_identity_adds_introductions_and_platform_scores() -> None:
+    transport = FakeTransport()
+    transport.attractions = [
+        {
+            "type": "relation",
+            "id": 88_001,
+            "center": {"lat": 43.654, "lon": -79.382},
+            "tags": {
+                "name": "Verified Gallery",
+                "name:en": "Verified Gallery",
+                "tourism": "gallery",
+                "wikidata": "Q1001",
+                "wikipedia": "en:Verified Gallery",
+            },
+        }
+    ]
+    transport.wikidata_entities = {
+        "Q1001": {
+            "labels": {
+                "en": {"language": "en", "value": "Verified Gallery"},
+                "zh": {"language": "zh", "value": "已验证美术馆"},
+            },
+            "descriptions": {
+                "en": {"language": "en", "value": "A gallery in Toronto."},
+                "zh": {"language": "zh", "value": "位于多伦多的美术馆。"},
+            },
+            "sitelinks": {
+                "enwiki": {"site": "enwiki", "title": "Verified Gallery"},
+                "zhwiki": {"site": "zhwiki", "title": "已验证美术馆"},
+            },
+            "claims": {
+                "P444": [
+                    {
+                        "rank": "normal",
+                        "mainsnak": {"datavalue": {"value": "4.7/5"}},
+                        "qualifiers": {
+                            "P447": [
+                                {"datavalue": {"value": {"id": "Q2001"}}}
+                            ],
+                            "P7887": [
+                                {"datavalue": {"value": {"amount": "+1234"}}}
+                            ],
+                            "P585": [
+                                {
+                                    "datavalue": {
+                                        "value": {"time": "+2026-01-02T00:00:00Z"}
+                                    }
+                                }
+                            ],
+                            "P2699": [
+                                {
+                                    "datavalue": {
+                                        "value": "https://ratings.example.org/gallery"
+                                    }
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        },
+        "Q2001": {
+            "labels": {
+                "en": {"language": "en", "value": "Example Reviews"},
+                "zh": {"language": "zh", "value": "示例评价平台"},
+            }
+        },
+    }
+    transport.wikipedia_pages = {
+        "zh": [
+            {
+                "title": "已验证美术馆",
+                "extract": "这是由中文维基百科返回的真实简介。",
+                "canonicalurl": (
+                    "https://zh.wikipedia.org/wiki/"
+                    "%E5%B7%B2%E9%AA%8C%E8%AF%81%E7%BE%8E%E6%9C%AF%E9%A6%86"
+                ),
+            }
+        ],
+        "en": [
+            {
+                "title": "Verified Gallery",
+                "extract": "This is a real introduction returned by English Wikipedia.",
+                "canonicalurl": "https://en.wikipedia.org/wiki/Verified_Gallery",
+            }
+        ],
+    }
+    service, _, _ = _service(transport=transport)
+
+    place = service.list_places("YYZ", "attraction", limit=300).places[0]
+
+    assert place.description_zh == "这是由中文维基百科返回的真实简介。"
+    assert place.description_en == (
+        "This is a real introduction returned by English Wikipedia."
+    )
+    assert place.description_basis == "wikipedia_extract"
+    assert place.description_source == "wikipedia"
+    assert place.ratings_status == "available"
+    assert len(place.ratings) == 1
+    rating = place.ratings[0]
+    assert (rating.platform_en, rating.platform_zh) == (
+        "Example Reviews",
+        "示例评价平台",
+    )
+    assert (rating.score_text, rating.score, rating.max_score) == ("4.7/5", 4.7, 5.0)
+    assert rating.review_count == 1234
+    assert rating.point_in_time == "2026-01-02"
+    assert rating.source_url == "https://ratings.example.org/gallery"
+
+
+def test_attraction_without_free_text_gets_only_an_osm_fact_summary() -> None:
+    service, _, _ = _service()
+
+    park = service.list_places("YYZ", "attraction", "nature").places[0]
+
+    assert park.description_basis == "osm_tag_summary"
+    assert park.description_source == "openstreetmap"
+    assert "OpenStreetMap" in (park.description_zh or "")
+    assert "Toronto" in (park.description_en or "")
+    assert park.ratings == ()
+    assert park.ratings_status == "source_not_provided"
 
 
 def test_all_supported_hotel_types_and_source_provided_stars_are_preserved() -> None:
@@ -432,7 +573,7 @@ def test_place_detail_has_three_estimated_routes_and_explicit_transit_gap() -> N
     assert transit.requested_departure_at == datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
     assert len(_calls(transport, "routing.openstreetmap.de")) == 3
     assert len(_calls(transport, "api.transitous.org")) == 1
-    assert clock.sleeps == [pytest.approx(1.0)] * 4
+    assert clock.sleeps == [pytest.approx(1.0)] * 5
 
     service.get_place_detail("YYZ", museum.place_id)
     assert len(_calls(transport, "routing.openstreetmap.de")) == 3
@@ -535,6 +676,18 @@ def test_ttl_cache_evicts_oldest_entry_at_capacity() -> None:
     assert cache.get(("first",)) is None
     assert cache.get(("second",)) == 2
     assert cache.get(("third",)) == 3
+
+
+def test_ttl_cache_supports_a_short_per_entry_expiry() -> None:
+    clock = FakeClock()
+    cache = _TtlCache(clock, ttl=timedelta(hours=24))
+
+    cache.set(("partial",), 1, ttl=PARTIAL_DESTINATION_CACHE_TTL)
+    clock.advance(PARTIAL_DESTINATION_CACHE_TTL.total_seconds() - 1)
+    assert cache.get(("partial",)) == 1
+
+    clock.advance(1)
+    assert cache.get(("partial",)) is None
 
 
 def test_route_provider_failure_does_not_invent_distance_or_time() -> None:
@@ -720,7 +873,7 @@ def test_internal_100_supports_balanced_all_categories_filters_and_hidden_detail
     assert all(place.category == "museum" for place in museums.places)
     assert hidden_id not in {place.place_id for place in all_places.places}
     assert detail.place.place_id == hidden_id
-    assert len(_calls(transport, "overpass-api.de")) == 1
+    assert len(_calls(transport, "overpass-api.de")) == 4
 
 
 def test_first_5km_response_over_30_is_fully_cached_without_radius_expansion() -> None:
@@ -789,12 +942,12 @@ def test_progressive_overpass_stops_when_100_unique_named_places_are_available()
 
     assert result.result_count == 30
     calls = _calls(transport, "overpass-api.de")
-    assert len(calls) == 2
-    first_bounds = calls[0]["data"]["data"].split("node(", 1)[1].split(")", 1)[0]
-    second_bounds = calls[1]["data"]["data"].split("node(", 1)[1].split(")", 1)[0]
+    assert len(calls) == 4
+    first_bounds = calls[0]["data"]["data"].split("nwr(", 1)[1].split(")", 1)[0]
+    second_bounds = calls[1]["data"]["data"].split("nwr(", 1)[1].split(")", 1)[0]
     assert first_bounds != second_bounds
     assert all("around:" not in call["data"]["data"] for call in calls)
-    assert clock.sleeps == [pytest.approx(1.0)]
+    assert clock.sleeps == [pytest.approx(1.0)] * 3
 
 
 def test_primary_overpass_success_never_calls_fallback_and_uses_short_timeout() -> None:
@@ -815,12 +968,18 @@ def test_primary_overpass_success_never_calls_fallback_and_uses_short_timeout() 
 
     assert result.result_count == 30
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert [call["url"] for call in calls] == [OVERPASS_URL]
-    assert calls[0]["timeout"] == OVERPASS_REQUEST_TIMEOUT_SECONDS == 6.0
-    assert "[timeout:5]" in calls[0]["data"]["data"]
+    assert [call["url"] for call in calls] == [OVERPASS_URL] * 4
+    assert (
+        calls[0]["timeout"]
+        == ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS
+        == 9.0
+    )
+    assert f"[timeout:{ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS}]" in calls[0]["data"][
+        "data"
+    ]
 
 
-def test_primary_failure_retries_fallback_once_then_caches_success() -> None:
+def test_primary_failure_switches_to_fallback_then_caches_success() -> None:
     transport = FakeTransport()
     fallback_elements = [
         {
@@ -844,11 +1003,17 @@ def test_primary_failure_retries_fallback_once_then_caches_success() -> None:
     assert first.result_count == 30
     assert cached.result_count == 30
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert [call["url"] for call in calls] == [OVERPASS_URL, OVERPASS_FALLBACK_URL]
-    assert clock.sleeps == [pytest.approx(1.0)]
+    assert [call["url"] for call in calls] == [
+        OVERPASS_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
+    ]
+    assert clock.sleeps == [pytest.approx(1.0)] * 4
 
 
-def test_one_list_operation_uses_at_most_one_fallback_and_stays_under_budget() -> None:
+def test_one_list_operation_reuses_fallback_and_stays_under_budget() -> None:
     transport = FakeTransport()
     small_success = {"elements": _attraction_elements()}
     transport.overpass_payloads = [
@@ -864,10 +1029,13 @@ def test_one_list_operation_uses_at_most_one_fallback_and_stays_under_budget() -
 
     assert result.result_count == 5
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert len(calls) == 4
-    assert [call["url"] for call in calls].count(OVERPASS_FALLBACK_URL) == 1
-    assert all(call["timeout"] <= OVERPASS_REQUEST_TIMEOUT_SECONDS for call in calls)
-    assert OVERPASS_OPERATION_BUDGET_SECONDS == 24.0 < 30
+    assert len(calls) == 5
+    assert [call["url"] for call in calls].count(OVERPASS_FALLBACK_URL) == 4
+    assert all(
+        call["timeout"] <= ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS
+        for call in calls
+    )
+    assert ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS == 42.0 < 60
 
 
 def test_operation_budget_prevents_an_additional_live_request() -> None:
@@ -889,9 +1057,11 @@ def test_operation_budget_prevents_an_additional_live_request() -> None:
     assert [call["url"] for call in calls] == [
         OVERPASS_URL,
         OVERPASS_FALLBACK_URL,
-        OVERPASS_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
     ]
-    assert clock.value == 1_000.0 + OVERPASS_OPERATION_BUDGET_SECONDS
+    assert clock.value == 1_040.0
 
 
 def test_primary_remark_is_retried_once_on_fallback() -> None:
@@ -916,7 +1086,13 @@ def test_primary_remark_is_retried_once_on_fallback() -> None:
 
     assert result.result_count == 30
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert [call["url"] for call in calls] == [OVERPASS_URL, OVERPASS_FALLBACK_URL]
+    assert [call["url"] for call in calls] == [
+        OVERPASS_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
+    ]
 
 
 def test_bbox_corner_places_beyond_each_circle_radius_are_clipped() -> None:
@@ -954,9 +1130,9 @@ def test_bbox_corner_places_beyond_each_circle_radius_are_clipped() -> None:
 
     result = service.list_places("YYZ", "attraction")
 
-    assert result.result_count == 29
-    assert all(not place.name.startswith("Square Corner") for place in result.places)
-    assert len(_calls(transport, "overpass-api.de")) == 3
+    assert result.result_count == 30
+    assert all(place.name != "Square Corner 2" for place in result.places)
+    assert len(_calls(transport, "overpass-api.de")) == 4
 
 
 def test_overpass_runtime_remark_is_provider_failure_and_is_not_cached() -> None:
@@ -976,9 +1152,33 @@ def test_overpass_runtime_remark_is_provider_failure_and_is_not_cached() -> None
 
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert [call["url"] for call in calls] == [
+        endpoint
+        for _ in range(2)
+        for _ in range(4)
+        for endpoint in OVERPASS_ENDPOINTS
+    ]
+
+
+def test_attraction_tiles_reuse_the_last_successful_overpass_endpoint() -> None:
+    transport = FakeTransport()
+    transport.overpass_payloads = [
+        DestinationDataUnavailable("primary unavailable"),
+        {"elements": _attraction_elements()},
+        {"elements": _attraction_elements()},
+        {"elements": _attraction_elements()},
+        {"elements": _attraction_elements()},
+    ]
+    service, _, _ = _service(transport=transport)
+
+    result = service.list_places("YYZ", "attraction")
+
+    assert result.coverage_status == "complete"
+    calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
+    assert [call["url"] for call in calls] == [
         OVERPASS_URL,
         OVERPASS_FALLBACK_URL,
-        OVERPASS_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_FALLBACK_URL,
         OVERPASS_FALLBACK_URL,
     ]
 
@@ -992,21 +1192,62 @@ def test_wider_radius_failure_keeps_and_caches_smaller_source_backed_results() -
             "remark": "runtime error: Query timed out in query after 13 seconds",
         },
     ]
-    service, _, _ = _service(transport=transport)
+    service, _, clock = _service(transport=transport)
 
     first = service.list_places("YYZ", "attraction")
     second = service.list_places("YYZ", "attraction", "museum")
 
-    assert first.result_count == 4
+    assert first.result_count == 5
     assert second.result_count == 1
-    assert first.coverage_radius_km == 5
+    assert first.coverage_radius_km == 30
     assert first.coverage_status == "partial"
     assert first.coverage_reason == "provider_failure"
     assert first.partial is True
-    assert "较大范围查询暂时失败" in first.coverage_notice.zh
-    assert "wider-radius query failed" in first.coverage_notice.en
+    assert first.query_parts_succeeded == 1
+    assert first.query_parts_total == 4
+    assert "1/4" in first.coverage_notice.zh
+    assert "1/4" in first.coverage_notice.en
     assert second.coverage_notice == first.coverage_notice
-    assert len([call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]) == 3
+    calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
+    assert len(calls) == 7
+    clock.advance(PARTIAL_DESTINATION_CACHE_TTL.total_seconds() - 1)
+    service.list_places("YYZ", "attraction")
+    assert len([call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]) == 7
+
+    transport.overpass_payloads = [{"elements": _attraction_elements()}]
+    clock.advance(1)
+    refreshed = service.list_places("YYZ", "attraction")
+    assert refreshed.coverage_status == "complete"
+    assert len([call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]) == 11
+
+
+def test_osm_transit_references_include_only_stop_and_platform_members() -> None:
+    payload = {
+        "elements": [
+            {"type": "node", "id": 1, "tags": {"name": "Actual Stop"}},
+            {"type": "node", "id": 2, "tags": {"name": "Geometry Node"}},
+            {"type": "node", "id": 3, "tags": {"name": "Route Landmark"}},
+            {
+                "type": "relation",
+                "id": 88,
+                "tags": {
+                    "type": "route",
+                    "route": "subway",
+                    "name": "Line 2",
+                    "ref": "2",
+                },
+                "members": [
+                    {"type": "node", "ref": 1, "role": "platform"},
+                    {"type": "node", "ref": 2, "role": ""},
+                    {"type": "node", "ref": 3, "role": "via"},
+                ],
+            },
+        ]
+    }
+
+    routes = _parse_osm_transit_reference_payload(payload)
+
+    assert routes[88]["stops"] == ("Actual Stop",)
 
 
 @pytest.mark.parametrize(
