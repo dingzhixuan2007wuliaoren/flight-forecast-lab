@@ -21,11 +21,17 @@ from time import sleep
 from typing import Any, Literal
 from urllib import parse
 
+from flight_forecaster.alternate_fare_providers import (
+    SEARCHAPI_FREE_CALL_LIMIT,
+    SEARCHAPI_SEARCH_URL,
+    _FreeCallLedger,
+)
 from flight_forecaster.availability import (
     ACCOUNT_REQUEST_TIMEOUT_SECONDS,
     MAX_PROVIDER_RESPONSE_BYTES,
     REQUEST_TIMEOUT_SECONDS,
     SEARCH_ARCHIVE_REQUEST_TIMEOUT_SECONDS,
+    SEARCHAPI_PROVIDER_CODE,
     SERPAPI_ACCOUNT_URL,
     SERPAPI_DEFAULT_MONTHLY_LIMIT,
     SERPAPI_MAX_HOURLY_LIMIT,
@@ -56,10 +62,14 @@ HotelPriceErrorCode = Literal[
     "response_invalid",
     "quota_ledger_unavailable",
 ]
-QuotaScope = Literal["monthly", "hourly"]
+QuotaScope = Literal["monthly", "hourly", "lifetime"]
 
 HOTEL_PRICE_PROVIDER_CODE = "serpapi_google_hotels"
 HOTEL_PRICE_PROVIDER_NAME = "SerpApi Google Hotels"
+SEARCHAPI_HOTEL_PROVIDER_CODE = "searchapi_google_hotels"
+SEARCHAPI_HOTEL_PROVIDER_NAME = "SearchAPI.io Google Hotels"
+HOTEL_PRICE_AGGREGATE_PROVIDER_CODE = "strict_hotel_price_failover"
+HOTEL_PRICE_AGGREGATE_PROVIDER_NAME = "Strict hotel price failover"
 HOTEL_PRICE_CACHE_TTL_SECONDS = 60 * 60
 HOTEL_PRICE_FAILURE_GUARD_SECONDS = 60 * 60
 HOTEL_PRICE_POLL_DELAYS_SECONDS = (0.25, 0.5, 1.0)
@@ -79,6 +89,53 @@ _SEARCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _SAFE_CURRENCY = "USD"
 
 
+@dataclass(frozen=True, slots=True)
+class HotelProviderRun:
+    """One sanitized attempt in the strict hotel-provider failover chain."""
+
+    provider_code: str
+    provider_name: str
+    configured: bool
+    status: Literal[
+        "not_configured",
+        "available",
+        "no_results",
+        "processing",
+        "quota_exhausted",
+        "authentication_failed",
+        "provider_error",
+        "provider_unavailable",
+        "response_invalid",
+    ]
+    error_code: HotelPriceErrorCode | None
+    calls_reserved: int
+    offer_count: int
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observed_at", _as_utc(self.observed_at))
+        if not self.provider_code or not self.provider_name:
+            raise ValueError("hotel provider run identity is invalid")
+        if self.calls_reserved not in {0, 1, 2} or self.offer_count < 0:
+            raise ValueError("hotel provider run counters are invalid")
+        if self.status in {"available", "no_results"} and self.error_code is not None:
+            raise ValueError("completed hotel provider run cannot have an error")
+        if self.status == "available" and self.offer_count < 1:
+            raise ValueError("available hotel provider run requires an offer")
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "provider_code": self.provider_code,
+            "provider_name": self.provider_name,
+            "configured": self.configured,
+            "status": self.status,
+            "error_code": self.error_code,
+            "calls_reserved": self.calls_reserved,
+            "offer_count": self.offer_count,
+            "observed_at": self.observed_at.isoformat(),
+        }
+
+
 class HotelPriceError(RuntimeError):
     """A classified error whose public text contains no provider payload."""
 
@@ -91,10 +148,16 @@ class HotelPriceError(RuntimeError):
         message: str,
         *,
         quota_scope: QuotaScope | None = None,
+        provider_runs: tuple[HotelProviderRun, ...] = (),
+        calls_reserved: int = 0,
     ) -> None:
         super().__init__(message)
+        if calls_reserved not in {0, 1, 2}:
+            raise ValueError("hotel error reservation count is invalid")
         self.code = code
         self.quota_scope = quota_scope
+        self.provider_runs = tuple(provider_runs)
+        self.calls_reserved = calls_reserved
 
 
 class HotelPriceValidationError(HotelPriceError):
@@ -395,9 +458,12 @@ class HotelPriceSearchResult:
     quota_hourly_limit: int | None
     provider_code: str = HOTEL_PRICE_PROVIDER_CODE
     provider_name: str = HOTEL_PRICE_PROVIDER_NAME
+    provider_runs: tuple[HotelProviderRun, ...] = ()
+    quota_scope: QuotaScope | None = "monthly"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "offers", tuple(self.offers))
+        object.__setattr__(self, "provider_runs", tuple(self.provider_runs))
         object.__setattr__(self, "observed_at", _as_utc(self.observed_at))
         if self.status == "available" and not self.offers:
             raise ValueError("available hotel result requires offers")
@@ -415,6 +481,8 @@ class HotelPriceSearchResult:
         )
         if any(value is not None and value < 0 for value in quota_values):
             raise ValueError("hotel quota snapshot is invalid")
+        if len(self.provider_runs) > 20:
+            raise ValueError("hotel provider run list is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,6 +520,13 @@ class _AccountQuota:
     hourly_used: int
     monthly_limit: int
     hourly_limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchApiReservation:
+    reserved_calls: int
+    monthly_used: int
+    hourly_used: int
 
 
 class _HotelCache:
@@ -769,6 +844,9 @@ class _HotelCache:
 class SerpApiHotelPriceProvider:
     """One explicit Google Hotels lookup backed by the shared flight quota."""
 
+    provider_code = HOTEL_PRICE_PROVIDER_CODE
+    provider_name = HOTEL_PRICE_PROVIDER_NAME
+
     def __init__(
         self,
         api_key: str | None,
@@ -884,15 +962,38 @@ class SerpApiHotelPriceProvider:
             "api_key": self._api_key,
         }
         try:
-            payload, observed_at = self._request_json(
-                SERPAPI_SEARCH_URL,
-                params=params,
-                account_request=False,
-                allow_pending=True,
-            )
+            try:
+                payload, observed_at = self._request_json(
+                    SERPAPI_SEARCH_URL,
+                    params=params,
+                    account_request=False,
+                    allow_pending=True,
+                )
+                if _search_status(payload) in {"processing", "queued"}:
+                    payload, observed_at = self._poll_pending_search(payload)
+            except HotelPriceError as exc:
+                if exc.code != "provider_unavailable":
+                    raise
+                # A transient transport/5xx failure gets one controlled retry.
+                # The retry receives its own reservation so the shared ledger
+                # remains an exact upper bound rather than a best-effort count.
+                account = self._account_quota()
+                reservation = self._reserve_one(account)
+                calls_reserved = 2
+                payload, observed_at = self._request_json(
+                    SERPAPI_SEARCH_URL,
+                    params=params,
+                    account_request=False,
+                    allow_pending=True,
+                )
+                if _search_status(payload) in {"processing", "queued"}:
+                    payload, observed_at = self._poll_pending_search(payload)
             if _search_status(payload) in {"processing", "queued"}:
-                payload, observed_at = self._poll_pending_search(payload)
-            if _search_status(payload) in {"processing", "queued"}:
+                if calls_reserved >= 2:
+                    raise HotelPriceError(
+                        "provider_processing",
+                        "The hotel price provider is still processing the request.",
+                    )
                 # One controlled re-submission only. Account synchronization is
                 # free, while the second business attempt gets its own atomic
                 # reservation in the exact ledger shared with flight searches.
@@ -926,6 +1027,7 @@ class SerpApiHotelPriceProvider:
                     "The hotel provider response did not contain safe property records.",
                 )
         except HotelPriceError as exc:
+            exc.calls_reserved = max(exc.calls_reserved, calls_reserved)
             failure_time = self._now()
             self._cache.store_failure(
                 stay.cache_key,
@@ -1398,16 +1500,564 @@ class SerpApiHotelPriceProvider:
             ) from exc
 
 
+class SearchApiHotelPriceProvider(SerpApiHotelPriceProvider):
+    """Strict SearchAPI.io Google Hotels fallback with a lifetime hard wall.
+
+    SearchAPI.io returns the same Google Hotels property identity fields but
+    uses ``google_hotels_property`` for detail requests and a lifetime free
+    allowance. The existing SearchAPI flight ledger is reused so hotel calls
+    cannot silently exceed that shared allowance.
+    """
+
+    provider_code = SEARCHAPI_HOTEL_PROVIDER_CODE
+    provider_name = SEARCHAPI_HOTEL_PROVIDER_NAME
+
+    def __init__(
+        self,
+        api_key: str | None,
+        *,
+        usage_path: Path,
+        lifetime_limit: int | str | None = SEARCHAPI_FREE_CALL_LIMIT,
+        client: Any = None,
+        timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+        now_provider: Any = None,
+        sleep_provider: Any = None,
+    ) -> None:
+        shared_path = Path(usage_path)
+        cache_path = shared_path.with_name(
+            f"{shared_path.stem}-searchapi-hotel-cache.sqlite3"
+        )
+        super().__init__(
+            api_key,
+            usage_path=cache_path,
+            monthly_limit=SERPAPI_DEFAULT_MONTHLY_LIMIT,
+            client=client,
+            timeout_seconds=timeout_seconds,
+            now_provider=now_provider,
+            poll_delays_seconds=(0.0,),
+            sleep_provider=sleep_provider,
+        )
+        parsed_limit = _positive_int(lifetime_limit)
+        self._lifetime_limit = min(
+            parsed_limit or SEARCHAPI_FREE_CALL_LIMIT,
+            SEARCHAPI_FREE_CALL_LIMIT,
+        )
+        self._usage_path = shared_path
+        self._free_ledger = _FreeCallLedger(shared_path)
+
+    @property
+    def lifetime_limit(self) -> int:
+        return self._lifetime_limit
+
+    def search(
+        self,
+        city_query: str,
+        destination_iata: str,
+        check_in: date | str,
+        check_out: date | str,
+        *,
+        adults: int,
+        language: str,
+        explicit: bool = False,
+        refresh_local_cache: bool = False,
+    ) -> HotelPriceSearchResult:
+        if isinstance(adults, int) and not isinstance(adults, bool) and adults > 6:
+            raise HotelPriceError(
+                "provider_error",
+                "SearchAPI.io Google Hotels supports at most six guests.",
+            )
+        result = super().search(
+            city_query,
+            destination_iata,
+            check_in,
+            check_out,
+            adults=adults,
+            language=language,
+            explicit=explicit,
+            refresh_local_cache=refresh_local_cache,
+        )
+        return self._mark_result(result)
+
+    def detail(
+        self,
+        hotel_id: str,
+        city_query: str,
+        destination_iata: str,
+        check_in: date | str,
+        check_out: date | str,
+        *,
+        adults: int,
+        language: str,
+        explicit: bool = False,
+    ) -> HotelPriceOffer | None:
+        offer = super().detail(
+            hotel_id,
+            city_query,
+            destination_iata,
+            check_in,
+            check_out,
+            adults=adults,
+            language=language,
+            explicit=explicit,
+        )
+        return self._mark_offer(offer) if offer is not None else None
+
+    def exact_property_detail(
+        self,
+        hotel_names: tuple[str, ...],
+        latitude: float,
+        longitude: float,
+        city_query: str,
+        destination_iata: str,
+        check_in: date | str,
+        check_out: date | str,
+        *,
+        adults: int,
+        language: str,
+        explicit: bool = False,
+    ) -> HotelPriceOffer | None:
+        offer = super().exact_property_detail(
+            hotel_names,
+            latitude,
+            longitude,
+            city_query,
+            destination_iata,
+            check_in,
+            check_out,
+            adults=adults,
+            language=language,
+            explicit=explicit,
+        )
+        return self._mark_offer(offer) if offer is not None else None
+
+    def _mark_result(self, result: HotelPriceSearchResult) -> HotelPriceSearchResult:
+        offers = tuple(self._mark_offer(item) for item in result.offers)
+        return replace(
+            result,
+            offers=offers,
+            provider_code=self.provider_code,
+            provider_name=self.provider_name,
+            quota_hourly_used=None,
+            quota_hourly_limit=None,
+            quota_scope="lifetime",
+        )
+
+    def _mark_offer(self, offer: HotelPriceOffer) -> HotelPriceOffer:
+        source = offer.price_source
+        if source in {None, "Google Hotels"}:
+            source = self.provider_name
+        return replace(offer, price_source=source)
+
+    def _account_quota(self) -> _AccountQuota:
+        try:
+            used = self._free_ledger.snapshot(SEARCHAPI_PROVIDER_CODE)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise HotelPriceError(
+                "quota_ledger_unavailable",
+                "The shared SearchAPI.io lifetime ledger is unavailable.",
+            ) from exc
+        return _AccountQuota(
+            billing_cycle_key="lifetime",
+            hour_bucket_key="lifetime",
+            monthly_used=used,
+            hourly_used=0,
+            monthly_limit=self._lifetime_limit,
+            hourly_limit=self._lifetime_limit,
+        )
+
+    def _reserve_one(self, account: _AccountQuota) -> _SearchApiReservation:
+        try:
+            reserved = self._free_ledger.reserve(
+                SEARCHAPI_PROVIDER_CODE,
+                1,
+                hard_limit=self._lifetime_limit,
+                require_all=True,
+            )
+            used = self._free_ledger.snapshot(SEARCHAPI_PROVIDER_CODE)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise HotelPriceError(
+                "quota_ledger_unavailable",
+                "The shared SearchAPI.io lifetime ledger is unavailable.",
+            ) from exc
+        if reserved != 1:
+            raise HotelPriceError(
+                "quota_exhausted",
+                "The SearchAPI.io lifetime free allowance is exhausted.",
+                quota_scope="lifetime",
+            )
+        return _SearchApiReservation(
+            reserved_calls=1,
+            monthly_used=used,
+            hourly_used=0,
+        )
+
+    def _poll_pending_search(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], datetime]:
+        # SearchAPI.io Google Hotels is synchronous. A pending response is not
+        # followed through a SerpApi archive URL; the inherited workflow may
+        # perform exactly one separately reserved re-submission.
+        return payload, self._now()
+
+    def _request_json(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        account_request: bool,
+        allow_pending: bool = False,
+    ) -> tuple[dict[str, Any], datetime]:
+        if account_request or url not in {SERPAPI_SEARCH_URL, SEARCHAPI_SEARCH_URL}:
+            raise HotelPriceError(
+                "response_invalid",
+                "The SearchAPI.io hotel request URL is not allowlisted.",
+            )
+        safe_params = {
+            key: value
+            for key, value in params.items()
+            if key != "api_key"
+        }
+        safe_params["engine"] = (
+            "google_hotels_property"
+            if _safe_text(safe_params.get("property_token"), 2_000)
+            else "google_hotels"
+        )
+        try:
+            response = self._client.get(
+                SEARCHAPI_SEARCH_URL,
+                params=safe_params,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
+                    "User-Agent": (
+                        "flight-forecast-lab/0.2.0 "
+                        "(explicit strict hotel prices)"
+                    ),
+                },
+                timeout=self._timeout_seconds,
+            )
+        except Exception as exc:
+            raise HotelPriceError(
+                "provider_unavailable",
+                "SearchAPI.io Google Hotels is temporarily unavailable.",
+            ) from exc
+        observed_at = self._now()
+        status = _response_status(response)
+        if status in {401, 403}:
+            raise HotelPriceError(
+                "authentication_failed",
+                "SearchAPI.io rejected hotel authentication.",
+            )
+        if status in {402, 429}:
+            code: HotelPriceErrorCode = (
+                "quota_exhausted" if status == 402 else "rate_limited"
+            )
+            raise HotelPriceError(
+                code,
+                "SearchAPI.io hotel allowance or rate limit was reached.",
+                quota_scope="lifetime" if status == 402 else None,
+            )
+        if status in {408, 425} or 500 <= status <= 599:
+            raise HotelPriceError(
+                "provider_unavailable",
+                "SearchAPI.io Google Hotels is temporarily unavailable.",
+            )
+        if not 200 <= status <= 299:
+            raise HotelPriceError(
+                "provider_error",
+                "SearchAPI.io rejected the hotel request.",
+            )
+        payload = _response_json(response)
+        if not isinstance(payload, dict):
+            raise HotelPriceError(
+                "response_invalid",
+                "SearchAPI.io returned an invalid hotel response.",
+            )
+        search_status = _search_status(payload)
+        if search_status in {"processing", "queued"}:
+            if allow_pending:
+                return payload, observed_at
+            raise HotelPriceError(
+                "provider_processing",
+                "SearchAPI.io is still processing the hotel request.",
+            )
+        if search_status not in {"success", "cached"}:
+            raise HotelPriceError(
+                "provider_error" if search_status == "error" else "response_invalid",
+                "SearchAPI.io hotel search failed strict status validation.",
+            )
+        return payload, observed_at
+
+
+class StrictHotelPriceProviderPool:
+    """Sequential strict failover across configured hotel price providers."""
+
+    provider_code = HOTEL_PRICE_AGGREGATE_PROVIDER_CODE
+    provider_name = HOTEL_PRICE_AGGREGATE_PROVIDER_NAME
+
+    def __init__(self, providers: tuple[SerpApiHotelPriceProvider, ...]) -> None:
+        self.providers = tuple(providers)
+        self._hotel_provider: dict[str, str] = {}
+
+    @property
+    def configured(self) -> bool:
+        return any(provider.configured for provider in self.providers)
+
+    @property
+    def usage_path(self) -> Path:
+        return self.providers[0].usage_path
+
+    def search(
+        self,
+        city_query: str,
+        destination_iata: str,
+        check_in: date | str,
+        check_out: date | str,
+        *,
+        adults: int,
+        language: str,
+        explicit: bool = False,
+        refresh_local_cache: bool = False,
+    ) -> HotelPriceSearchResult:
+        runs: list[HotelProviderRun] = []
+        completed_empty: list[HotelPriceSearchResult] = []
+        failures: list[HotelPriceError] = []
+        for provider in self.providers:
+            observed_at = provider._now()
+            if not provider.configured:
+                runs.append(
+                    HotelProviderRun(
+                        provider.provider_code,
+                        provider.provider_name,
+                        False,
+                        "not_configured",
+                        "not_configured",
+                        0,
+                        0,
+                        observed_at,
+                    )
+                )
+                continue
+            try:
+                result = provider.search(
+                    city_query,
+                    destination_iata,
+                    check_in,
+                    check_out,
+                    adults=adults,
+                    language=language,
+                    explicit=explicit,
+                    refresh_local_cache=refresh_local_cache,
+                )
+            except HotelPriceValidationError:
+                raise
+            except HotelPriceError as exc:
+                failures.append(exc)
+                runs.append(_provider_failure_run(provider, exc, provider._now()))
+                continue
+            runs.append(
+                HotelProviderRun(
+                    result.provider_code,
+                    result.provider_name,
+                    True,
+                    result.status,
+                    None,
+                    result.calls_reserved,
+                    len(result.offers),
+                    result.observed_at,
+                )
+            )
+            if result.status == "available":
+                for offer in result.offers:
+                    self._hotel_provider[offer.hotel_id] = provider.provider_code
+                return replace(result, provider_runs=tuple(runs))
+            completed_empty.append(result)
+
+        if completed_empty and not failures:
+            last = completed_empty[-1]
+            return replace(
+                last,
+                provider_code=self.provider_code,
+                provider_name=self.provider_name,
+                provider_runs=tuple(runs),
+            )
+        if not failures:
+            raise HotelPriceError(
+                "not_configured",
+                "No strict hotel price provider is configured.",
+                provider_runs=tuple(runs),
+            )
+        selected = _aggregate_failure(failures)
+        raise HotelPriceError(
+            selected.code,
+            _aggregate_failure_message(selected.code),
+            quota_scope=selected.quota_scope,
+            provider_runs=tuple(runs),
+        )
+
+    def detail(self, hotel_id: str, *args: Any, **kwargs: Any) -> HotelPriceOffer | None:
+        providers = self._ordered_for_hotel(hotel_id)
+        failures: list[HotelPriceError] = []
+        for provider in providers:
+            if not provider.configured:
+                continue
+            try:
+                offer = provider.detail(hotel_id, *args, **kwargs)
+            except HotelPriceValidationError:
+                raise
+            except HotelPriceError as exc:
+                failures.append(exc)
+                continue
+            if offer is not None:
+                self._hotel_provider[hotel_id] = provider.provider_code
+                return offer
+        if failures:
+            selected = _aggregate_failure(failures)
+            raise HotelPriceError(
+                selected.code,
+                _aggregate_failure_message(selected.code),
+                quota_scope=selected.quota_scope,
+            )
+        return None
+
+    def exact_property_detail(self, *args: Any, **kwargs: Any) -> HotelPriceOffer | None:
+        failures: list[HotelPriceError] = []
+        for provider in self.providers:
+            if not provider.configured:
+                continue
+            try:
+                offer = provider.exact_property_detail(*args, **kwargs)
+            except HotelPriceValidationError:
+                raise
+            except HotelPriceError as exc:
+                failures.append(exc)
+                continue
+            if offer is not None:
+                self._hotel_provider[offer.hotel_id] = provider.provider_code
+                return offer
+        if failures:
+            selected = _aggregate_failure(failures)
+            raise HotelPriceError(
+                selected.code,
+                _aggregate_failure_message(selected.code),
+                quota_scope=selected.quota_scope,
+            )
+        return None
+
+    def _ordered_for_hotel(
+        self,
+        hotel_id: str,
+    ) -> tuple[SerpApiHotelPriceProvider, ...]:
+        preferred = self._hotel_provider.get(hotel_id)
+        if preferred is None:
+            return self.providers
+        return tuple(
+            sorted(
+                self.providers,
+                key=lambda provider: provider.provider_code != preferred,
+            )
+        )
+
+
 def hotel_price_provider_from_env(
     usage_path: Path = HOTEL_PRICE_DEFAULT_USAGE_PATH,
-) -> SerpApiHotelPriceProvider:
-    """Construct the optional provider without performing any network I/O."""
+    *,
+    alternate_usage_path: Path | None = None,
+) -> StrictHotelPriceProviderPool:
+    """Construct strict hotel providers without performing network I/O.
 
-    return SerpApiHotelPriceProvider(
-        os.getenv("SERPAPI_API_KEY"),
-        usage_path=usage_path,
-        monthly_limit=os.getenv("SERPAPI_MONTHLY_LIMIT"),
+    SerpApi shares its billing-window ledger with strict flights. SearchAPI.io
+    shares the separate lifetime ledger used by its strict-flight adapter.
+    """
+
+    serpapi_usage_path = Path(usage_path)
+    searchapi_usage_path = (
+        Path(alternate_usage_path)
+        if alternate_usage_path is not None
+        else serpapi_usage_path.with_name("alternate-provider-usage.sqlite3")
     )
+    return StrictHotelPriceProviderPool(
+        (
+            SerpApiHotelPriceProvider(
+                os.getenv("SERPAPI_API_KEY"),
+                usage_path=serpapi_usage_path,
+                monthly_limit=os.getenv("SERPAPI_MONTHLY_LIMIT"),
+            ),
+            SearchApiHotelPriceProvider(
+                os.getenv("SEARCHAPI_API_KEY"),
+                usage_path=searchapi_usage_path,
+                lifetime_limit=(
+                    os.getenv("SEARCHAPI_LIFETIME_LIMIT")
+                    or os.getenv("SEARCHAPI_MONTHLY_LIMIT")
+                ),
+            ),
+        )
+    )
+
+
+def _provider_failure_run(
+    provider: SerpApiHotelPriceProvider,
+    error: HotelPriceError,
+    observed_at: datetime,
+) -> HotelProviderRun:
+    status_by_code: dict[HotelPriceErrorCode, str] = {
+        "not_configured": "not_configured",
+        "authentication_failed": "authentication_failed",
+        "quota_exhausted": "quota_exhausted",
+        "rate_limited": "quota_exhausted",
+        "provider_processing": "processing",
+        "provider_error": "provider_error",
+        "provider_unavailable": "provider_unavailable",
+        "response_invalid": "response_invalid",
+        "quota_ledger_unavailable": "provider_unavailable",
+        "validation_error": "response_invalid",
+    }
+    status = status_by_code[error.code]
+    return HotelProviderRun(
+        provider.provider_code,
+        provider.provider_name,
+        provider.configured,
+        status,  # type: ignore[arg-type]
+        error.code,
+        error.calls_reserved,
+        0,
+        observed_at,
+    )
+
+
+def _aggregate_failure(errors: list[HotelPriceError]) -> HotelPriceError:
+    priority: tuple[HotelPriceErrorCode, ...] = (
+        "provider_processing",
+        "quota_exhausted",
+        "rate_limited",
+        "authentication_failed",
+        "provider_error",
+        "provider_unavailable",
+        "quota_ledger_unavailable",
+        "response_invalid",
+        "not_configured",
+    )
+    return next(
+        (error for code in priority for error in errors if error.code == code),
+        errors[0],
+    )
+
+
+def _aggregate_failure_message(code: HotelPriceErrorCode) -> str:
+    messages: dict[HotelPriceErrorCode, str] = {
+        "validation_error": "The hotel request failed validation.",
+        "not_configured": "No strict hotel price provider is configured.",
+        "authentication_failed": "All configured hotel sources failed authentication.",
+        "quota_exhausted": "All usable strict hotel source allowances are exhausted.",
+        "rate_limited": "All usable strict hotel sources are currently rate limited.",
+        "provider_processing": "All usable hotel sources are still processing.",
+        "provider_error": "Configured strict hotel sources returned provider errors.",
+        "provider_unavailable": "Configured strict hotel sources are temporarily unavailable.",
+        "response_invalid": "No configured hotel source returned strictly verifiable data.",
+        "quota_ledger_unavailable": "The strict hotel quota ledger is unavailable.",
+    }
+    return messages[code]
 
 
 def _validate_stay(
@@ -1477,7 +2127,8 @@ def _validate_detail_echo(
             "The hotel detail provider did not confirm the stay parameters.",
         )
     checks = (
-        str(parameters.get("engine", "")).strip() == "google_hotels",
+        str(parameters.get("engine", "")).strip()
+        in {"google_hotels", "google_hotels_property"},
         _safe_text(parameters.get("property_token"), 2_000) == property_token,
         str(parameters.get("check_in_date", "")).strip() == stay.check_in.isoformat(),
         str(parameters.get("check_out_date", "")).strip() == stay.check_out.isoformat(),
@@ -1573,21 +2224,37 @@ def _parse_offer(
         # A price source is an indivisible evidence row. Never fill a missing
         # value or cancellation flag from the property aggregate or another
         # seller while retaining this seller's label.
-        nightly = _nested_price(selected_price, "rate_per_night")
-        total = _nested_price(selected_price, "total_rate")
+        nightly = _nightly_price(selected_price)
+        total = _total_price(selected_price)
         price_source = _safe_text(selected_price.get("source"), 160)
-        free_cancellation = _optional_bool(selected_price.get("free_cancellation"))
+        free_cancellation = (
+            _optional_bool(selected_price.get("free_cancellation"))
+            if selected_price.get("free_cancellation") is not None
+            else _optional_bool(selected_price.get("has_free_cancellation"))
+        )
     else:
-        nightly = _nested_price(row, "rate_per_night")
-        total = _nested_price(row, "total_rate")
+        nightly = _nightly_price(row)
+        total = _total_price(row)
         price_source = None
-        free_cancellation = _optional_bool(row.get("free_cancellation"))
+        free_cancellation = (
+            _optional_bool(row.get("free_cancellation"))
+            if row.get("free_cancellation") is not None
+            else _optional_bool(row.get("has_free_cancellation"))
+        )
     if nightly is None and total is None:
         return None
     if price_source is None:
         price_source = "Google Hotels"
     hotel_class = _hotel_class(row)
-    rating = _bounded_float(row.get("overall_rating"), 0, 5)
+    rating = _bounded_float(
+        (
+            row.get("overall_rating")
+            if row.get("overall_rating") is not None
+            else row.get("rating")
+        ),
+        0,
+        5,
+    )
     review_count = _nonnegative_int(row.get("reviews"))
     description = _safe_text(row.get("description"), 1_200)
     amenities = _safe_text_list(row.get("amenities"), limit=40, item_limit=100)
@@ -1661,6 +2328,10 @@ def _hotel_id(row: dict[str, Any], stay: _Stay) -> str:
 def _selected_price(row: dict[str, Any]) -> dict[str, Any] | None:
     prices = row.get("prices")
     if not isinstance(prices, list):
+        prices = row.get("featured_offers")
+    if not isinstance(prices, list):
+        prices = row.get("all_offers")
+    if not isinstance(prices, list):
         return None
     safe_rows = [item for item in prices[:30] if isinstance(item, dict)]
     candidates = [
@@ -1668,15 +2339,15 @@ def _selected_price(row: dict[str, Any]) -> dict[str, Any] | None:
         for item in safe_rows
         if _safe_text(item.get("source"), 160) is not None
         and (
-            _nested_price(item, "rate_per_night") is not None
-            or _nested_price(item, "total_rate") is not None
+            _nightly_price(item) is not None
+            or _total_price(item) is not None
         )
     ]
     return min(
         candidates,
         key=lambda item: (
-            _nested_price(item, "total_rate") or math.inf,
-            _nested_price(item, "rate_per_night") or math.inf,
+            _total_price(item) or math.inf,
+            _nightly_price(item) or math.inf,
         ),
         default=None,
     )
@@ -1729,6 +2400,7 @@ def _property_images(row: dict[str, Any]) -> tuple[str, ...]:
         if isinstance(item, dict):
             candidate = (
                 _safe_public_url(item.get("original_image"))
+                or _safe_public_url(item.get("original"))
                 or _safe_public_url(item.get("image"))
                 or _safe_public_url(item.get("thumbnail"))
             )
@@ -1787,6 +2459,10 @@ def _parse_room_rates(
 ) -> tuple[HotelRoomRate, ...]:
     featured = row.get("featured_prices")
     if not isinstance(featured, list):
+        featured = row.get("featured_offers")
+    if not isinstance(featured, list):
+        featured = row.get("all_offers")
+    if not isinstance(featured, list):
         return ()
     deduplicated: dict[tuple[Any, ...], HotelRoomRate] = {}
     for seller in featured[:20]:
@@ -1796,15 +2472,26 @@ def _parse_room_rates(
         rooms = seller.get("rooms")
         if source is None or not isinstance(rooms, list):
             continue
-        seller_link = _safe_public_url(seller.get("link"))
-        official = _optional_bool(seller.get("official"))
+        seller_link = (
+            _safe_public_url(seller.get("link"))
+            or _safe_public_url(seller.get("tracking_link"))
+        )
+        official = (
+            _optional_bool(seller.get("official"))
+            if seller.get("official") is not None
+            else _optional_bool(seller.get("is_official"))
+        )
         for room in rooms[:30]:
             if not isinstance(room, dict):
                 continue
             room_name = _safe_text(room.get("name"), 200)
             if room_name is None:
                 continue
-            room_link = _safe_public_url(room.get("link")) or seller_link
+            room_link = (
+                _safe_public_url(room.get("link"))
+                or _safe_public_url(room.get("tracking_link"))
+                or seller_link
+            )
             raw_rates = room.get("rates")
             nested_rates = (
                 [item for item in raw_rates[:20] if isinstance(item, dict)]
@@ -1817,10 +2504,10 @@ def _parse_room_rates(
                 if any(
                     value is not None
                     for value in (
-                        _nested_price(item, "rate_per_night"),
-                        _nested_price(item, "total_rate"),
-                        _nested_before_taxes(item, "rate_per_night"),
-                        _nested_before_taxes(item, "total_rate"),
+                        _nightly_price(item),
+                        _total_price(item),
+                        _nightly_before_taxes(item),
+                        _total_before_taxes(item),
                     )
                 )
             ]
@@ -1829,10 +2516,10 @@ def _parse_room_rates(
             # not return its own price evidence.
             rate_rows = priced_nested_rates or [room]
             for rate in rate_rows:
-                nightly = _nested_price(rate, "rate_per_night")
-                total = _nested_price(rate, "total_rate")
-                nightly_before = _nested_before_taxes(rate, "rate_per_night")
-                total_before = _nested_before_taxes(rate, "total_rate")
+                nightly = _nightly_price(rate)
+                total = _total_price(rate)
+                nightly_before = _nightly_before_taxes(rate)
+                total_before = _total_before_taxes(rate)
                 if all(
                     value is None
                     for value in (nightly, total, nightly_before, total_before)
@@ -1843,12 +2530,21 @@ def _parse_room_rates(
                     or _bounded_positive_int(room.get("num_guests"), 50)
                     or _bounded_positive_int(seller.get("num_guests"), 50)
                 )
+                raw_until = rate.get("free_cancellation_until")
                 cancellation_date = _safe_text(
-                    rate.get("free_cancellation_until_date"),
+                    (
+                        raw_until.get("date")
+                        if isinstance(raw_until, dict)
+                        else rate.get("free_cancellation_until_date")
+                    ),
                     80,
                 )
                 cancellation_time = _safe_text(
-                    rate.get("free_cancellation_until_time"),
+                    (
+                        raw_until.get("time")
+                        if isinstance(raw_until, dict)
+                        else rate.get("free_cancellation_until_time")
+                    ),
                     80,
                 )
                 cancellation_until = " ".join(
@@ -1871,7 +2567,11 @@ def _parse_room_rates(
                     currency=_SAFE_CURRENCY,
                     guests=guests,
                     official=official,
-                    free_cancellation=_optional_bool(rate.get("free_cancellation")),
+                    free_cancellation=(
+                        _optional_bool(rate.get("free_cancellation"))
+                        if rate.get("free_cancellation") is not None
+                        else _optional_bool(rate.get("has_free_cancellation"))
+                    ),
                     free_cancellation_until=cancellation_until,
                     breakfast_included=_optional_bool(rate.get("breakfast_included")),
                     beds=beds,
@@ -1907,7 +2607,15 @@ def _parse_review_sources(
     observed_at: datetime,
 ) -> tuple[HotelReviewSource, ...]:
     sources: list[HotelReviewSource] = []
-    google_score = _bounded_float(row.get("overall_rating"), 0, 5)
+    google_score = _bounded_float(
+        (
+            row.get("overall_rating")
+            if row.get("overall_rating") is not None
+            else row.get("rating")
+        ),
+        0,
+        5,
+    )
     google_count = _nonnegative_int(row.get("reviews"))
     if google_score is not None or google_count is not None:
         sources.append(
@@ -1927,6 +2635,13 @@ def _parse_review_sources(
         )
     other_reviews = row.get("other_reviews")
     if not isinstance(other_reviews, list):
+        review_results = row.get("review_results")
+        other_reviews = (
+            review_results.get("on_other_sites")
+            if isinstance(review_results, dict)
+            else None
+        )
+    if not isinstance(other_reviews, list):
         return tuple(sources)
     for item in other_reviews[:20]:
         if not isinstance(item, dict):
@@ -1938,19 +2653,24 @@ def _parse_review_sources(
         score = (
             _nonnegative_float(source_rating.get("score"))
             if isinstance(source_rating, dict)
-            else None
+            else _nonnegative_float(item.get("rating"))
         )
         max_score = (
             _positive_float(source_rating.get("max_score"))
             if isinstance(source_rating, dict)
-            else None
+            else 5.0 if score is not None else None
         )
         if score is None or max_score is None or score > max_score or max_score > 100:
             score = None
             max_score = None
         user_review = item.get("user_review")
         if not isinstance(user_review, dict):
-            user_review = {}
+            user_review = {
+                "username": item.get("username"),
+                "date": item.get("date"),
+                "comment": item.get("text"),
+                "link": item.get("link"),
+            }
         sample_rating = user_review.get("rating")
         sample_score = (
             _nonnegative_float(sample_rating.get("score"))
@@ -2016,7 +2736,10 @@ def _nested_before_taxes(container: dict[str, Any], key: str) -> float | None:
     value = container.get(key)
     if not isinstance(value, dict):
         return None
-    return _positive_float(value.get("extracted_before_taxes_fees"))
+    return (
+        _positive_float(value.get("extracted_before_taxes_fees"))
+        or _positive_float(value.get("extracted_price_before_taxes"))
+    )
 
 
 def _review_evidence_rank(item: HotelReviewSource) -> tuple[int, int, int]:
@@ -2076,7 +2799,38 @@ def _nested_price(container: dict[str, Any], key: str) -> float | None:
     value = container.get(key)
     if not isinstance(value, dict):
         return None
-    return _positive_float(value.get("extracted_lowest"))
+    return (
+        _positive_float(value.get("extracted_lowest"))
+        or _positive_float(value.get("extracted_price"))
+    )
+
+
+def _nightly_price(container: dict[str, Any]) -> float | None:
+    return (
+        _nested_price(container, "rate_per_night")
+        or _nested_price(container, "price_per_night")
+    )
+
+
+def _total_price(container: dict[str, Any]) -> float | None:
+    return (
+        _nested_price(container, "total_rate")
+        or _nested_price(container, "total_price")
+    )
+
+
+def _nightly_before_taxes(container: dict[str, Any]) -> float | None:
+    return (
+        _nested_before_taxes(container, "rate_per_night")
+        or _nested_before_taxes(container, "price_per_night")
+    )
+
+
+def _total_before_taxes(container: dict[str, Any]) -> float | None:
+    return (
+        _nested_before_taxes(container, "total_rate")
+        or _nested_before_taxes(container, "total_price")
+    )
 
 
 def _price_rank(offer: HotelPriceOffer) -> tuple[float, float, str]:

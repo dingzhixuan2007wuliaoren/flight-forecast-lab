@@ -136,6 +136,25 @@ def test_provider_status_reports_true_quota_scopes_without_secrets(monkeypatch) 
     )
     assert "without credentials" in opensky["notice"]["en"]
 
+    capabilities = payload["destination_capabilities"]
+    assert isinstance(capabilities, list)
+    assert len(capabilities) == 14
+    assert sum(item["active"] is True for item in capabilities) == 11
+    assert {
+        item["data_family"] for item in capabilities if item["active"] is True
+    } == {"ourairports", "openstreetmap", "wikimedia", "transitous"}
+    assert all(
+        item["strict_evidence_requirement"] and item["source_host"]
+        for item in capabilities
+    )
+    overpass = [
+        item
+        for item in capabilities
+        if item["code"].startswith("osm_overpass_")
+    ]
+    assert len(overpass) == 3
+    assert {item["data_family"] for item in overpass} == {"openstreetmap"}
+
     serialized = json.dumps(payload, ensure_ascii=False)
     for secret in secrets.values():
         assert secret not in serialized
@@ -497,9 +516,18 @@ def test_dashboard_only_shows_per_provider_quota_summary_and_links_to_detail() -
 
     for fragment in (
         'id="grid"',
+        'id="capability-grid"',
         'fetch("/v1/provider-status"',
         "数据提供商状态",
         "Data-provider status",
+        "目的地数据 API 能力",
+        "Destination-data API capabilities",
+        "端点数量不等于独立信息源数量",
+        "Endpoint count is not an independent-source count",
+        "destination_capabilities",
+        "strict_evidence_requirement",
+        "source_host",
+        "data_family",
         "quota_used",
         "quota_limit",
         "quota_remaining",

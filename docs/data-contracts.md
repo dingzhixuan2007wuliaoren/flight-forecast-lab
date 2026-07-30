@@ -252,7 +252,7 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 | `POST /v1/context/news-detail` | 最近七日最多 20 篇中断新闻及文章级风险解释 |
 | `POST /v1/destination/places` | 按目的地机场返回脱敏的 OSM 景点或酒店列表及真实查询覆盖半径 |
 | `POST /v1/destination/place-detail` | 返回 OSM 地点详情、道路图路线，以及 Transitous 或配额受控 SerpApi Google Maps Directions 回退返回的完整公共交通行程；两者均无真实结果时返回明确不可用状态 |
-| `POST /v1/destination/hotel-prices` | 用户显式触发 Google Hotels 住宿报价搜索；与严格航班共用 SerpApi 额度 |
+| `POST /v1/destination/hotel-prices` | 用户显式触发严格 Google Hotels 住宿报价搜索；SerpApi 失败时顺序回退到已配置的 SearchAPI.io，并返回脱敏 `provider_runs`。只有所有已配置来源成功完成且均为空时才返回 `no_results` |
 | `POST /v1/destination/hotel-price-detail` | 用 `hotel_id` 或 OSM `place_id` 二选一严格确认同一家酒店，并返回真实房型价格、跨平台评分/评价与机场交通 |
 
 健康响应不得暴露本地绝对路径、密钥或原始训练记录。所有 provider 凭据都不得进入浏览器/前端、仓库或应用日志；服务端只把凭据发送给对应的 HTTPS provider，完整外部请求 URL 不得记录。模型信息应能让调用方识别是否误用了 `synthetic` 演示模型。

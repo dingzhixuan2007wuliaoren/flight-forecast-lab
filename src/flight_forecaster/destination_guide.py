@@ -121,7 +121,17 @@ NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OVERPASS_FALLBACK_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
-OVERPASS_ENDPOINTS = (OVERPASS_URL, OVERPASS_FALLBACK_URL)
+OVERPASS_PRIVATE_COFFEE_URL = "https://overpass.private.coffee/api/interpreter"
+OVERPASS_ENDPOINTS = (
+    OVERPASS_URL,
+    OVERPASS_FALLBACK_URL,
+    OVERPASS_PRIVATE_COFFEE_URL,
+)
+OVERPASS_SOURCE_KEYS = {
+    OVERPASS_URL: "osm_overpass_fossgis",
+    OVERPASS_FALLBACK_URL: "osm_overpass_vk_maps",
+    OVERPASS_PRIVATE_COFFEE_URL: "osm_overpass_private_coffee",
+}
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 WIKIMEDIA_COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIPEDIA_API_URLS = {
@@ -135,10 +145,13 @@ OPENSTREETMAP_BASE_URL = "https://www.openstreetmap.org"
 OSM_TRANSIT_REFERENCE_SOURCE_URL = f"{OPENSTREETMAP_BASE_URL}/copyright"
 DESTINATION_CACHE_TTL = timedelta(hours=24)
 PARTIAL_DESTINATION_CACHE_TTL = timedelta(minutes=10)
+STALE_DESTINATION_CACHE_TTL = timedelta(days=7)
 TRANSIT_CACHE_TTL = timedelta(minutes=30)
 TRANSIT_CACHE_MAX_ENTRIES = 512
 DESTINATION_RADIUS_METERS = 30_000
 OVERPASS_RADIUS_METERS = (5_000, 15_000, DESTINATION_RADIUS_METERS)
+HOTEL_SEED_RADIUS_METERS = 1_000
+HOTEL_QUERY_PARTS = 1 + 4 + 2
 MAX_PLACES_PER_KIND = 300
 MAX_INTERNAL_PLACES_PER_KIND = 300
 DEFAULT_PLACES_PER_KIND = 30
@@ -162,6 +175,8 @@ OVERPASS_OPERATION_BUDGET_SECONDS = 24.0
 ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS = 9.0
 ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS = 8
 ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS = 42.0
+ATTRACTION_QUERY_GRID_SIZE = 3
+ATTRACTION_QUERY_PARTS = 1 + ATTRACTION_QUERY_GRID_SIZE**2
 WIKIMEDIA_REQUEST_TIMEOUT_SECONDS = 8.0
 WIKIMEDIA_OPERATION_BUDGET_SECONDS = 18.0
 ROUTING_REQUEST_TIMEOUT_SECONDS = 5.0
@@ -188,6 +203,30 @@ class DestinationAirportNotFound(DestinationGuideError):
 class DestinationDataUnavailable(DestinationGuideError):
     """Raised when a required public-data response is unavailable or invalid."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: Literal[
+            "timeout",
+            "rate_limited",
+            "quota_exhausted",
+            "provider_error",
+            "invalid_response",
+            "request_budget_exhausted",
+        ] = "provider_error",
+        http_status: int | None = None,
+        provider_attempts: tuple[Any, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+        self.http_status = http_status
+        # Attempts are already reduced to the strict, credential-safe model below.
+        # Carrying them on the exception lets the HTTP layer explain whether every
+        # public replica timed out, was rate limited, or exhausted a quota without
+        # retaining provider bodies, URLs, or raw exception messages.
+        self.provider_attempts = tuple(provider_attempts)
+
 
 class DestinationPlaceNotFound(DestinationGuideError):
     """Raised when a safe place identifier is absent from the destination result."""
@@ -201,6 +240,297 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
+def _safe_capability_source_url(value: str) -> bool:
+    try:
+        parsed = parse.urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        return False
+    normalized_host = hostname.rstrip(".").lower()
+    if normalized_host in {"localhost", "localhost.localdomain"} or normalized_host.endswith(
+        ".local"
+    ):
+        return False
+    try:
+        address = ipaddress.ip_address(normalized_host.strip("[]"))
+    except ValueError:
+        return True
+    return address.is_global
+
+
+class DestinationSourceCapability(_StrictModel):
+    """A real destination-data adapter or evidence layer.
+
+    Capability entries describe code paths, not a claim that a particular
+    request returned data.  ``configured`` is explicit so optional commercial
+    catalog entries can never look like active evidence.
+    """
+
+    key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,49}$")
+    display_name: str = Field(min_length=1, max_length=120)
+    role: Literal[
+        "airport_identity",
+        "city_resolution",
+        "place_discovery",
+        "identity_enrichment",
+        "description_enrichment",
+        "photo_evidence",
+        "rating_evidence",
+        "road_routing",
+        "public_transit_routing",
+    ]
+    adapter_status: Literal["active", "catalogued"]
+    configured: bool
+    strict_evidence_requirement: Literal[
+        "iata_airport_record",
+        "osm_element_id_coordinates_and_permalink",
+        "same_wikidata_subject",
+        "same_wikipedia_sitelink",
+        "same_commons_file_with_license",
+        "provider_route_coordinates_and_times",
+        "provider_place_id",
+        "city_name_country_and_coordinates",
+    ]
+    source_url: str = Field(min_length=20, max_length=2_048)
+    evidence_policy: Literal["capability_only_not_query_evidence"] = (
+        "capability_only_not_query_evidence"
+    )
+
+    @model_validator(mode="after")
+    def capability_is_honest(self) -> DestinationSourceCapability:
+        if self.adapter_status == "active" and not self.configured:
+            raise ValueError("active destination source capabilities must be configured")
+        if self.adapter_status == "catalogued" and self.configured:
+            raise ValueError("catalogued destination sources cannot be marked configured")
+        if not _safe_capability_source_url(self.source_url):
+            raise ValueError("destination capability URL must be a safe public HTTPS URL")
+        return self
+
+
+class DestinationProviderAttempt(_StrictModel):
+    """Sanitized evidence about one provider-endpoint attempt."""
+
+    source_key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,49}$")
+    endpoint_host: str = Field(
+        min_length=3,
+        max_length=253,
+        pattern=r"^[a-z0-9.-]+$",
+    )
+    status: Literal["succeeded", "empty_response", "failed", "skipped_budget"]
+    failure_kind: (
+        Literal[
+            "timeout",
+            "rate_limited",
+            "quota_exhausted",
+            "provider_error",
+            "invalid_response",
+            "request_budget_exhausted",
+        ]
+        | None
+    ) = None
+    http_status: int | None = Field(default=None, ge=400, le=599)
+    result_count: int | None = Field(default=None, ge=0, le=MAX_INTERNAL_PLACES_PER_KIND)
+
+    @model_validator(mode="after")
+    def attempt_is_consistent(self) -> DestinationProviderAttempt:
+        if self.status in {"succeeded", "empty_response"}:
+            if self.failure_kind is not None or self.http_status is not None:
+                raise ValueError("successful provider attempts cannot contain failure metadata")
+            if self.result_count is None:
+                raise ValueError("successful provider attempts require a result count")
+            if self.status == "succeeded" and self.result_count < 1:
+                raise ValueError("succeeded provider attempts require a non-empty result")
+            if self.status == "empty_response" and self.result_count != 0:
+                raise ValueError("empty provider attempts require result_count=0")
+        else:
+            if self.failure_kind is None or self.result_count is not None:
+                raise ValueError("failed provider attempts require only failure metadata")
+        return self
+
+
+def _aggregate_destination_attempt_failure(
+    attempts: tuple[DestinationProviderAttempt, ...],
+) -> tuple[
+    Literal[
+        "timeout",
+        "rate_limited",
+        "quota_exhausted",
+        "provider_error",
+        "invalid_response",
+        "request_budget_exhausted",
+    ],
+    int | None,
+]:
+    """Classify an all-replica failure without overclaiming a single cause."""
+
+    failed = tuple(
+        attempt
+        for attempt in attempts
+        if attempt.status in {"failed", "skipped_budget"}
+        and attempt.failure_kind is not None
+    )
+    if not failed:
+        return "provider_error", None
+    kinds = {attempt.failure_kind for attempt in failed}
+    if len(kinds) == 1:
+        failure_kind = next(iter(kinds))
+    elif kinds <= {"quota_exhausted", "rate_limited"}:
+        failure_kind = "rate_limited"
+    elif "provider_error" in kinds:
+        failure_kind = "provider_error"
+    elif "invalid_response" in kinds:
+        failure_kind = "invalid_response"
+    elif "timeout" in kinds:
+        failure_kind = "timeout"
+    else:
+        failure_kind = "request_budget_exhausted"
+    statuses = {
+        attempt.http_status
+        for attempt in failed
+        if attempt.http_status is not None
+    }
+    return failure_kind, next(iter(statuses)) if len(statuses) == 1 else None
+
+
+DESTINATION_SOURCE_REGISTRY: tuple[DestinationSourceCapability, ...] = (
+    DestinationSourceCapability(
+        key="ourairports",
+        display_name="OurAirports",
+        role="airport_identity",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="iata_airport_record",
+        source_url=OURAIRPORTS_CSV_URL,
+    ),
+    DestinationSourceCapability(
+        key="osm_nominatim",
+        display_name="OpenStreetMap Nominatim",
+        role="city_resolution",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="city_name_country_and_coordinates",
+        source_url=NOMINATIM_SEARCH_URL,
+    ),
+    DestinationSourceCapability(
+        key="osm_overpass_fossgis",
+        display_name="Overpass API by FOSSGIS",
+        role="place_discovery",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="osm_element_id_coordinates_and_permalink",
+        source_url=OVERPASS_URL,
+    ),
+    DestinationSourceCapability(
+        key="osm_overpass_vk_maps",
+        display_name="VK Maps Overpass API",
+        role="place_discovery",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="osm_element_id_coordinates_and_permalink",
+        source_url=OVERPASS_FALLBACK_URL,
+    ),
+    DestinationSourceCapability(
+        key="osm_overpass_private_coffee",
+        display_name="Private.coffee Overpass API",
+        role="place_discovery",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="osm_element_id_coordinates_and_permalink",
+        source_url=OVERPASS_PRIVATE_COFFEE_URL,
+    ),
+    DestinationSourceCapability(
+        key="wikidata_entities",
+        display_name="Wikidata Entity API",
+        role="identity_enrichment",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="same_wikidata_subject",
+        source_url=WIKIDATA_API_URL,
+    ),
+    DestinationSourceCapability(
+        key="wikipedia_zh",
+        display_name="Chinese Wikipedia API",
+        role="description_enrichment",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="same_wikipedia_sitelink",
+        source_url=WIKIPEDIA_API_URLS["zh"],
+    ),
+    DestinationSourceCapability(
+        key="wikipedia_en",
+        display_name="English Wikipedia API",
+        role="description_enrichment",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="same_wikipedia_sitelink",
+        source_url=WIKIPEDIA_API_URLS["en"],
+    ),
+    DestinationSourceCapability(
+        key="wikimedia_commons",
+        display_name="Wikimedia Commons API",
+        role="photo_evidence",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="same_commons_file_with_license",
+        source_url=WIKIMEDIA_COMMONS_API_URL,
+    ),
+    DestinationSourceCapability(
+        key="openstreetmap_osrm",
+        display_name="OpenStreetMap.de OSRM",
+        role="road_routing",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="provider_route_coordinates_and_times",
+        source_url=ROUTING_BASE_URL,
+    ),
+    DestinationSourceCapability(
+        key="transitous_motis",
+        display_name="Transitous MOTIS",
+        role="public_transit_routing",
+        adapter_status="active",
+        configured=True,
+        strict_evidence_requirement="provider_route_coordinates_and_times",
+        source_url=TRANSITOUS_SOURCES_URL,
+    ),
+    DestinationSourceCapability(
+        key="google_places",
+        display_name="Google Places",
+        role="rating_evidence",
+        adapter_status="catalogued",
+        configured=False,
+        strict_evidence_requirement="provider_place_id",
+        source_url="https://developers.google.com/maps/documentation/places/web-service",
+    ),
+    DestinationSourceCapability(
+        key="foursquare_places",
+        display_name="Foursquare Places",
+        role="rating_evidence",
+        adapter_status="catalogued",
+        configured=False,
+        strict_evidence_requirement="provider_place_id",
+        source_url="https://docs.foursquare.com/developer/reference/place-search",
+    ),
+    DestinationSourceCapability(
+        key="opentripmap",
+        display_name="OpenTripMap",
+        role="place_discovery",
+        adapter_status="catalogued",
+        configured=False,
+        strict_evidence_requirement="provider_place_id",
+        source_url="https://dev.opentripmap.org/product",
+    ),
+)
+
+
 class AttractionRatingSourceCapability(_StrictModel):
     """A known rating-source capability, not evidence that a score was returned."""
 
@@ -208,6 +538,7 @@ class AttractionRatingSourceCapability(_StrictModel):
     display_name: str = Field(min_length=1, max_length=100)
     capability: Literal["ratings", "ratings_and_reviews"]
     adapter_status: Literal["active", "catalogued"]
+    configured: bool
     exact_match_requirement: Literal[
         "wikidata_subject_and_issuer",
         "provider_place_id",
@@ -215,6 +546,14 @@ class AttractionRatingSourceCapability(_StrictModel):
     evidence_policy: Literal["capability_only_not_query_evidence"] = (
         "capability_only_not_query_evidence"
     )
+
+    @model_validator(mode="after")
+    def rating_capability_is_honest(self) -> AttractionRatingSourceCapability:
+        if self.adapter_status == "active" and not self.configured:
+            raise ValueError("active rating source capabilities must be configured")
+        if self.adapter_status == "catalogued" and self.configured:
+            raise ValueError("catalogued rating sources cannot be marked configured")
+        return self
 
 
 ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
@@ -226,6 +565,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Wikidata review score statements",
         capability="ratings",
         adapter_status="active",
+        configured=True,
         exact_match_requirement="wikidata_subject_and_issuer",
     ),
     AttractionRatingSourceCapability(
@@ -233,6 +573,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Google Places",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -240,6 +581,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Tripadvisor",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -247,6 +589,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Yelp",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -254,6 +597,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Foursquare",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -261,6 +605,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Viator",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -268,6 +613,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Tiqets",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -275,6 +621,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Klook",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -282,6 +629,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="GetYourGuide",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -289,6 +637,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Trip.com",
         capability="ratings_and_reviews",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -296,6 +645,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Apple Maps",
         capability="ratings",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
     AttractionRatingSourceCapability(
@@ -303,6 +653,7 @@ ATTRACTION_RATING_SOURCE_REGISTRY: tuple[
         display_name="Bing Maps",
         capability="ratings",
         adapter_status="catalogued",
+        configured=False,
         exact_match_requirement="provider_place_id",
     ),
 )
@@ -332,7 +683,7 @@ class DestinationCoverageNotice(_StrictModel):
 
 
 class DestinationCoverage(_StrictModel):
-    coverage_radius_km: Literal[5, 15, 30]
+    coverage_radius_km: Literal[1, 5, 15, 30]
     coverage_status: Literal["complete", "partial"]
     coverage_reason: Literal[
         "full_radius_queried",
@@ -345,6 +696,11 @@ class DestinationCoverage(_StrictModel):
     query_parts_succeeded: int = Field(default=1, ge=0, le=16)
     query_parts_total: int = Field(default=1, ge=1, le=16)
     provider_truncated: bool = False
+    provider_attempts: tuple[DestinationProviderAttempt, ...] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+    served_from_stale_cache: bool = False
 
     @model_validator(mode="after")
     def coverage_is_consistent(self) -> DestinationCoverage:
@@ -364,6 +720,12 @@ class DestinationCoverage(_StrictModel):
                 raise ValueError("partial coverage requires partial=true")
             if self.coverage_reason == "full_radius_queried":
                 raise ValueError("partial coverage cannot report a full-radius reason")
+        if self.served_from_stale_cache and (
+            self.coverage_status != "partial"
+            or self.coverage_reason != "provider_failure"
+            or not self.provider_attempts
+        ):
+            raise ValueError("stale cache requires failed provider attempt evidence")
         return self
 
 
@@ -566,7 +928,7 @@ class DestinationPlaceList(_StrictModel):
     result_count: int = Field(ge=0, le=MAX_PLACES_PER_KIND)
     fetched_at: datetime
     expires_at: datetime
-    coverage_radius_km: Literal[5, 15, 30]
+    coverage_radius_km: Literal[1, 5, 15, 30]
     coverage_status: Literal["complete", "partial"]
     coverage_reason: Literal[
         "full_radius_queried",
@@ -579,6 +941,19 @@ class DestinationPlaceList(_StrictModel):
     query_parts_succeeded: int = Field(default=1, ge=0, le=16)
     query_parts_total: int = Field(default=1, ge=1, le=16)
     provider_truncated: bool = False
+    provider_attempts: tuple[DestinationProviderAttempt, ...] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+    served_from_stale_cache: bool = False
+    destination_source_capabilities: tuple[
+        DestinationSourceCapability,
+        ...,
+    ] = Field(
+        default=DESTINATION_SOURCE_REGISTRY,
+        min_length=10,
+        max_length=30,
+    )
     attraction_rating_source_capabilities: tuple[
         AttractionRatingSourceCapability,
         ...,
@@ -613,6 +988,8 @@ class DestinationPlaceList(_StrictModel):
             query_parts_succeeded=self.query_parts_succeeded,
             query_parts_total=self.query_parts_total,
             provider_truncated=self.provider_truncated,
+            provider_attempts=self.provider_attempts,
+            served_from_stale_cache=self.served_from_stale_cache,
         )
         return self
 
@@ -926,6 +1303,14 @@ class DestinationPlaceDetail(_StrictModel):
     city: DestinationCity
     place: DestinationPlace
     transport: DestinationTransport
+    destination_source_capabilities: tuple[
+        DestinationSourceCapability,
+        ...,
+    ] = Field(
+        default=DESTINATION_SOURCE_REGISTRY,
+        min_length=10,
+        max_length=30,
+    )
     attraction_rating_source_capabilities: tuple[
         AttractionRatingSourceCapability,
         ...,
@@ -1024,16 +1409,48 @@ class BoundedJsonHttpClient:
                         "destination provider returned a non-success status"
                     )
                 payload = response.read(max_response_bytes + 1)
-        except (error.HTTPError, error.URLError, OSError, TimeoutError, ValueError) as exc:
-            raise DestinationDataUnavailable("destination provider request failed") from exc
+        except error.HTTPError as exc:
+            status = int(exc.code)
+            failure_kind: Literal[
+                "rate_limited",
+                "quota_exhausted",
+                "provider_error",
+            ]
+            if status == 429:
+                failure_kind = "rate_limited"
+            elif status in {402, 509}:
+                failure_kind = "quota_exhausted"
+            else:
+                failure_kind = "provider_error"
+            raise DestinationDataUnavailable(
+                "destination provider request failed",
+                failure_kind=failure_kind,
+                http_status=status,
+            ) from exc
+        except (error.URLError, OSError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", None)
+            timed_out = isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError)
+            raise DestinationDataUnavailable(
+                "destination provider request failed",
+                failure_kind="timeout" if timed_out else "provider_error",
+            ) from exc
+        except ValueError as exc:
+            raise DestinationDataUnavailable(
+                "destination provider request failed",
+                failure_kind="invalid_response",
+            ) from exc
         if len(payload) > max_response_bytes:
             raise DestinationDataUnavailable(
-                "destination provider response exceeded the byte limit"
+                "destination provider response exceeded the byte limit",
+                failure_kind="invalid_response",
             )
         try:
             return json.loads(payload.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
-            raise DestinationDataUnavailable("destination provider returned invalid JSON") from exc
+            raise DestinationDataUnavailable(
+                "destination provider returned invalid JSON",
+                failure_kind="invalid_response",
+            ) from exc
 
 
 MunicipalityResolver = Callable[[str], str | None]
@@ -1145,13 +1562,17 @@ class _TtlCache:
         *,
         ttl: timedelta = DESTINATION_CACHE_TTL,
         max_entries: int | None = None,
+        stale_retention: timedelta = timedelta(0),
     ) -> None:
         if ttl <= timedelta(0):
             raise ValueError("cache TTL must be positive")
         if max_entries is not None and max_entries < 1:
             raise ValueError("cache max_entries must be positive")
+        if stale_retention < timedelta(0):
+            raise ValueError("stale cache retention cannot be negative")
         self._clock = clock
         self._ttl_seconds = ttl.total_seconds()
+        self._stale_retention_seconds = stale_retention.total_seconds()
         self._max_entries = max_entries
         self._values: dict[tuple[Any, ...], tuple[float, Any]] = {}
         self._lock = threading.Lock()
@@ -1164,9 +1585,24 @@ class _TtlCache:
                 return None
             expires_at, value = cached
             if now >= expires_at:
-                self._values.pop(key, None)
                 return None
             return value
+
+    def get_stale(self, key: tuple[Any, ...]) -> Any | None:
+        """Return an expired value only inside the explicit stale-if-error window."""
+
+        now = self._clock()
+        with self._lock:
+            cached = self._values.get(key)
+            if cached is None:
+                return None
+            expires_at, value = cached
+            if now < expires_at:
+                return value
+            if now < expires_at + self._stale_retention_seconds:
+                return value
+            self._values.pop(key, None)
+            return None
 
     def set(
         self,
@@ -1183,7 +1619,7 @@ class _TtlCache:
             expired = [
                 existing_key
                 for existing_key, (expires_at, _) in self._values.items()
-                if now >= expires_at
+                if now >= expires_at + self._stale_retention_seconds
             ]
             for existing_key in expired:
                 self._values.pop(existing_key, None)
@@ -1239,7 +1675,11 @@ class DestinationGuideService:
             sleeper=sleeper,
         )
         self._city_cache = _TtlCache(monotonic_clock)
-        self._place_cache = _TtlCache(monotonic_clock)
+        self._place_cache = _TtlCache(
+            monotonic_clock,
+            max_entries=512,
+            stale_retention=STALE_DESTINATION_CACHE_TTL,
+        )
         self._route_cache = _TtlCache(monotonic_clock)
         self._transit_cache = _TtlCache(
             monotonic_clock,
@@ -1309,6 +1749,8 @@ class DestinationGuideService:
             query_parts_succeeded=coverage.query_parts_succeeded,
             query_parts_total=coverage.query_parts_total,
             provider_truncated=coverage.provider_truncated,
+            provider_attempts=coverage.provider_attempts,
+            served_from_stale_cache=coverage.served_from_stale_cache,
         )
 
     def get_place_detail(
@@ -1488,6 +1930,121 @@ class DestinationGuideService:
             source=source,
         )
 
+    def _query_overpass_with_failover(
+        self,
+        *,
+        query: str,
+        kind: PlaceKind,
+        city: DestinationCity,
+        radius_meters: int,
+        preferred_endpoint: str,
+        operation_started: float,
+        operation_budget_seconds: float,
+        request_timeout_seconds: float,
+    ) -> tuple[
+        tuple[DestinationPlace, ...] | None,
+        Any,
+        str,
+        tuple[DestinationProviderAttempt, ...],
+    ]:
+        """Query every configured global replica until strict evidence is available.
+
+        A non-empty response is self-verifying because every retained record must
+        include a valid OSM element type/id, coordinates, recognised tags, and the
+        corresponding permanent OSM link.  An empty response is weaker evidence:
+        two replicas must agree before it is treated as a genuine empty tile.
+        """
+
+        attempts: list[DestinationProviderAttempt] = []
+        empty_responses: list[tuple[Any, str]] = []
+        endpoints = _ordered_overpass_endpoints(preferred_endpoint)
+        for endpoint in endpoints:
+            remaining_budget = operation_budget_seconds - (
+                self._clock() - operation_started
+            )
+            source_key = OVERPASS_SOURCE_KEYS[endpoint]
+            endpoint_host = parse.urlsplit(endpoint).hostname or "unknown.invalid"
+            if remaining_budget <= 0.05:
+                attempts.append(
+                    DestinationProviderAttempt(
+                        source_key=source_key,
+                        endpoint_host=endpoint_host,
+                        status="skipped_budget",
+                        failure_kind="request_budget_exhausted",
+                    )
+                )
+                break
+            try:
+                self._overpass_limiter.wait()
+                remaining_budget = operation_budget_seconds - (
+                    self._clock() - operation_started
+                )
+                if remaining_budget <= 0.05:
+                    attempts.append(
+                        DestinationProviderAttempt(
+                            source_key=source_key,
+                            endpoint_host=endpoint_host,
+                            status="skipped_budget",
+                            failure_kind="request_budget_exhausted",
+                        )
+                    )
+                    break
+                payload = self.client.request_json(
+                    "POST",
+                    endpoint,
+                    data={"data": query},
+                    headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                    timeout_seconds=min(
+                        self.timeout_seconds,
+                        request_timeout_seconds,
+                        remaining_budget,
+                    ),
+                    max_response_bytes=MAX_OVERPASS_BYTES,
+                )
+                places = _parse_overpass_places(
+                    payload,
+                    kind,
+                    city.latitude,
+                    city.longitude,
+                    radius_meters=radius_meters,
+                )
+            except DestinationGuideError as exc:
+                failure_kind = getattr(exc, "failure_kind", "provider_error")
+                http_status = getattr(exc, "http_status", None)
+                attempts.append(
+                    DestinationProviderAttempt(
+                        source_key=source_key,
+                        endpoint_host=endpoint_host,
+                        status="failed",
+                        failure_kind=failure_kind,
+                        http_status=http_status,
+                    )
+                )
+                continue
+            if places:
+                attempts.append(
+                    DestinationProviderAttempt(
+                        source_key=source_key,
+                        endpoint_host=endpoint_host,
+                        status="succeeded",
+                        result_count=len(places),
+                    )
+                )
+                return places, payload, endpoint, tuple(attempts)
+            attempts.append(
+                DestinationProviderAttempt(
+                    source_key=source_key,
+                    endpoint_host=endpoint_host,
+                    status="empty_response",
+                    result_count=0,
+                )
+            )
+            empty_responses.append((payload, endpoint))
+            if len(empty_responses) >= min(2, len(OVERPASS_ENDPOINTS)):
+                confirmed_payload, confirmed_endpoint = empty_responses[-1]
+                return (), confirmed_payload, confirmed_endpoint, tuple(attempts)
+        return None, None, preferred_endpoint, tuple(attempts)
+
     def _load_attraction_places(
         self,
         code: str,
@@ -1500,15 +2057,15 @@ class DestinationGuideService:
     ]:
         """Query a bounded city-centred area in independent parts.
 
-        A single 60 km-wide Overpass request is fragile in large cities.  Four
-        independently retryable quadrants preserve real results from successful
-        parts and make incomplete coverage explicit instead of collapsing the
-        complete attraction page.
+        A single 60 km-wide Overpass request is fragile in large cities.  A fast
+        5 km seed query first preserves useful strict records; nine independently
+        retryable expansion cells then keep each wider public query bounded.  Failed
+        expansion parts never erase successful real records.
         """
 
         key = (
             code,
-            "attraction-city-tiles-v2",
+            "attraction-city-tiles-v3",
             round(city.latitude, 6),
             round(city.longitude, 6),
             city.scope,
@@ -1516,70 +2073,85 @@ class DestinationGuideService:
         cached = self._place_cache.get(key)
         if isinstance(cached, tuple) and len(cached) == 4:
             return cached
+        stale = self._place_cache.get_stale(key)
 
-        query_bounds = _attraction_query_bounds(city.latitude, city.longitude)
+        query_plan = (
+            (
+                _bounding_box(city.latitude, city.longitude, OVERPASS_RADIUS_METERS[0]),
+                OVERPASS_RADIUS_METERS[0],
+            ),
+            *(
+                (bounds, DESTINATION_RADIUS_METERS)
+                for bounds in _attraction_query_bounds(city.latitude, city.longitude)
+            ),
+        )
         operation_started = self._clock()
         preferred_endpoint = OVERPASS_URL
         successful_parts = 0
         provider_truncated = False
         by_id: dict[str, DestinationPlace] = {}
+        provider_attempts: list[DestinationProviderAttempt] = []
 
-        for bounds in query_bounds:
+        for bounds, clip_radius_meters in query_plan:
             remaining_budget = ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS - (
                 self._clock() - operation_started
             )
             if remaining_budget <= 0:
                 break
             query = _attraction_overpass_query(bounds)
-            tile_places: tuple[DestinationPlace, ...] | None = None
-            tile_payload: Any = None
-            endpoints = (
-                preferred_endpoint,
-                next(endpoint for endpoint in OVERPASS_ENDPOINTS if endpoint != preferred_endpoint),
+            (
+                tile_places,
+                tile_payload,
+                successful_endpoint,
+                tile_attempts,
+            ) = self._query_overpass_with_failover(
+                query=query,
+                kind="attraction",
+                city=city,
+                radius_meters=clip_radius_meters,
+                preferred_endpoint=preferred_endpoint,
+                operation_started=operation_started,
+                operation_budget_seconds=ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS,
+                request_timeout_seconds=ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS,
             )
-            for endpoint in endpoints:
-                try:
-                    self._overpass_limiter.wait()
-                    remaining_budget = ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS - (
-                        self._clock() - operation_started
-                    )
-                    if remaining_budget <= 0:
-                        break
-                    tile_payload = self.client.request_json(
-                        "POST",
-                        endpoint,
-                        data={"data": query},
-                        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-                        timeout_seconds=min(
-                            self.timeout_seconds,
-                            ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS,
-                            remaining_budget,
-                        ),
-                        max_response_bytes=MAX_OVERPASS_BYTES,
-                    )
-                    tile_places = _parse_overpass_places(
-                        tile_payload,
-                        "attraction",
-                        city.latitude,
-                        city.longitude,
-                        radius_meters=DESTINATION_RADIUS_METERS,
-                    )
-                except DestinationGuideError:
-                    continue
-                preferred_endpoint = endpoint
-                break
+            provider_attempts.extend(tile_attempts)
             if tile_places is None:
                 continue
+            preferred_endpoint = successful_endpoint
             successful_parts += 1
             provider_truncated = provider_truncated or _overpass_payload_hit_limit(tile_payload)
             for place in tile_places:
                 existing = by_id.get(place.place_id)
                 if existing is None or _place_completeness(place) > _place_completeness(existing):
                     by_id[place.place_id] = place
+            if (
+                len(by_id) >= MAX_INTERNAL_PLACES_PER_KIND
+                and provider_truncated
+            ):
+                break
 
         if successful_parts == 0:
+            if isinstance(stale, tuple) and len(stale) == 4:
+                stale_places, fetched_at, expires_at, stale_coverage = stale
+                return (
+                    stale_places,
+                    fetched_at,
+                    expires_at,
+                    _stale_provider_failure_coverage(
+                        kind="attraction",
+                        previous=stale_coverage,
+                        attempts=tuple(provider_attempts),
+                        query_parts_total=len(query_plan),
+                    ),
+                )
+            failure_kind, http_status = _aggregate_destination_attempt_failure(
+                tuple(provider_attempts)
+            )
             raise DestinationDataUnavailable(
-                "OpenStreetMap attraction coverage is temporarily unavailable"
+                "OpenStreetMap attraction coverage is temporarily unavailable",
+                failure_kind=failure_kind,
+                http_status=http_status,
+                provider_attempts=tuple(provider_attempts),
             )
 
         ordered = tuple(
@@ -1598,9 +2170,10 @@ class DestinationGuideService:
         fetched_at = _aware_utc(self._wall_clock())
         coverage = _attraction_coverage(
             successful_parts=successful_parts,
-            total_parts=len(query_bounds),
+            total_parts=len(query_plan),
             provider_truncated=provider_truncated or internal_truncated,
             result_count=len(places),
+            provider_attempts=tuple(provider_attempts),
         )
         cache_ttl = PARTIAL_DESTINATION_CACHE_TTL if coverage.partial else DESTINATION_CACHE_TTL
         value = (places, fetched_at, fetched_at + cache_ttl, coverage)
@@ -1620,69 +2193,54 @@ class DestinationGuideService:
     ]:
         if kind == "attraction":
             return self._load_attraction_places(code, city)
-        key = (code, kind, round(city.latitude, 6), round(city.longitude, 6), city.scope)
+        key = (
+            code,
+            f"{kind}-overpass-bounded-v3",
+            round(city.latitude, 6),
+            round(city.longitude, 6),
+            city.scope,
+        )
         cached = self._place_cache.get(key)
         if isinstance(cached, tuple) and len(cached) == 4:
             return cached
+        stale = self._place_cache.get_stale(key)
         by_id: dict[str, DestinationPlace] = {}
         operation_started = self._clock()
-        fallback_used = False
+        preferred_endpoint = OVERPASS_URL
         last_successful_radius_meters: int | None = None
         expansion_failed = False
-        for radius_meters in OVERPASS_RADIUS_METERS:
-            query = _overpass_query(
-                kind,
-                city.latitude,
-                city.longitude,
+        successful_parts = 0
+        provider_attempts: list[DestinationProviderAttempt] = []
+        query_plan = _hotel_query_plan(city.latitude, city.longitude)
+        for bounds, radius_meters in query_plan:
+            query = _hotel_overpass_query(bounds)
+            (
+                radius_places,
+                _,
+                successful_endpoint,
+                radius_attempts,
+            ) = self._query_overpass_with_failover(
+                query=query,
+                kind=kind,
+                city=city,
                 radius_meters=radius_meters,
+                preferred_endpoint=preferred_endpoint,
+                operation_started=operation_started,
+                operation_budget_seconds=OVERPASS_OPERATION_BUDGET_SECONDS,
+                request_timeout_seconds=OVERPASS_REQUEST_TIMEOUT_SECONDS,
             )
-            radius_places: tuple[DestinationPlace, ...] | None = None
-            last_error: DestinationGuideError | None = None
-            endpoints = (OVERPASS_URL,) if fallback_used else (OVERPASS_URL, OVERPASS_FALLBACK_URL)
-            for endpoint in endpoints:
-                if endpoint == OVERPASS_FALLBACK_URL:
-                    fallback_used = True
-                try:
-                    self._overpass_limiter.wait()
-                    remaining_budget = OVERPASS_OPERATION_BUDGET_SECONDS - (
-                        self._clock() - operation_started
-                    )
-                    if remaining_budget <= 0:
-                        raise DestinationDataUnavailable(
-                            "OpenStreetMap request budget was exhausted"
-                        )
-                    payload = self.client.request_json(
-                        "POST",
-                        endpoint,
-                        data={"data": query},
-                        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-                        timeout_seconds=min(
-                            self.timeout_seconds,
-                            OVERPASS_REQUEST_TIMEOUT_SECONDS,
-                            remaining_budget,
-                        ),
-                        max_response_bytes=MAX_OVERPASS_BYTES,
-                    )
-                    radius_places = _parse_overpass_places(
-                        payload,
-                        kind,
-                        city.latitude,
-                        city.longitude,
-                        radius_meters=radius_meters,
-                    )
-                except DestinationGuideError as exc:
-                    last_error = exc
-                    continue
-                break
+            provider_attempts.extend(radius_attempts)
             if radius_places is None:
-                # A smaller-radius response is still real, source-backed data.  Keep it
-                # instead of discarding useful places when only a wider expansion fails.
-                if by_id:
-                    expansion_failed = True
+                # A seed failure across every replica is strong evidence of a
+                # provider outage; avoid multiplying the same failure over wider
+                # areas. Once any part has succeeded, later bounded parts remain
+                # independent and a failed quadrant does not erase real records.
+                expansion_failed = True
+                if successful_parts == 0 and not by_id:
                     break
-                raise DestinationDataUnavailable(
-                    "OpenStreetMap places are temporarily unavailable"
-                ) from last_error
+                continue
+            preferred_endpoint = successful_endpoint
+            successful_parts += 1
             last_successful_radius_meters = radius_meters
             for place in radius_places:
                 existing = by_id.get(place.place_id)
@@ -1690,6 +2248,29 @@ class DestinationGuideService:
                     by_id[place.place_id] = place
             if len(by_id) >= HOTEL_RESULT_TARGET:
                 break
+        if not by_id and expansion_failed:
+            if isinstance(stale, tuple) and len(stale) == 4:
+                stale_places, fetched_at, expires_at, stale_coverage = stale
+                return (
+                    stale_places,
+                    fetched_at,
+                    expires_at,
+                    _stale_provider_failure_coverage(
+                        kind=kind,
+                        previous=stale_coverage,
+                        attempts=tuple(provider_attempts),
+                        query_parts_total=len(query_plan),
+                    ),
+                )
+            failure_kind, http_status = _aggregate_destination_attempt_failure(
+                tuple(provider_attempts)
+            )
+            raise DestinationDataUnavailable(
+                "OpenStreetMap places are temporarily unavailable",
+                failure_kind=failure_kind,
+                http_status=http_status,
+                provider_attempts=tuple(provider_attempts),
+            )
         places = tuple(
             sorted(
                 by_id.values(),
@@ -1706,6 +2287,9 @@ class DestinationGuideService:
         coverage = _destination_coverage(
             last_successful_radius_meters,
             expansion_failed=expansion_failed,
+            query_parts_succeeded=successful_parts,
+            query_parts_total=len(query_plan),
+            provider_attempts=tuple(provider_attempts),
         )
         cache_ttl = PARTIAL_DESTINATION_CACHE_TTL if coverage.partial else DESTINATION_CACHE_TTL
         value = (places, fetched_at, fetched_at + cache_ttl, coverage)
@@ -2349,9 +2933,16 @@ def _destination_coverage(
     radius_meters: int,
     *,
     expansion_failed: bool,
+    query_parts_succeeded: int = 1,
+    query_parts_total: int = 1,
+    provider_attempts: tuple[DestinationProviderAttempt, ...] = (),
 ) -> DestinationCoverage:
     radius_km = radius_meters // 1_000
-    if radius_meters == DESTINATION_RADIUS_METERS and not expansion_failed:
+    if (
+        radius_meters == DESTINATION_RADIUS_METERS
+        and not expansion_failed
+        and query_parts_succeeded == query_parts_total
+    ):
         return DestinationCoverage(
             coverage_radius_km=30,
             coverage_status="complete",
@@ -2368,6 +2959,9 @@ def _destination_coverage(
                     f"at most {MAX_INTERNAL_PLACES_PER_KIND} internal records."
                 ),
             ),
+            query_parts_succeeded=query_parts_succeeded,
+            query_parts_total=query_parts_total,
+            provider_attempts=provider_attempts,
         )
     if expansion_failed:
         reason: Literal["result_target_reached", "provider_failure"] = "provider_failure"
@@ -2396,6 +2990,9 @@ def _destination_coverage(
         coverage_reason=reason,
         partial=True,
         coverage_notice=DestinationCoverageNotice(zh=zh, en=en),
+        query_parts_succeeded=query_parts_succeeded,
+        query_parts_total=query_parts_total,
+        provider_attempts=provider_attempts,
     )
 
 
@@ -2405,6 +3002,7 @@ def _attraction_coverage(
     total_parts: int,
     provider_truncated: bool,
     result_count: int,
+    provider_attempts: tuple[DestinationProviderAttempt, ...] = (),
 ) -> DestinationCoverage:
     if successful_parts == total_parts and not provider_truncated:
         return DestinationCoverage(
@@ -2428,6 +3026,7 @@ def _attraction_coverage(
             query_parts_succeeded=successful_parts,
             query_parts_total=total_parts,
             provider_truncated=False,
+            provider_attempts=provider_attempts,
         )
     if provider_truncated:
         reason: Literal["result_limit_reached", "provider_failure"] = "result_limit_reached"
@@ -2462,6 +3061,58 @@ def _attraction_coverage(
         query_parts_succeeded=successful_parts,
         query_parts_total=total_parts,
         provider_truncated=provider_truncated,
+        provider_attempts=provider_attempts,
+    )
+
+
+def _stale_provider_failure_coverage(
+    *,
+    kind: PlaceKind,
+    previous: DestinationCoverage,
+    attempts: tuple[DestinationProviderAttempt, ...],
+    query_parts_total: int,
+) -> DestinationCoverage:
+    safe_attempts = attempts or (
+        DestinationProviderAttempt(
+            source_key=OVERPASS_SOURCE_KEYS[OVERPASS_URL],
+            endpoint_host=parse.urlsplit(OVERPASS_URL).hostname or "overpass-api.de",
+            status="skipped_budget",
+            failure_kind="request_budget_exhausted",
+        ),
+    )
+    label_zh = "景点" if kind == "attraction" else "住宿地点"
+    label_en = "attraction" if kind == "attraction" else "accommodation"
+    return DestinationCoverage(
+        coverage_radius_km=previous.coverage_radius_km,
+        coverage_status="partial",
+        coverage_reason="provider_failure",
+        partial=True,
+        coverage_notice=DestinationCoverageNotice(
+            zh=(
+                f"当前公开数据端点暂时失败；页面保留最近一次严格验证的{label_zh}记录。"
+                "每条记录仍有真实 OSM 元素编号、坐标和来源链接，但可能不是最新状态。"
+            ),
+            en=(
+                f"Current public endpoints failed temporarily. The most recent strictly "
+                f"validated {label_en} records are retained. Every record still has a real "
+                "OSM element id, coordinates, and source link, but may not reflect the "
+                "latest state."
+            ),
+        ),
+        query_parts_succeeded=0,
+        query_parts_total=query_parts_total,
+        provider_truncated=False,
+        provider_attempts=safe_attempts,
+        served_from_stale_cache=True,
+    )
+
+
+def _ordered_overpass_endpoints(preferred_endpoint: str) -> tuple[str, ...]:
+    if preferred_endpoint not in OVERPASS_ENDPOINTS:
+        raise DestinationValidationError("preferred Overpass endpoint is not configured")
+    return (
+        preferred_endpoint,
+        *(endpoint for endpoint in OVERPASS_ENDPOINTS if endpoint != preferred_endpoint),
     )
 
 
@@ -3418,7 +4069,7 @@ def _overpass_query(
         kind,
         (south, west, north, east),
         query_timeout_seconds=OVERPASS_QUERY_TIMEOUT_SECONDS,
-        element_selector="nwr" if kind == "attraction" else "node",
+        element_selector="nwr",
     )
 
 
@@ -3431,11 +4082,73 @@ def _attraction_query_bounds(
         longitude,
         DESTINATION_RADIUS_METERS,
     )
-    return (
+    latitude_edges = tuple(
+        south + (north - south) * index / ATTRACTION_QUERY_GRID_SIZE
+        for index in range(ATTRACTION_QUERY_GRID_SIZE + 1)
+    )
+    longitude_edges = tuple(
+        west + (east - west) * index / ATTRACTION_QUERY_GRID_SIZE
+        for index in range(ATTRACTION_QUERY_GRID_SIZE + 1)
+    )
+    return tuple(
+        (
+            latitude_edges[row],
+            longitude_edges[column],
+            latitude_edges[row + 1],
+            longitude_edges[column + 1],
+        )
+        for row in range(ATTRACTION_QUERY_GRID_SIZE)
+        for column in range(ATTRACTION_QUERY_GRID_SIZE)
+    )
+
+
+def _hotel_query_plan(
+    latitude: float,
+    longitude: float,
+) -> tuple[tuple[tuple[float, float, float, float], int], ...]:
+    """Return small, independently retryable hotel-discovery areas.
+
+    Hotel tags are unusually dense in major cities. A 1 km seed normally returns
+    enough strict records quickly; four 5 km quadrants avoid the provider cost of
+    one large dense query, while the 15 km and 30 km bounds preserve progressive
+    coverage for sparse destinations.
+    """
+
+    south, west, north, east = _bounding_box(
+        latitude,
+        longitude,
+        OVERPASS_RADIUS_METERS[0],
+    )
+    quadrants = (
         (south, west, latitude, longitude),
         (south, longitude, latitude, east),
         (latitude, west, north, longitude),
         (latitude, longitude, north, east),
+    )
+    return (
+        (
+            _bounding_box(latitude, longitude, HOTEL_SEED_RADIUS_METERS),
+            HOTEL_SEED_RADIUS_METERS,
+        ),
+        *((bounds, OVERPASS_RADIUS_METERS[0]) for bounds in quadrants),
+        *(
+            (
+                _bounding_box(latitude, longitude, radius_meters),
+                radius_meters,
+            )
+            for radius_meters in OVERPASS_RADIUS_METERS[1:]
+        ),
+    )
+
+
+def _hotel_overpass_query(
+    bounds: tuple[float, float, float, float],
+) -> str:
+    return _overpass_bounded_query(
+        "hotel",
+        bounds,
+        query_timeout_seconds=OVERPASS_QUERY_TIMEOUT_SECONDS,
+        element_selector="nwr",
     )
 
 
@@ -3460,9 +4173,9 @@ def _overpass_bounded_query(
     south, west, north, east = bounds_tuple
     bounds = f"{south:.7f},{west:.7f},{north:.7f},{east:.7f}"
     if kind == "hotel":
+        categories = "|".join(re.escape(category) for category in HOTEL_CATEGORY_ORDER)
         selectors = [
-            f'{element_selector}({bounds})["tourism"="{category}"]["name"]'
-            for category in HOTEL_CATEGORY_ORDER
+            f'{element_selector}({bounds})["tourism"~"^({categories})$"]["name"]'
         ]
     else:
         selectors = [
@@ -3512,11 +4225,20 @@ def _parse_overpass_places(
     radius_meters: int,
 ) -> tuple[DestinationPlace, ...]:
     if not isinstance(payload, dict):
-        raise DestinationDataUnavailable("Overpass response is not an object")
+        raise DestinationDataUnavailable(
+            "Overpass response is not an object",
+            failure_kind="invalid_response",
+        )
     if _clean_text(payload.get("remark"), 1_000) is not None:
-        raise DestinationDataUnavailable("Overpass reported a provider runtime failure")
+        raise DestinationDataUnavailable(
+            "Overpass reported a provider runtime failure",
+            failure_kind="provider_error",
+        )
     if not isinstance(payload.get("elements"), list):
-        raise DestinationDataUnavailable("Overpass response is missing an elements list")
+        raise DestinationDataUnavailable(
+            "Overpass response is missing an elements list",
+            failure_kind="invalid_response",
+        )
     by_id: dict[str, DestinationPlace] = {}
     for raw in payload["elements"][:MAX_OVERPASS_ELEMENTS]:
         place = _parse_osm_element(raw, kind, centre_latitude, centre_longitude)
@@ -4466,6 +5188,7 @@ def _assert_allowed_outbound_url(url: str) -> None:
         ("nominatim.openstreetmap.org", "/reverse"),
         ("overpass-api.de", "/api/interpreter"),
         ("maps.mail.ru", "/osm/tools/overpass/api/interpreter"),
+        ("overpass.private.coffee", "/api/interpreter"),
         ("www.wikidata.org", "/w/api.php"),
         ("commons.wikimedia.org", "/w/api.php"),
         ("zh.wikipedia.org", "/w/api.php"),

@@ -13,7 +13,7 @@ services:
       - key: EXTERNAL_CONTEXT_ENABLED
         value: "1"
       - key: FLIGHT_OFFER_PROVIDER
-        value: serpapi
+        value: auto
       - key: SERPAPI_MONTHLY_LIMIT
         value: "250"
       - key: SITE_ACCESS_USERNAME
@@ -22,3 +22,15 @@ services:
         sync: false
       - key: SERPAPI_API_KEY
         sync: false
+      - key: SEARCHAPI_API_KEY
+        sync: false
+      - key: SEARCHAPI_LIFETIME_LIMIT
+        value: "100"
+      - key: IGNAV_API_KEY
+        sync: false
+      - key: IGNAV_LIFETIME_LIMIT
+        value: "1000"
+      - key: IGNAV_STRICT_RELEASE
+        value: "0"
+      - key: IGNAV_FREE_ACCOUNT_ATTESTED
+        value: "0"

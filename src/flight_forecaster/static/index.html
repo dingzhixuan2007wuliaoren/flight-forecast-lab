@@ -597,6 +597,146 @@
       font-weight: 640;
     }
 
+    .price-tracking {
+      margin: 18px 0 0;
+      padding: 20px 22px;
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius-lg);
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .price-tracking[hidden] { display: none; }
+
+    .price-tracking-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 13px;
+    }
+
+    .price-tracking-head h2 { margin: 0 0 4px; font-size: 18px; }
+    .price-tracking-head p { margin: 0; color: var(--slate-500); font-size: 10px; }
+
+    .tracking-current {
+      min-width: 190px;
+      padding: 10px 13px;
+      color: var(--navy-950);
+      border: 1px solid var(--blue-100);
+      border-radius: 12px;
+      background: var(--blue-50);
+      text-align: right;
+    }
+
+    .tracking-current span,
+    .tracking-current strong { display: block; }
+    .tracking-current span { color: var(--slate-500); font-size: 9px; }
+    .tracking-current strong { margin-top: 3px; font-size: 21px; }
+
+    .tracking-state {
+      padding: 18px;
+      color: var(--slate-600);
+      border: 1px dashed var(--slate-300);
+      border-radius: 12px;
+      background: var(--slate-50);
+      font-size: 11px;
+    }
+
+    .tracking-state[hidden],
+    .tracking-chart-wrap[hidden],
+    .tracking-about[hidden] { display: none; }
+
+    .tracking-chart-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--slate-100);
+      border-radius: 13px;
+      background: linear-gradient(180deg, #fbfdff, #fff);
+    }
+
+    .tracking-chart {
+      display: block;
+      width: 100%;
+      min-width: 680px;
+      height: auto;
+      min-height: 250px;
+    }
+
+    .tracking-grid { stroke: var(--slate-100); stroke-width: 1; }
+    .tracking-axis { fill: var(--slate-500); font-size: 10px; }
+    .tracking-history-line {
+      fill: none;
+      stroke: var(--blue-600);
+      stroke-width: 3;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .tracking-forecast-line {
+      fill: none;
+      stroke: var(--blue-600);
+      stroke-width: 3;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-dasharray: 6 6;
+    }
+    .tracking-point { fill: #fff; stroke: var(--blue-600); stroke-width: 2; }
+    .tracking-current-point { fill: var(--blue-600); stroke: #fff; stroke-width: 3; }
+    .tracking-average { stroke: var(--navy-800); stroke-width: 1; }
+
+    .tracking-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px 16px;
+      margin: 10px 1px 0;
+      color: var(--slate-500);
+      font-size: 9px;
+    }
+
+    .tracking-legend span::before {
+      display: inline-block;
+      width: 16px;
+      height: 3px;
+      margin-right: 5px;
+      border-radius: 3px;
+      background: var(--blue-600);
+      vertical-align: middle;
+      content: "";
+    }
+
+    .tracking-legend .forecast::before {
+      background: repeating-linear-gradient(90deg, var(--blue-600) 0 5px, transparent 5px 8px);
+    }
+
+    .tracking-about {
+      margin-top: 13px;
+      border-top: 1px solid var(--slate-100);
+    }
+
+    .tracking-about summary {
+      padding: 13px 0 2px;
+      color: var(--blue-700);
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 780;
+    }
+
+    .tracking-explanation {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .tracking-explanation article {
+      padding: 12px;
+      border: 1px solid var(--slate-100);
+      border-radius: 11px;
+      background: var(--slate-50);
+    }
+
+    .tracking-explanation h3 { margin: 0 0 5px; font-size: 11px; }
+    .tracking-explanation p { margin: 0; color: var(--slate-600); font-size: 9px; line-height: 1.55; }
+
     .section-heading {
       display: flex;
       align-items: flex-end;
@@ -1412,6 +1552,7 @@
       .context-summary { min-height: 0; }
       .route-banner { grid-template-columns: 1fr auto; }
       .route-meta { grid-column: 1 / -1; grid-row: 2; }
+      .tracking-explanation { grid-template-columns: 1fr; }
 
       .rank-toolbar { align-items: stretch; flex-direction: column; }
       .tabs { width: 100%; }
@@ -1472,6 +1613,9 @@
       .route-banner { gap: 17px; padding: 20px; }
       .generated-at { max-width: 125px; }
       .route-meta { gap: 9px 17px; }
+      .price-tracking { padding: 16px; }
+      .price-tracking-head { flex-direction: column; }
+      .tracking-current { min-width: 0; width: 100%; text-align: left; }
       .section-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
       .context-card { padding: 16px; }
       .provider-status-panel { grid-template-columns: 1fr; }
@@ -1628,6 +1772,44 @@
             <strong id="generated-time">—</strong>
           </div>
         </div>
+
+        <section id="price-tracking" class="price-tracking" aria-labelledby="price-tracking-title" aria-busy="false">
+          <div class="price-tracking-head">
+            <div>
+              <h2 id="price-tracking-title" data-i18n="priceTrackingTitle">价格追踪</h2>
+              <p data-i18n="priceTrackingHint">历史仅使用来源实际返回的同航线、日期与舱位市场观测；虚线为从当前最低已验证报价锚定的模型预测。</p>
+            </div>
+            <div class="tracking-current">
+              <span data-i18n="currentLowestPrice">当前最低已验证价格</span>
+              <strong id="tracking-current-price">—</strong>
+            </div>
+          </div>
+          <div id="tracking-state" class="tracking-state" role="status">—</div>
+          <div id="tracking-chart-wrap" class="tracking-chart-wrap" hidden>
+            <svg id="tracking-chart" class="tracking-chart" viewBox="0 0 900 280" role="img" aria-labelledby="tracking-chart-title tracking-chart-description"></svg>
+            <div class="tracking-legend">
+              <span data-i18n="trackingHistoryLegend">来源市场历史</span>
+              <span class="forecast" data-i18n="trackingForecastLegend">当前报价锚定预测</span>
+            </div>
+          </div>
+          <details id="tracking-about" class="tracking-about" hidden>
+            <summary data-i18n="aboutPriceTracking">关于价格追踪</summary>
+            <div class="tracking-explanation">
+              <article>
+                <h3 data-i18n="trackingCurrentHeading">当前价格</h3>
+                <p data-i18n="trackingCurrentExplanation">取本次严格验证航班中最低的一位成人、单程 USD 报价。仅当完整行程、正价格和安全购票路径全部通过验证时才显示。</p>
+              </article>
+              <article>
+                <h3 data-i18n="trackingHistoryHeading">价格历史</h3>
+                <p id="tracking-history-explanation" data-i18n="trackingHistoryExplanation">仅显示报价源为同航线、同出发日期及同舱位返回的市场观测；它不是某个航班、销售方或用户搜索记录的历史。</p>
+              </article>
+              <article>
+                <h3 data-i18n="trackingPredictionHeading">价格预测</h3>
+                <p data-i18n="trackingPredictionExplanation">预测把合成演示模型的第一点校准到当前已验证最低价，并逐日延伸至出发；会考虑航司、舱位、中转、提前期、星期、距离、时长和新闻，但不保证未来可购价格。</p>
+              </article>
+            </div>
+          </details>
+        </section>
 
         <div class="section-heading">
           <div>
@@ -1931,6 +2113,28 @@
           duration: "直飞基准时长",
           plannedTime: "计划出发日期",
           generatedAt: "本次查询响应时间",
+          priceTrackingTitle: "价格追踪",
+          priceTrackingHint: "历史仅使用来源实际返回的同航线、同出发日期与同舱位市场观测；虚线为从当前最低已验证报价锚定的模型预测。",
+          currentLowestPrice: "当前最低已验证价格",
+          trackingLoading: "正在读取最低已验证报价的价格轨迹…",
+          trackingUnavailable: "本次没有严格验证的当前报价，因此无法生成以当前价为锚点的预测。系统不会用估算价格冒充当前价格。",
+          trackingDetailUnavailable: "当前报价已验证，但价格追踪明细暂时无法读取；航班报价仍以列表中的验证时间为准。",
+          trackingHistoryUnavailable: "报价源没有返回同航线、同出发日期、同舱位的真实市场历史；历史最低价不可用，模型值不会冒充历史。",
+          trackingHistoryAvailable: "历史最低 {amount} · {count} 个来源市场观测",
+          trackingHistoryLegend: "来源市场历史",
+          trackingForecastLegend: "当前报价锚定预测",
+          aboutPriceTracking: "关于价格追踪",
+          trackingCurrentHeading: "当前价格",
+          trackingCurrentExplanation: "取本次严格验证航班中最低的一位成人、单程 USD 报价。仅当完整行程、正价格和安全购票路径全部通过验证时才显示。",
+          trackingHistoryHeading: "价格历史",
+          trackingHistoryExplanation: "仅显示报价源为同航线、同出发日期及同舱位返回的市场观测；它不是某个航班、销售方或用户搜索记录的历史。",
+          trackingPredictionHeading: "价格预测",
+          trackingPredictionExplanation: "预测把合成演示模型的第一点校准到当前已验证最低价，并逐日延伸至出发；会考虑航司、舱位、中转、提前期、星期、距离、时长和新闻，但不保证未来可购价格。",
+          trackingAverage: "平均",
+          trackingDeparture: "出发",
+          trackingCurrentMarker: "当前",
+          trackingChartTitle: "历史市场价格与未来模型预测",
+          trackingChartDescription: "实线为可用的来源市场历史，圆点为当前最低已验证报价，虚线为直到出发的模型预测。",
           contextTitle: "预测上下文",
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
           weather: "实时 / 预测航空天气",
@@ -2182,6 +2386,28 @@
           duration: "Direct baseline duration",
           plannedTime: "Planned departure date",
           generatedAt: "This response generated",
+          priceTrackingTitle: "Price tracking",
+          priceTrackingHint: "History uses only source-returned market observations for the same route, departure date, and cabin; the dotted line is a model forecast anchored to the current lowest verified fare.",
+          currentLowestPrice: "Current lowest verified price",
+          trackingLoading: "Loading the lowest verified fare's price trajectory…",
+          trackingUnavailable: "No current fare passed strict verification, so a current-price-anchored forecast cannot be generated. A model estimate is never substituted for the current price.",
+          trackingDetailUnavailable: "The current fare is verified, but price-tracking detail is temporarily unavailable; use the verification time shown in the flight list.",
+          trackingHistoryUnavailable: "The provider returned no real market history for the same route, departure date, and cabin. Historical low is unavailable; model values are never presented as history.",
+          trackingHistoryAvailable: "Historical low {amount} · {count} source market observation(s)",
+          trackingHistoryLegend: "Source market history",
+          trackingForecastLegend: "Current-fare-anchored forecast",
+          aboutPriceTracking: "About price tracking",
+          trackingCurrentHeading: "Current price",
+          trackingCurrentExplanation: "The lowest one-way, one-adult USD fare in this strictly verified response. It appears only after the complete itinerary, positive price, and safe booking path all pass verification.",
+          trackingHistoryHeading: "Price history",
+          trackingHistoryExplanation: "Only provider-returned market observations for the same route, departure date, and cabin are shown. This is not the history of a specific flight, seller, or traveller search.",
+          trackingPredictionHeading: "Price prediction",
+          trackingPredictionExplanation: "The synthetic-demo model is calibrated so its first point equals the current lowest verified fare, then projected daily until departure. It considers airline, cabin, stops, advance purchase, weekday, distance, duration, and news, but cannot guarantee a future bookable price.",
+          trackingAverage: "Avg",
+          trackingDeparture: "Departure",
+          trackingCurrentMarker: "Current",
+          trackingChartTitle: "Historical market prices and future model forecast",
+          trackingChartDescription: "The solid line is available source market history, the dot is the current lowest verified fare, and the dotted line is the model forecast until departure.",
           contextTitle: "Forecast context",
           contextHint: "Every card shows its data status, source, and observation time.",
           weather: "Live / forecast aviation weather",
@@ -2405,6 +2631,9 @@
       var providerStatusData = null;
       var destinationGuideSummary = null;
       var destinationGuideRequestKey = "";
+      var priceTrackingDetail = null;
+      var priceTrackingRequestKey = "";
+      var priceTrackingController = null;
       var sessionKey = "flight-forecast-session-v1";
       var activeComparison = null;
       var comparisonTimeoutMs = 600000;
@@ -2827,6 +3056,252 @@
       }
 
       function formatMoney(value) { return formatCurrency(value, "USD", 0); }
+
+      function svgElement(name, attributes, text) {
+        var element = document.createElementNS("http://www.w3.org/2000/svg", name);
+        Object.keys(attributes || {}).forEach(function (key) {
+          element.setAttribute(key, String(attributes[key]));
+        });
+        if (text !== undefined) element.textContent = String(text);
+        return element;
+      }
+
+      function priceTrackingKey(data, offer) {
+        return [
+          safeText(data && data.origin, ""),
+          safeText(data && data.destination, ""),
+          safeText(data && data.departure_date, "").slice(0, 10),
+          safeText(offer && offer.id, "")
+        ].join("|");
+      }
+
+      function resetPriceTracking(messageKey, currentAmount) {
+        byId("price-tracking").setAttribute("aria-busy", "false");
+        byId("tracking-current-price").textContent = currentAmount === undefined ?
+          "—" : formatCurrency(currentAmount, "USD", 2);
+        byId("tracking-state").hidden = false;
+        byId("tracking-state").textContent = t(messageKey);
+        byId("tracking-chart-wrap").hidden = true;
+        byId("tracking-chart").replaceChildren();
+        byId("tracking-about").hidden = false;
+        byId("tracking-history-explanation").textContent = t("trackingHistoryExplanation");
+      }
+
+      function chartTime(value) {
+        var parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+      }
+
+      function renderPriceTrackingChart(detail) {
+        var curve = detail && detail.price_curve && typeof detail.price_curve === "object" ?
+          detail.price_curve : {};
+        var forecast = (Array.isArray(curve.points) ? curve.points : []).map(function (point) {
+          return {
+            time: chartTime(point && (point.quote_time || point.quote_date)),
+            price: asNumber(point && point.estimated_price_usd),
+            kind: "forecast"
+          };
+        }).filter(function (point) { return point.time !== null && point.price !== null && point.price > 0; });
+        var historyContext = detail && detail.historical_market_context &&
+          typeof detail.historical_market_context === "object" ? detail.historical_market_context : null;
+        var history = (historyContext && Array.isArray(historyContext.points) ? historyContext.points : []).map(function (point) {
+          return {
+            time: chartTime(point && point.observed_at),
+            price: asNumber(point && point.price_usd),
+            kind: "history"
+          };
+        }).filter(function (point) { return point.time !== null && point.price !== null && point.price > 0; });
+        if (!forecast.length) return false;
+
+        var current = forecast[0];
+        var historyWithCurrent = history.concat([current]);
+        var all = history.concat(forecast);
+        var prices = all.map(function (point) { return point.price; });
+        var times = all.map(function (point) { return point.time; });
+        var minimumPrice = Math.min.apply(Math, prices);
+        var maximumPrice = Math.max.apply(Math, prices);
+        var pricePadding = Math.max(10, (maximumPrice - minimumPrice) * 0.18, maximumPrice * 0.04);
+        var yMinimum = Math.max(0, minimumPrice - pricePadding);
+        var yMaximum = maximumPrice + pricePadding;
+        if (yMaximum <= yMinimum) yMaximum = yMinimum + 1;
+        var xMinimum = Math.min.apply(Math, times);
+        var xMaximum = Math.max.apply(Math, times);
+        if (xMaximum <= xMinimum) xMaximum = xMinimum + 86_400_000;
+        var left = 58, right = 842, top = 24, bottom = 224;
+        function x(point) {
+          return left + ((point.time - xMinimum) / (xMaximum - xMinimum)) * (right - left);
+        }
+        function y(point) {
+          return bottom - ((point.price - yMinimum) / (yMaximum - yMinimum)) * (bottom - top);
+        }
+        function path(points) {
+          return points.map(function (point, index) {
+            return (index ? "L" : "M") + x(point).toFixed(2) + " " + y(point).toFixed(2);
+          }).join(" ");
+        }
+
+        var svg = byId("tracking-chart");
+        svg.replaceChildren();
+        svg.appendChild(svgElement("title", { id: "tracking-chart-title" }, t("trackingChartTitle")));
+        svg.appendChild(svgElement("desc", { id: "tracking-chart-description" }, t("trackingChartDescription")));
+        [top, (top + bottom) / 2, bottom].forEach(function (gridY) {
+          svg.appendChild(svgElement("line", {
+            x1: left, y1: gridY, x2: right, y2: gridY, class: "tracking-grid"
+          }));
+        });
+        var average = prices.reduce(function (sum, value) { return sum + value; }, 0) / prices.length;
+        var averageY = bottom - ((average - yMinimum) / (yMaximum - yMinimum)) * (bottom - top);
+        svg.appendChild(svgElement("line", {
+          x1: left, y1: averageY, x2: right, y2: averageY, class: "tracking-average"
+        }));
+        svg.appendChild(svgElement("text", {
+          x: right + 8, y: averageY + 4, class: "tracking-axis"
+        }, t("trackingAverage") + " " + formatCurrency(average, "USD", 0)));
+        svg.appendChild(svgElement("text", {
+          x: right + 8, y: top + 4, class: "tracking-axis"
+        }, formatCurrency(yMaximum, "USD", 0)));
+        svg.appendChild(svgElement("text", {
+          x: right + 8, y: bottom + 4, class: "tracking-axis"
+        }, formatCurrency(yMinimum, "USD", 0)));
+        if (historyWithCurrent.length > 1) {
+          svg.appendChild(svgElement("path", {
+            d: path(historyWithCurrent), class: "tracking-history-line"
+          }));
+        }
+        if (forecast.length > 1) {
+          svg.appendChild(svgElement("path", {
+            d: path(forecast), class: "tracking-forecast-line"
+          }));
+        }
+        history.forEach(function (point) {
+          var circle = svgElement("circle", {
+            cx: x(point), cy: y(point), r: 3.5, class: "tracking-point"
+          });
+          circle.appendChild(svgElement("title", {}, formatDate(point.time, false) + " · " +
+            formatCurrency(point.price, "USD", 2)));
+          svg.appendChild(circle);
+        });
+        var currentPoint = svgElement("circle", {
+          cx: x(current), cy: y(current), r: 7, class: "tracking-current-point"
+        });
+        currentPoint.appendChild(svgElement("title", {}, t("trackingCurrentMarker") + " · " +
+          formatCurrency(current.price, "USD", 2)));
+        svg.appendChild(currentPoint);
+        svg.appendChild(svgElement("text", {
+          x: Math.max(left, Math.min(right - 65, x(current) - 26)),
+          y: Math.max(top + 12, y(current) - 13),
+          class: "tracking-axis"
+        }, t("trackingCurrentMarker")));
+        svg.appendChild(svgElement("text", {
+          x: left, y: 257, class: "tracking-axis"
+        }, formatDate(xMinimum, false)));
+        svg.appendChild(svgElement("text", {
+          x: right - 42, y: 257, class: "tracking-axis"
+        }, t("trackingDeparture")));
+        return {
+          history: history,
+          current: current,
+          forecast: forecast,
+          historyContext: historyContext
+        };
+      }
+
+      function renderPriceTrackingDetail(detail) {
+        var offer = detail && detail.offer && typeof detail.offer === "object" ? detail.offer : {};
+        var fare = fareFor(offer);
+        var currentAmount = asNumber(fare && fare.total_amount);
+        var rendered = currentAmount !== null && currentAmount > 0 ?
+          renderPriceTrackingChart(detail) : false;
+        if (!rendered) {
+          resetPriceTracking("trackingDetailUnavailable", currentAmount === null ? undefined : currentAmount);
+          return;
+        }
+        byId("price-tracking").setAttribute("aria-busy", "false");
+        byId("tracking-current-price").textContent = formatCurrency(currentAmount, fare.currency || "USD", 2);
+        byId("tracking-chart-wrap").hidden = false;
+        byId("tracking-about").hidden = false;
+        byId("tracking-state").hidden = false;
+        var history = rendered.history;
+        if (history.length) {
+          var historicalLow = Math.min.apply(Math, history.map(function (point) { return point.price; }));
+          byId("tracking-state").textContent = fillTemplate("trackingHistoryAvailable", {
+            amount: formatCurrency(historicalLow, "USD", 2),
+            count: history.length
+          });
+          byId("tracking-history-explanation").textContent = localizedText(
+            rendered.historyContext && rendered.historyContext.notice,
+            t("trackingHistoryExplanation")
+          );
+        } else {
+          byId("tracking-state").textContent = t("trackingHistoryUnavailable");
+          byId("tracking-history-explanation").textContent = t("trackingHistoryUnavailable");
+        }
+      }
+
+      async function loadPriceTracking(data) {
+        var lowest = rankedOffers(data, "lowest_price").filter(hasConfirmedFareOffer)[0];
+        if (!lowest) {
+          if (priceTrackingController) priceTrackingController.abort();
+          priceTrackingController = null;
+          priceTrackingRequestKey = "";
+          priceTrackingDetail = null;
+          resetPriceTracking("trackingUnavailable");
+          return;
+        }
+        var key = priceTrackingKey(data, lowest);
+        if (priceTrackingDetail && priceTrackingDetail.key === key) {
+          renderPriceTrackingDetail(priceTrackingDetail.detail);
+          return;
+        }
+        if (priceTrackingRequestKey === key) return;
+        if (priceTrackingController) priceTrackingController.abort();
+        priceTrackingController = typeof AbortController === "function" ? new AbortController() : null;
+        priceTrackingRequestKey = key;
+        byId("price-tracking").setAttribute("aria-busy", "true");
+        byId("tracking-current-price").textContent = formatCurrency(
+          fareFor(lowest).total_amount,
+          fareFor(lowest).currency || "USD",
+          2
+        );
+        byId("tracking-state").hidden = false;
+        byId("tracking-state").textContent = t("trackingLoading");
+        byId("tracking-chart-wrap").hidden = true;
+        byId("tracking-about").hidden = false;
+        var controller = priceTrackingController;
+        var timeout = controller ? window.setTimeout(function () { controller.abort(); }, 65000) : null;
+        try {
+          var response = await fetch("/v1/offer-detail", {
+            method: "POST",
+            headers: { "Accept": "application/json", "Content-Type": "application/json" },
+            body: JSON.stringify({
+              origin: safeText(data.origin, "").toUpperCase(),
+              destination: safeText(data.destination, "").toUpperCase(),
+              departure_date: safeText(data.departure_date, "").slice(0, 10),
+              offer_id: safeText(lowest.id, ""),
+              force_refresh: false
+            }),
+            signal: controller ? controller.signal : undefined
+          });
+          var payload = {};
+          try { payload = await response.json(); } catch (error) { /* handled below */ }
+          if (!response.ok || !payload || typeof payload !== "object") {
+            throw new Error("price tracking unavailable");
+          }
+          if (priceTrackingRequestKey !== key || safeText(payload.offer && payload.offer.id, "") !== safeText(lowest.id, "")) return;
+          priceTrackingDetail = { key: key, detail: payload };
+          renderPriceTrackingDetail(payload);
+        } catch (error) {
+          if (priceTrackingRequestKey === key && (!error || error.name !== "AbortError" || controller === priceTrackingController)) {
+            resetPriceTracking("trackingDetailUnavailable", fareFor(lowest).total_amount);
+          }
+        } finally {
+          if (timeout !== null) window.clearTimeout(timeout);
+          if (priceTrackingRequestKey === key) {
+            priceTrackingRequestKey = "";
+            priceTrackingController = null;
+          }
+        }
+      }
 
       function formatProbability(value) {
         var number = asNumber(value);
@@ -3648,7 +4123,16 @@
           }
         }
         byId("empty-title").textContent = t(titleKey);
-        byId("empty-body").textContent = t(bodyKey);
+        var body = t(bodyKey);
+        var metadataNotice = localizedText(
+          data && data.fare_search_metadata && data.fare_search_metadata.notice,
+          ""
+        );
+        if (allConfirmed.length === 0 && hasValue(metadataNotice) &&
+            body.indexOf(metadataNotice) < 0) {
+          body += " " + metadataNotice;
+        }
+        byId("empty-body").textContent = body;
       }
 
       function warningText(warnings) {
@@ -3687,6 +4171,7 @@
           String(data.departure_time || "").slice(0, 10);
         byId("route-departure").textContent = formatDepartureDate(resolvedDeparture);
         byId("generated-time").textContent = formatDate(data.generated_at);
+        loadPriceTracking(data);
 
         renderContext("weather", context.weather, context.weather_feature_status);
         renderContext("operations", context.operations);

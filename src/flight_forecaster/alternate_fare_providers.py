@@ -2006,12 +2006,24 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
 
 
 class FallbackFlightOfferProvider:
-    """Run every strict provider and merge only independently verified offers."""
+    """Run every strict provider in order and merge verified offers.
+
+    Provider/account failures are isolated per source.  A transient source
+    failure receives exactly one whole-provider retry with ``force_refresh``;
+    authentication, quota, and complete no-result responses are terminal for
+    that source and immediately advance the chain.  This keeps failover honest
+    without spending scarce free calls retrying a known quota wall.
+    """
 
     _PASSIVE_STATUSES = {
         "not_configured",
         "budget_not_configured",
         "test_environment_rejected",
+    }
+    _CONTROLLED_RETRY_STATUSES = {
+        "provider_processing",
+        "provider_error",
+        "provider_unavailable",
     }
 
     def __init__(self, providers: tuple[Any, ...]) -> None:
@@ -2036,33 +2048,29 @@ class FallbackFlightOfferProvider:
         fetched_at: datetime,
         force_refresh: bool = False,
     ) -> FlightOfferSearchResult:
-        def run_provider(provider: Any) -> FlightOfferSearchResult:
+        def run_provider(
+            provider: Any,
+            *,
+            refresh: bool,
+        ) -> FlightOfferSearchResult:
             try:
                 return provider.search(
                     origin,
                     destination,
                     departure_date,
                     fetched_at=fetched_at,
-                    force_refresh=force_refresh,
+                    force_refresh=refresh,
                 )
             except Exception:
                 return _unexpected_provider_result(provider, fetched_at)
 
-        results_by_position: dict[int, FlightOfferSearchResult] = {}
-        with ThreadPoolExecutor(
-            max_workers=len(self.providers),
-            thread_name_prefix="strict-provider",
-        ) as pool:
-            futures = {
-                pool.submit(run_provider, provider): position
-                for position, provider in enumerate(self.providers)
-            }
-            for future in as_completed(futures):
-                results_by_position[futures[future]] = future.result()
-        results = [
-            results_by_position[position]
-            for position in range(len(self.providers))
-        ]
+        results: list[FlightOfferSearchResult] = []
+        for provider in self.providers:
+            first = run_provider(provider, refresh=force_refresh)
+            if first.status in self._CONTROLLED_RETRY_STATUSES:
+                second = run_provider(provider, refresh=True)
+                first = _controlled_provider_retry_result(first, second)
+            results.append(first)
 
         attempted = [
             result
@@ -2074,6 +2082,63 @@ class FallbackFlightOfferProvider:
         if len(attempted) > 1:
             return _aggregate_strict_provider_results(attempted)
         return results[-1]
+
+
+def _controlled_provider_retry_result(
+    first: FlightOfferSearchResult,
+    second: FlightOfferSearchResult,
+) -> FlightOfferSearchResult:
+    """Return the retry's evidence with conservative two-attempt accounting."""
+
+    if (
+        first.provider_code,
+        first.provider_name,
+    ) != (
+        second.provider_code,
+        second.provider_name,
+    ):
+        return first
+
+    marker_time = max(first.observed_at, second.observed_at)
+    marker = ProviderDiagnostic(
+        observed_at=marker_time,
+        stage="validation",
+        http_status=None,
+        exception_type="ControlledProviderRetry",
+        search_id=None,
+    )
+    diagnostics = tuple(
+        [*first.diagnostics[:4], marker, *second.diagnostics[-5:]]
+    )
+
+    def maximum_optional(left: int | None, right: int | None) -> int | None:
+        values = [value for value in (left, right) if value is not None]
+        return max(values) if values else None
+
+    return replace(
+        second,
+        observed_at=marker_time,
+        calls_used=first.calls_used + second.calls_used,
+        cache_hit=False,
+        search_calls_used=(
+            first.search_calls_used + second.search_calls_used
+        ),
+        pricing_calls_used=(
+            first.pricing_calls_used + second.pricing_calls_used
+        ),
+        search_monthly_used=maximum_optional(
+            first.search_monthly_used,
+            second.search_monthly_used,
+        ),
+        pricing_monthly_used=maximum_optional(
+            first.pricing_monthly_used,
+            second.pricing_monthly_used,
+        ),
+        archive_poll_count=(
+            first.archive_poll_count + second.archive_poll_count
+        ),
+        diagnostics=diagnostics,
+    )
 
 
 def _unexpected_provider_result(
@@ -2186,7 +2251,12 @@ def _aggregate_strict_provider_results(
     search_failed_cabin_count = sum(
         result.search_failed_cabin_count for result in results
     )
-    evaluated = any(result.coverage_status != "not_evaluated" for result in results)
+    # An aggregate has evaluated cross-provider coverage once two or more active
+    # sources have returned terminal run results, even when neither source
+    # reached candidate verification.  The individual runs retain their own
+    # ``not_evaluated`` status; the aggregate must still expose that provider
+    # failure and/or quota walls made the combined coverage incomplete.
+    evaluated = bool(results)
     provider_run_incomplete = any(
         result.status not in {"confirmed_offers", "no_results"}
         or result.coverage_status
@@ -2216,7 +2286,15 @@ def _aggregate_strict_provider_results(
         if result.quota_limit is not None
     }
     quota_limit = None
-    if quota_skipped_candidate_count or retry_quota_limited or quota_limited_runs:
+    quota_truncated_coverage = coverage_status in {
+        "quota_limited",
+        "quota_and_provider_incomplete",
+    }
+    unevaluated_quota_wall = (
+        coverage_status == "not_evaluated"
+        and status in {"rate_limited", "budget_exhausted"}
+    )
+    if quota_truncated_coverage or unevaluated_quota_wall:
         quota_limit = (
             next(iter(quota_limits))
             if len(quota_limits) == 1

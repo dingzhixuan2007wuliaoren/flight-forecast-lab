@@ -7,6 +7,7 @@ import os
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
@@ -20,6 +21,7 @@ from flight_forecaster.alternate_fare_providers import (
     read_alternate_provider_quota_snapshot,
 )
 from flight_forecaster.availability import read_serpapi_quota_snapshot
+from flight_forecaster.destination_guide import DESTINATION_SOURCE_REGISTRY
 from flight_forecaster.destination_routes import router as destination_router
 from flight_forecaster.quota_status import QuotaLedgerSnapshot
 from flight_forecaster.route_info import RouteLookupError
@@ -34,6 +36,7 @@ from flight_forecaster.schemas import (
     OnTimeRequest,
     PricePrediction,
     PriceRequest,
+    RuntimeDestinationCapability,
     RuntimeProviderStatusItem,
     RuntimeProviderStatusResponse,
     WeatherDetailResponse,
@@ -230,6 +233,51 @@ def _airlabs_quota_status(
         now=datetime.now(UTC),
     )
     return True, snapshot, limit
+
+
+def _destination_runtime_capabilities() -> list[RuntimeDestinationCapability]:
+    """Expose destination adapters without presenting them as fare sources."""
+
+    openstreetmap_keys = {
+        "osm_nominatim",
+        "osm_overpass_fossgis",
+        "osm_overpass_vk_maps",
+        "osm_overpass_private_coffee",
+        "openstreetmap_osrm",
+    }
+    wikimedia_keys = {
+        "wikidata_entities",
+        "wikipedia_zh",
+        "wikipedia_en",
+        "wikimedia_commons",
+    }
+    capabilities: list[RuntimeDestinationCapability] = []
+    for item in DESTINATION_SOURCE_REGISTRY:
+        if item.key == "ourairports":
+            family = "ourairports"
+        elif item.key in openstreetmap_keys:
+            family = "openstreetmap"
+        elif item.key in wikimedia_keys:
+            family = "wikimedia"
+        elif item.key == "transitous_motis":
+            family = "transitous"
+        else:
+            family = "optional_commercial"
+        capabilities.append(
+            RuntimeDestinationCapability(
+                code=item.key,
+                display_name=item.display_name,
+                role=item.role,
+                active=item.adapter_status == "active" and item.configured,
+                configured=item.configured,
+                strict_evidence_requirement=item.strict_evidence_requirement,
+                source_host=(urlsplit(item.source_url).hostname or "")
+                .rstrip(".")
+                .lower(),
+                data_family=family,
+            )
+        )
+    return capabilities
 
 
 def _runtime_provider_status(
@@ -749,13 +797,21 @@ def _runtime_provider_status(
             fare_status == "rate_limited"
             and rate_limit_scope in {"monthly", "lifetime"}
         )
-        if explicitly_exhausted and effective_limit is not None:
+        has_usage_observation = (
+            effective_used is not None
+            and (provider.quota_observed_at is not None or run_used is not None)
+        )
+        if (
+            explicitly_exhausted
+            and effective_limit is not None
+            and has_usage_observation
+        ):
             effective_remaining = 0
         has_measurement = (
             effective_used is not None
             and effective_limit is not None
             and effective_remaining is not None
-            and (provider.quota_observed_at is not None or run_used is not None)
+            and has_usage_observation
         )
         measurably_exhausted = has_measurement and effective_remaining == 0
         exhausted = has_measurement and (explicitly_exhausted or measurably_exhausted)
@@ -805,6 +861,7 @@ def _runtime_provider_status(
         generated_at=now,
         strict_policy=strict_notice,
         providers=providers,
+        destination_capabilities=_destination_runtime_capabilities(),
     )
 
 

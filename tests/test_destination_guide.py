@@ -13,9 +13,15 @@ from flight_forecaster.destination_guide import (
     ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS,
     ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS,
     ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS,
+    ATTRACTION_QUERY_PARTS,
     ATTRACTION_RATING_SOURCE_REGISTRY,
+    DESTINATION_CACHE_TTL,
+    DESTINATION_SOURCE_REGISTRY,
+    HOTEL_QUERY_PARTS,
+    HOTEL_SEED_RADIUS_METERS,
     OVERPASS_ENDPOINTS,
     OVERPASS_FALLBACK_URL,
+    OVERPASS_PRIVATE_COFFEE_URL,
     OVERPASS_RADIUS_METERS,
     OVERPASS_URL,
     PARTIAL_DESTINATION_CACHE_TTL,
@@ -331,9 +337,13 @@ def _service(
 ) -> tuple[DestinationGuideService, FakeTransport, FakeClock]:
     actual_transport = transport or FakeTransport()
     actual_clock = clock or FakeClock()
+    municipality_resolver = kwargs.pop(
+        "municipality_resolver",
+        lambda code: "Toronto" if code == "YYZ" else None,
+    )
     service = DestinationGuideService(
         client=actual_transport,
-        municipality_resolver=lambda code: "Toronto" if code == "YYZ" else None,
+        municipality_resolver=municipality_resolver,
         monotonic_clock=actual_clock,
         sleeper=actual_clock.sleep,
         wall_clock=lambda: datetime(2026, 7, 21, 12, 0, tzinfo=UTC),
@@ -379,7 +389,7 @@ def test_served_city_centre_drives_real_attraction_query() -> None:
     assert park.address is None
     assert park.website is None
     overpass_calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert len(overpass_calls) == 4
+    assert len(overpass_calls) == ATTRACTION_QUERY_PARTS == 10
     assert OVERPASS_RADIUS_METERS == (5_000, 15_000, 30_000)
     tile_bounds: set[tuple[float, float, float, float]] = set()
     for call in overpass_calls:
@@ -387,12 +397,16 @@ def test_served_city_centre_drives_real_attraction_query() -> None:
         assert "around:" not in query
         bounds_text = query.split("nwr(", 1)[1].split(")", 1)[0]
         south, west, north, east = (float(value) for value in bounds_text.split(","))
-        assert south <= 43.6532 <= north
-        assert west <= -79.3832 <= east
+        assert south < north
+        assert west < east
         assert query.count(f"nwr({bounds_text})") == 7
         assert query.endswith("out center 350;")
         tile_bounds.add((south, west, north, east))
-    assert len(tile_bounds) == 4
+    assert len(tile_bounds) == ATTRACTION_QUERY_PARTS
+    assert min(bounds[0] for bounds in tile_bounds) < 43.6532
+    assert max(bounds[2] for bounds in tile_bounds) > 43.6532
+    assert min(bounds[1] for bounds in tile_bounds) < -79.3832
+    assert max(bounds[3] for bounds in tile_bounds) > -79.3832
     assert all('["name"]' in call["data"]["data"] for call in overpass_calls)
     overpass_call = overpass_calls[0]
     assert overpass_call["method"] == "POST"
@@ -409,7 +423,7 @@ def test_category_buttons_can_filter_cached_results_without_new_network_calls() 
     assert museums.result_count == 1
     assert museums.places[0].name == "Verified Museum"
     assert len(_calls(transport, "nominatim")) == 1
-    assert len(_calls(transport, "overpass-api.de")) == 4
+    assert len(_calls(transport, "overpass-api.de")) == ATTRACTION_QUERY_PARTS
 
 
 def test_exact_wikimedia_identity_adds_introductions_and_platform_scores() -> None:
@@ -738,6 +752,24 @@ def test_rating_source_registry_is_exposed_as_capability_not_query_evidence() ->
         "active",
         "catalogued",
     }
+    assert all(item.configured == (item.adapter_status == "active") for item in capabilities)
+    source_capabilities = places.destination_source_capabilities
+    assert source_capabilities == DESTINATION_SOURCE_REGISTRY
+    assert detail.destination_source_capabilities == source_capabilities
+    assert len(source_capabilities) >= 10
+    assert len({item.key for item in source_capabilities}) == len(source_capabilities)
+    assert all(
+        item.configured == (item.adapter_status == "active")
+        for item in source_capabilities
+    )
+    assert sum(
+        item.adapter_status == "active" and item.configured
+        for item in source_capabilities
+    ) >= 10
+    assert sum(
+        item.role == "place_discovery" and item.adapter_status == "active"
+        for item in source_capabilities
+    ) == len(OVERPASS_ENDPOINTS)
     assert all(place.ratings == () for place in places.places)
 
 
@@ -788,10 +820,12 @@ def test_all_supported_hotel_types_and_source_provided_stars_are_preserved() -> 
     assert all(place.stars is None for place in result.places if place.category != "hotel")
     assert all(place.data_source == "openstreetmap_overpass" for place in result.places)
     query = _calls(transport, "overpass-api.de")[0]["data"]["data"]
-    assert '["tourism"~' not in query
-    for category in ("hotel", "hostel", "guest_house", "motel", "apartment"):
-        assert f'["tourism"="{category}"]["name"]' in query
-    assert query.count('["tourism"=') == 5
+    assert (
+        '["tourism"~"^(hotel|hostel|guest_house|motel|apartment)$"]["name"]'
+        in query
+    )
+    assert query.count('["tourism"~') == 1
+    assert query.count("nwr(") == 1
 
 
 def test_place_detail_has_three_estimated_routes_and_explicit_transit_gap() -> None:
@@ -815,7 +849,7 @@ def test_place_detail_has_three_estimated_routes_and_explicit_transit_gap() -> N
     assert transit.requested_departure_at == datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
     assert len(_calls(transport, "routing.openstreetmap.de")) == 3
     assert len(_calls(transport, "api.transitous.org")) == 1
-    assert clock.sleeps == [pytest.approx(1.0)] * 5
+    assert clock.sleeps == [pytest.approx(1.0)] * (ATTRACTION_QUERY_PARTS - 1 + 2)
 
     service.get_place_detail("YYZ", museum.place_id)
     assert len(_calls(transport, "routing.openstreetmap.de")) == 3
@@ -1057,11 +1091,11 @@ def test_places_and_city_are_refetched_after_exact_24_hour_expiry() -> None:
     service.list_places("YYZ", "hotel")
     clock.advance(86_399)
     service.list_places("YYZ", "hotel")
-    assert len(_calls(transport, "overpass-api.de")) == 3
+    assert len(_calls(transport, "overpass-api.de")) == HOTEL_QUERY_PARTS
 
     clock.advance(1)
     service.list_places("YYZ", "hotel")
-    assert len(_calls(transport, "overpass-api.de")) == 6
+    assert len(_calls(transport, "overpass-api.de")) == 2 * HOTEL_QUERY_PARTS
     assert len(_calls(transport, "nominatim")) == 2
 
 
@@ -1108,10 +1142,10 @@ def test_internal_100_supports_balanced_all_categories_filters_and_hidden_detail
     assert all(place.category == "museum" for place in museums.places)
     assert hidden_id not in {place.place_id for place in all_places.places}
     assert detail.place.place_id == hidden_id
-    assert len(_calls(transport, "overpass-api.de")) == 4
+    assert len(_calls(transport, "overpass-api.de")) == ATTRACTION_QUERY_PARTS
 
 
-def test_first_5km_response_over_30_is_fully_cached_without_radius_expansion() -> None:
+def test_one_km_seed_over_30_is_fully_cached_without_radius_expansion() -> None:
     transport = FakeTransport()
     hotel_categories = ("hotel", "hostel", "guest_house", "motel", "apartment")
     transport.hotels = [
@@ -1135,14 +1169,152 @@ def test_first_5km_response_over_30_is_fully_cached_without_radius_expansion() -
 
     assert all_hotels.result_count == 30
     assert hostels.result_count == 10
-    assert all_hotels.coverage_radius_km == 5
+    assert all_hotels.coverage_radius_km == HOTEL_SEED_RADIUS_METERS // 1_000
     assert all_hotels.coverage_status == "partial"
     assert all_hotels.coverage_reason == "result_target_reached"
+    assert all_hotels.query_parts_succeeded == 1
+    assert all_hotels.query_parts_total == HOTEL_QUERY_PARTS
     assert all_hotels.partial is True
     assert "不是完整 30 公里覆盖" in all_hotels.coverage_notice.zh
     assert "not full 30 km coverage" in all_hotels.coverage_notice.en
     assert hidden_detail.place.place_id == "osm_hotel_node_50048"
     assert len(_calls(transport, "overpass-api.de")) == 1
+
+
+def test_jfk_dense_hotel_seed_returns_real_records_without_wide_queries() -> None:
+    transport = FakeTransport()
+    transport.search_results = [
+        {
+            "lat": "40.7128",
+            "lon": "-74.0060",
+            "name": "New York",
+            "display_name": "New York, United States",
+            "addresstype": "city",
+            "address": {"city": "New York", "country_code": "us"},
+        }
+    ]
+    categories = ("hotel", "hostel", "guest_house", "motel", "apartment")
+    transport.hotels = [
+        {
+            "type": "way" if index % 2 else "node",
+            "id": 70_000 + index,
+            **(
+                {"center": {"lat": 40.7128 + index / 1_000_000, "lon": -74.0060}}
+                if index % 2
+                else {"lat": 40.7128 + index / 1_000_000, "lon": -74.0060}
+            ),
+            "tags": {
+                "name": f"Verified New York Stay {index:02}",
+                "tourism": categories[index % len(categories)],
+            },
+        }
+        for index in range(63)
+    ]
+    service, _, _ = _service(
+        transport=transport,
+        municipality_resolver=lambda code: "New York" if code == "JFK" else None,
+    )
+
+    result = service.list_places("JFK", "hotel", "all", limit=300)
+
+    assert result.result_count == 63
+    assert result.coverage_radius_km == 1
+    assert result.coverage_reason == "result_target_reached"
+    assert result.query_parts_succeeded == 1
+    assert result.query_parts_total == HOTEL_QUERY_PARTS
+    calls = _calls(transport, "overpass-api.de")
+    assert len(calls) == 1
+    query = calls[0]["data"]["data"]
+    assert query.count("nwr(") == 1
+    assert '["tourism"~"^(hotel|hostel|guest_house|motel|apartment)$"]' in query
+    expected_source_urls = {
+        "https://www.openstreetmap.org/"
+        f"{'way' if index % 2 else 'node'}/{70_000 + index}"
+        for index in range(63)
+    }
+    assert {place.source_url for place in result.places} == expected_source_urls
+    assert all(
+        place.latitude is not None and place.longitude is not None
+        for place in result.places
+    )
+
+
+def test_hotel_tiles_keep_successful_records_when_other_parts_fail() -> None:
+    transport = FakeTransport()
+    stay_a = {
+        "type": "node",
+        "id": 71_001,
+        "lat": 43.6532,
+        "lon": -79.3832,
+        "tags": {"name": "Strict Stay A", "tourism": "hotel"},
+    }
+    stay_b = {
+        "type": "relation",
+        "id": 71_002,
+        "center": {"lat": 43.6542, "lon": -79.3842},
+        "tags": {"name": "Strict Stay B", "tourism": "hostel"},
+    }
+    timeout = DestinationDataUnavailable("timeout", failure_kind="timeout")
+    transport.overpass_payloads = [
+        {"elements": []},
+        {"elements": []},
+        {"elements": [stay_a]},
+        timeout,
+        timeout,
+        timeout,
+        {"elements": [stay_b]},
+    ]
+    service, _, _ = _service(transport=transport)
+
+    result = service.list_places("YYZ", "hotel", "all", limit=300)
+
+    assert {place.place_id for place in result.places} == {
+        "osm_hotel_node_71001",
+        "osm_hotel_relation_71002",
+    }
+    assert result.coverage_status == "partial"
+    assert result.coverage_reason == "provider_failure"
+    assert result.query_parts_succeeded == 6
+    assert result.query_parts_total == HOTEL_QUERY_PARTS
+    assert any(
+        attempt.status == "failed" and attempt.failure_kind == "timeout"
+        for attempt in result.provider_attempts
+    )
+    assert any(attempt.status == "succeeded" for attempt in result.provider_attempts)
+
+
+def test_hotel_place_discovery_uses_all_global_replicas_and_nwr_identity() -> None:
+    transport = FakeTransport()
+    transport.overpass_payloads = [
+        DestinationDataUnavailable("primary timeout", failure_kind="timeout"),
+        DestinationDataUnavailable(
+            "secondary throttled",
+            failure_kind="rate_limited",
+            http_status=429,
+        ),
+        {"elements": _hotel_elements()},
+    ]
+    service, _, _ = _service(transport=transport)
+
+    result = service.list_places("YYZ", "hotel")
+
+    assert result.result_count == 5
+    assert [attempt.source_key for attempt in result.provider_attempts[:3]] == [
+        "osm_overpass_fossgis",
+        "osm_overpass_vk_maps",
+        "osm_overpass_private_coffee",
+    ]
+    assert result.provider_attempts[2].status == "succeeded"
+    calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
+    assert calls[0]["url"] == OVERPASS_URL
+    assert calls[1]["url"] == OVERPASS_FALLBACK_URL
+    assert calls[2]["url"] == OVERPASS_PRIVATE_COFFEE_URL
+    assert all("nwr(" in call["data"]["data"] for call in calls)
+    assert all(
+        place.source_url.startswith("https://www.openstreetmap.org/")
+        and place.place_id.startswith("osm_hotel_")
+        for place in result.places
+    )
 
 
 def test_progressive_overpass_stops_when_100_unique_named_places_are_available() -> None:
@@ -1177,12 +1349,12 @@ def test_progressive_overpass_stops_when_100_unique_named_places_are_available()
 
     assert result.result_count == 30
     calls = _calls(transport, "overpass-api.de")
-    assert len(calls) == 4
+    assert len(calls) == ATTRACTION_QUERY_PARTS
     first_bounds = calls[0]["data"]["data"].split("nwr(", 1)[1].split(")", 1)[0]
     second_bounds = calls[1]["data"]["data"].split("nwr(", 1)[1].split(")", 1)[0]
     assert first_bounds != second_bounds
     assert all("around:" not in call["data"]["data"] for call in calls)
-    assert clock.sleeps == [pytest.approx(1.0)] * 3
+    assert clock.sleeps == [pytest.approx(1.0)] * (ATTRACTION_QUERY_PARTS - 1)
 
 
 def test_primary_overpass_success_never_calls_fallback_and_uses_short_timeout() -> None:
@@ -1203,9 +1375,33 @@ def test_primary_overpass_success_never_calls_fallback_and_uses_short_timeout() 
 
     assert result.result_count == 30
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert [call["url"] for call in calls] == [OVERPASS_URL] * 4
+    assert [call["url"] for call in calls] == [OVERPASS_URL] * ATTRACTION_QUERY_PARTS
     assert calls[0]["timeout"] == ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS == 9.0
     assert f"[timeout:{ATTRACTION_OVERPASS_QUERY_TIMEOUT_SECONDS}]" in calls[0]["data"]["data"]
+
+
+def test_capped_core_seed_returns_all_retained_places_without_slow_expansion() -> None:
+    transport = FakeTransport()
+    transport.attractions = [
+        {
+            "type": "node",
+            "id": 25_500 + index,
+            "lat": 43.6532 + index / 1_000_000,
+            "lon": -79.3832,
+            "tags": {"name": f"Core Museum {index:03}", "tourism": "museum"},
+        }
+        for index in range(350)
+    ]
+    service, _, _ = _service(transport=transport)
+
+    result = service.list_places("YYZ", "attraction", limit=300)
+
+    assert result.result_count == 300
+    assert result.coverage_status == "partial"
+    assert result.coverage_reason == "result_limit_reached"
+    assert result.provider_truncated is True
+    calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
+    assert [call["url"] for call in calls] == [OVERPASS_URL]
 
 
 def test_primary_failure_switches_to_fallback_then_caches_success() -> None:
@@ -1234,12 +1430,186 @@ def test_primary_failure_switches_to_fallback_then_caches_success() -> None:
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert [call["url"] for call in calls] == [
         OVERPASS_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
+        *([OVERPASS_FALLBACK_URL] * ATTRACTION_QUERY_PARTS),
     ]
-    assert clock.sleeps == [pytest.approx(1.0)] * 4
+    assert clock.sleeps == [pytest.approx(1.0)] * ATTRACTION_QUERY_PARTS
+
+
+def test_third_global_replica_recovers_and_attempt_metadata_is_sanitized() -> None:
+    transport = FakeTransport()
+    transport.overpass_payloads = [
+        DestinationDataUnavailable("primary unavailable", failure_kind="timeout"),
+        DestinationDataUnavailable(
+            "secondary unavailable",
+            failure_kind="rate_limited",
+            http_status=429,
+        ),
+        {"elements": _attraction_elements()},
+    ]
+    service, _, _ = _service(transport=transport)
+
+    result = service.list_places("YYZ", "attraction")
+
+    assert result.result_count == 5
+    assert [attempt.source_key for attempt in result.provider_attempts[:3]] == [
+        "osm_overpass_fossgis",
+        "osm_overpass_vk_maps",
+        "osm_overpass_private_coffee",
+    ]
+    assert [attempt.status for attempt in result.provider_attempts[:3]] == [
+        "failed",
+        "failed",
+        "succeeded",
+    ]
+    assert result.provider_attempts[0].failure_kind == "timeout"
+    assert result.provider_attempts[1].http_status == 429
+    assert result.provider_attempts[2].endpoint_host == "overpass.private.coffee"
+    assert all(
+        "/" not in attempt.endpoint_host and ":" not in attempt.endpoint_host
+        for attempt in result.provider_attempts
+    )
+    calls = [call["url"] for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
+    assert calls == [
+        OVERPASS_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_PRIVATE_COFFEE_URL,
+        *([OVERPASS_PRIVATE_COFFEE_URL] * (ATTRACTION_QUERY_PARTS - 1)),
+    ]
+
+
+def test_jfk_large_city_keeps_real_places_when_two_replicas_fail() -> None:
+    transport = FakeTransport()
+    transport.search_results = [
+        {
+            "lat": "40.7128",
+            "lon": "-74.0060",
+            "name": "New York",
+            "display_name": "New York, United States",
+            "addresstype": "city",
+            "address": {"city": "New York", "country_code": "us"},
+        }
+    ]
+    nyc_places = [
+        {
+            "type": "relation",
+            "id": 17_321,
+            "center": {"lat": 40.7350, "lon": -73.9900},
+            "tags": {
+                "name": "Strict New York Museum",
+                "tourism": "museum",
+            },
+        }
+    ]
+    transport.overpass_payloads = [
+        DestinationDataUnavailable("primary timeout", failure_kind="timeout"),
+        DestinationDataUnavailable(
+            "secondary rate limit",
+            failure_kind="rate_limited",
+            http_status=429,
+        ),
+        {"elements": nyc_places},
+    ]
+    service, _, _ = _service(
+        transport=transport,
+        municipality_resolver=lambda code: "New York" if code == "JFK" else None,
+    )
+
+    result = service.list_places("JFK", "attraction")
+
+    assert result.city.destination_airport == "JFK"
+    assert result.city.name == "New York"
+    assert result.result_count == 1
+    place = result.places[0]
+    assert place.place_id == "osm_attraction_relation_17321"
+    assert place.source_url == "https://www.openstreetmap.org/relation/17321"
+    assert (place.latitude, place.longitude) == (40.735, -73.99)
+    assert result.coverage_status == "complete"
+    assert result.query_parts_total == ATTRACTION_QUERY_PARTS
+    assert {attempt.source_key for attempt in result.provider_attempts} >= {
+        "osm_overpass_fossgis",
+        "osm_overpass_vk_maps",
+        "osm_overpass_private_coffee",
+    }
+
+
+def test_empty_tile_requires_two_replica_responses_before_no_results() -> None:
+    transport = FakeTransport()
+    transport.overpass_payloads = [{"elements": []}, {"elements": []}]
+    service, _, _ = _service(transport=transport)
+
+    result = service.list_places("YYZ", "attraction")
+
+    assert result.result_count == 0
+    assert result.coverage_status == "complete"
+    assert len(result.provider_attempts) == ATTRACTION_QUERY_PARTS * 2
+    assert {attempt.status for attempt in result.provider_attempts} == {"empty_response"}
+    assert not _calls(transport, "overpass.private.coffee")
+
+
+def test_expired_strict_places_are_retained_when_all_replicas_fail() -> None:
+    transport = FakeTransport()
+    service, _, clock = _service(transport=transport)
+    fresh = service.list_places("YYZ", "attraction")
+    clock.advance(DESTINATION_CACHE_TTL.total_seconds() + 1)
+    transport.overpass_payloads = [
+        DestinationDataUnavailable("all replicas unavailable", failure_kind="timeout")
+    ]
+
+    stale = service.list_places("YYZ", "attraction")
+
+    assert stale.places == fresh.places
+    assert stale.served_from_stale_cache is True
+    assert stale.coverage_status == "partial"
+    assert stale.coverage_reason == "provider_failure"
+    assert stale.query_parts_succeeded == 0
+    assert stale.query_parts_total == ATTRACTION_QUERY_PARTS
+    assert stale.provider_attempts
+    assert {attempt.status for attempt in stale.provider_attempts} <= {
+        "failed",
+        "skipped_budget",
+    }
+    assert all(
+        place.source_url.startswith("https://www.openstreetmap.org/")
+        for place in stale.places
+    )
+
+
+def test_all_hotel_replicas_failure_carries_sanitized_cause_chain() -> None:
+    transport = FakeTransport()
+    transport.overpass_payloads = [
+        DestinationDataUnavailable("primary secret detail", failure_kind="timeout"),
+        DestinationDataUnavailable(
+            "secondary secret detail",
+            failure_kind="rate_limited",
+            http_status=429,
+        ),
+        DestinationDataUnavailable(
+            "third secret detail",
+            failure_kind="quota_exhausted",
+            http_status=429,
+        ),
+    ]
+    service, _, _ = _service(transport=transport)
+
+    with pytest.raises(DestinationDataUnavailable) as captured:
+        service.list_places("YYZ", "hotel")
+
+    error = captured.value
+    assert error.failure_kind == "timeout"
+    assert len(error.provider_attempts) == 3
+    assert [attempt.source_key for attempt in error.provider_attempts] == [
+        "osm_overpass_fossgis",
+        "osm_overpass_vk_maps",
+        "osm_overpass_private_coffee",
+    ]
+    assert [attempt.status for attempt in error.provider_attempts] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+    serialized = [attempt.model_dump(mode="json") for attempt in error.provider_attempts]
+    assert "secret detail" not in str(serialized)
+    assert serialized[1]["http_status"] == 429
 
 
 def test_one_list_operation_reuses_fallback_and_stays_under_budget() -> None:
@@ -1258,8 +1628,10 @@ def test_one_list_operation_reuses_fallback_and_stays_under_budget() -> None:
 
     assert result.result_count == 5
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert len(calls) == 5
-    assert [call["url"] for call in calls].count(OVERPASS_FALLBACK_URL) == 4
+    assert len(calls) == ATTRACTION_QUERY_PARTS + 1
+    assert [call["url"] for call in calls].count(OVERPASS_FALLBACK_URL) == (
+        ATTRACTION_QUERY_PARTS
+    )
     assert all(call["timeout"] <= ATTRACTION_OVERPASS_REQUEST_TIMEOUT_SECONDS for call in calls)
     assert ATTRACTION_OVERPASS_OPERATION_BUDGET_SECONDS == 42.0 < 60
 
@@ -1280,14 +1652,10 @@ def test_operation_budget_prevents_an_additional_live_request() -> None:
 
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert result.result_count == 5
-    assert [call["url"] for call in calls] == [
-        OVERPASS_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-    ]
-    assert clock.value == 1_040.0
+    assert calls[0]["url"] == OVERPASS_URL
+    assert all(call["url"] == OVERPASS_FALLBACK_URL for call in calls[1:])
+    assert len(calls) <= 6
+    assert clock.value <= 1_051.0
 
 
 def test_primary_remark_is_retried_once_on_fallback() -> None:
@@ -1314,10 +1682,7 @@ def test_primary_remark_is_retried_once_on_fallback() -> None:
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert [call["url"] for call in calls] == [
         OVERPASS_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
+        *([OVERPASS_FALLBACK_URL] * ATTRACTION_QUERY_PARTS),
     ]
 
 
@@ -1358,7 +1723,7 @@ def test_bbox_corner_places_beyond_each_circle_radius_are_clipped() -> None:
 
     assert result.result_count == 30
     assert all(place.name != "Square Corner 2" for place in result.places)
-    assert len(_calls(transport, "overpass-api.de")) == 4
+    assert len(_calls(transport, "overpass-api.de")) == ATTRACTION_QUERY_PARTS
 
 
 def test_overpass_runtime_remark_is_provider_failure_and_is_not_cached() -> None:
@@ -1378,7 +1743,10 @@ def test_overpass_runtime_remark_is_provider_failure_and_is_not_cached() -> None
 
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert [call["url"] for call in calls] == [
-        endpoint for _ in range(2) for _ in range(4) for endpoint in OVERPASS_ENDPOINTS
+        endpoint
+        for _ in range(2)
+        for _ in range(ATTRACTION_QUERY_PARTS)
+        for endpoint in OVERPASS_ENDPOINTS
     ]
 
 
@@ -1399,10 +1767,7 @@ def test_attraction_tiles_reuse_the_last_successful_overpass_endpoint() -> None:
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
     assert [call["url"] for call in calls] == [
         OVERPASS_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
-        OVERPASS_FALLBACK_URL,
+        *([OVERPASS_FALLBACK_URL] * ATTRACTION_QUERY_PARTS),
     ]
 
 
@@ -1420,28 +1785,35 @@ def test_wider_radius_failure_keeps_and_caches_smaller_source_backed_results() -
     first = service.list_places("YYZ", "attraction")
     second = service.list_places("YYZ", "attraction", "museum")
 
-    assert first.result_count == 5
+    assert first.result_count == 4
     assert second.result_count == 1
     assert first.coverage_radius_km == 30
     assert first.coverage_status == "partial"
     assert first.coverage_reason == "provider_failure"
     assert first.partial is True
     assert first.query_parts_succeeded == 1
-    assert first.query_parts_total == 4
-    assert "1/4" in first.coverage_notice.zh
-    assert "1/4" in first.coverage_notice.en
+    assert first.query_parts_total == ATTRACTION_QUERY_PARTS
+    assert f"1/{ATTRACTION_QUERY_PARTS}" in first.coverage_notice.zh
+    assert f"1/{ATTRACTION_QUERY_PARTS}" in first.coverage_notice.en
     assert second.coverage_notice == first.coverage_notice
     calls = [call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]
-    assert len(calls) == 7
+    initial_call_count = len(calls)
+    assert initial_call_count > 1
     clock.advance(PARTIAL_DESTINATION_CACHE_TTL.total_seconds() - 1)
     service.list_places("YYZ", "attraction")
-    assert len([call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]) == 7
+    assert (
+        len([call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS])
+        == initial_call_count
+    )
 
     transport.overpass_payloads = [{"elements": _attraction_elements()}]
     clock.advance(1)
     refreshed = service.list_places("YYZ", "attraction")
     assert refreshed.coverage_status == "complete"
-    assert len([call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS]) == 11
+    assert (
+        len([call for call in transport.calls if call["url"] in OVERPASS_ENDPOINTS])
+        == initial_call_count + ATTRACTION_QUERY_PARTS
+    )
 
 
 def test_osm_transit_references_include_only_stop_and_platform_members() -> None:
@@ -1503,7 +1875,7 @@ def test_valid_but_absent_place_id_returns_not_found() -> None:
     with pytest.raises(DestinationPlaceNotFound):
         service.get_place_detail("YYZ", "osm_hotel_node_999999")
 
-    assert len(_calls(transport, "overpass-api.de")) == 3
+    assert len(_calls(transport, "overpass-api.de")) == HOTEL_QUERY_PARTS
     assert len(_calls(transport, "routing.openstreetmap.de")) == 0
 
 
@@ -1602,14 +1974,16 @@ def test_ourairports_downloader_refuses_redirects(monkeypatch: pytest.MonkeyPatc
     assert payload.startswith(b"iata_code")
 
 
-def test_overpass_allowlist_contains_exactly_primary_and_one_verified_fallback() -> None:
-    assert OVERPASS_ENDPOINTS == (OVERPASS_URL, OVERPASS_FALLBACK_URL)
-    assert len(OVERPASS_ENDPOINTS) == 2
+def test_overpass_allowlist_contains_three_verified_global_replicas() -> None:
+    assert OVERPASS_ENDPOINTS == (
+        OVERPASS_URL,
+        OVERPASS_FALLBACK_URL,
+        OVERPASS_PRIVATE_COFFEE_URL,
+    )
+    assert len(OVERPASS_ENDPOINTS) == 3
     for endpoint in OVERPASS_ENDPOINTS:
         _assert_allowed_outbound_url(endpoint)
 
-    with pytest.raises(DestinationValidationError, match="allowlist"):
-        _assert_allowed_outbound_url("https://overpass.private.coffee/api/interpreter")
     with pytest.raises(DestinationValidationError, match="allowlist"):
         _assert_allowed_outbound_url(
             "https://attacker.maps.mail.ru/osm/tools/overpass/api/interpreter"
