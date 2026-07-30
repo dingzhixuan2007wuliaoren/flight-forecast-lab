@@ -797,13 +797,21 @@ def _runtime_provider_status(
             fare_status == "rate_limited"
             and rate_limit_scope in {"monthly", "lifetime"}
         )
-        if explicitly_exhausted and effective_limit is not None:
+        has_usage_observation = (
+            effective_used is not None
+            and (provider.quota_observed_at is not None or run_used is not None)
+        )
+        if (
+            explicitly_exhausted
+            and effective_limit is not None
+            and has_usage_observation
+        ):
             effective_remaining = 0
         has_measurement = (
             effective_used is not None
             and effective_limit is not None
             and effective_remaining is not None
-            and (provider.quota_observed_at is not None or run_used is not None)
+            and has_usage_observation
         )
         measurably_exhausted = has_measurement and effective_remaining == 0
         exhausted = has_measurement and (explicitly_exhausted or measurably_exhausted)

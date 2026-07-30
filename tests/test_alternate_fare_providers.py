@@ -1557,6 +1557,7 @@ def test_aggregate_marks_confirmed_plus_budget_exhausted_source_quota_limited() 
 def test_aggregate_authentication_failure_plus_quota_wall_is_structured(
     trained_model_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     call_log: list[str] = []
     authentication_failed = FlightOfferSearchResult(
@@ -1613,6 +1614,7 @@ def test_aggregate_authentication_failure_plus_quota_wall_is_structured(
     monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "auto")
     monkeypatch.setenv("SERPAPI_API_KEY", "test-only-serpapi-key")
     monkeypatch.setenv("SEARCHAPI_API_KEY", "test-only-searchapi-key")
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "clean-model"))
     service = PredictionService(
         trained_model_dir,
         context_provider=ContextProvider(),
@@ -1649,6 +1651,18 @@ def test_aggregate_authentication_failure_plus_quota_wall_is_structured(
     assert [
         run["status"] for run in payload["fare_search_metadata"]["provider_runs"]
     ] == ["authentication_failed", "budget_exhausted"]
+    searchapi_status = next(
+        provider
+        for provider in payload["provider_statuses"]
+        if provider["code"] == SEARCHAPI_PROVIDER_CODE
+    )
+    assert searchapi_status["active"] is True
+    assert searchapi_status["status"] == "configured"
+    assert searchapi_status["quota_status"] == "unknown"
+    assert searchapi_status["quota_data_basis"] == "unavailable"
+    assert searchapi_status["quota_used"] is None
+    assert searchapi_status["quota_remaining"] is None
+    assert searchapi_status["quota_observed_at"] is None
 
 
 def test_search_result_rejects_offer_from_a_different_provider() -> None:
