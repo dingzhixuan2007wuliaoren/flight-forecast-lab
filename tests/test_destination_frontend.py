@@ -69,6 +69,16 @@ def test_destination_list_pages_have_bilingual_category_controls() -> None:
     assert '"/details/place?"' in hotels
     assert "航班结果不受影响" not in hotels
     assert "Flight results are unaffected" not in hotels
+    assert "航班结果不受影响" not in attractions
+    assert "Flight results are unaffected" not in attractions
+    assert "destination_quota_exhausted" in attractions
+    assert "destination_rate_limited" in attractions
+    assert "destination_timeout" in attractions
+    assert "detail.provider_attempts" in attractions
+    assert "destination_quota_exhausted" in hotels
+    assert "destination_rate_limited" in hotels
+    assert "destination_timeout" in hotels
+    assert "placeFailureText(error)" in hotels
 
 
 def test_destination_back_controls_start_in_the_page_top_left() -> None:
@@ -92,6 +102,19 @@ def test_hotel_prices_are_only_requested_after_explicit_submit() -> None:
     assert "queryPrices();" not in hotels
     assert 'loadPlaces();' in hotels
     assert 'quota_warning' in hotels
+    assert "priceFailureText(error)" in hotels
+    for code in (
+        "not_configured",
+        "authentication_failed",
+        "quota_exhausted",
+        "rate_limited",
+        "provider_processing",
+        "provider_error",
+        "provider_unavailable",
+        "response_invalid",
+    ):
+        assert code in hotels
+    assert "providerRunSummary" in hotels
     assert 'next.set("hotel_id",hid)' in hotels
     assert 'kind:priced?"priced_hotel":"hotel"' in hotels
     assert 'next.set("check_in"' in hotels

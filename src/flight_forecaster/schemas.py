@@ -457,16 +457,54 @@ class RuntimeProviderStatusItem(BaseModel):
         return self
 
 
+class RuntimeDestinationCapability(BaseModel):
+    """Credential-free destination API capability, not a fare-provider claim."""
+
+    code: str = Field(pattern=r"^[a-z][a-z0-9_]{1,49}$")
+    display_name: str = Field(min_length=1, max_length=120)
+    role: str = Field(min_length=1, max_length=80)
+    active: bool
+    configured: bool
+    strict_evidence_requirement: str = Field(min_length=1, max_length=120)
+    source_host: str = Field(
+        min_length=3,
+        max_length=253,
+        pattern=r"^[a-z0-9.-]+$",
+    )
+    data_family: Literal[
+        "ourairports",
+        "openstreetmap",
+        "wikimedia",
+        "transitous",
+        "optional_commercial",
+    ]
+
+    @model_validator(mode="after")
+    def validate_capability_boundary(self) -> RuntimeDestinationCapability:
+        if self.active and not self.configured:
+            raise ValueError("active destination capabilities must be configured")
+        return self
+
+
 class RuntimeProviderStatusResponse(BaseModel):
     generated_at: datetime
     strict_policy: BilingualText
     providers: list[RuntimeProviderStatusItem]
+    destination_capabilities: list[RuntimeDestinationCapability] = Field(
+        default_factory=list,
+        max_length=30,
+    )
 
     @model_validator(mode="after")
     def validate_unique_providers(self) -> RuntimeProviderStatusResponse:
         codes = [provider.code for provider in self.providers]
         if len(codes) != len(set(codes)):
             raise ValueError("provider status codes must be unique")
+        capability_codes = [
+            capability.code for capability in self.destination_capabilities
+        ]
+        if len(capability_codes) != len(set(capability_codes)):
+            raise ValueError("destination capability codes must be unique")
         return self
 
 

@@ -8,7 +8,12 @@ from typing import Any
 
 import pytest
 
+from flight_forecaster.alternate_fare_providers import (
+    SEARCHAPI_SEARCH_URL,
+    _FreeCallLedger,
+)
 from flight_forecaster.availability import (
+    SEARCHAPI_PROVIDER_CODE,
     SERPAPI_ACCOUNT_URL,
     SERPAPI_SEARCH_ARCHIVE_URL,
     SERPAPI_SEARCH_URL,
@@ -18,7 +23,9 @@ from flight_forecaster.hotel_prices import (
     HOTEL_PRICE_MAX_RESPONSE_BYTES,
     HotelPriceError,
     HotelPriceValidationError,
+    SearchApiHotelPriceProvider,
     SerpApiHotelPriceProvider,
+    StrictHotelPriceProviderPool,
     hotel_price_provider_from_env,
 )
 
@@ -86,6 +93,21 @@ class _Client:
         if isinstance(value, _Response):
             return value
         return _Response(value, status)
+
+
+class _SearchApiClient:
+    def __init__(self, payload: Any, *, status: int = 200) -> None:
+        self.payload = payload
+        self.status = status
+        self.calls: list[dict[str, Any]] = []
+
+    def get(self, url: str, **kwargs: Any) -> _Response:
+        self.calls.append({"url": url, **kwargs})
+        assert url == SEARCHAPI_SEARCH_URL
+        value = self.payload.pop(0) if isinstance(self.payload, list) else self.payload
+        if isinstance(value, BaseException):
+            raise value
+        return _Response(value, self.status)
 
 
 NOW = datetime(2026, 7, 21, 14, 30, tzinfo=UTC)
@@ -897,6 +919,379 @@ def test_env_factory_uses_only_existing_serpapi_settings(
 
     assert provider.configured is True
     assert provider.usage_path == path
+
+
+def _searchapi_payload(*, properties: list[Any] | None = None) -> dict[str, Any]:
+    return {
+        "search_metadata": {"id": "searchapi-hotel-001", "status": "Success"},
+        "search_parameters": {
+            "engine": "google_hotels",
+            "q": "Toronto",
+            "check_in_date": CHECK_IN.isoformat(),
+            "check_out_date": CHECK_OUT.isoformat(),
+            "adults": 2,
+            "currency": "USD",
+            "hl": "en",
+        },
+        "properties": (
+            [
+                {
+                    "type": "hotel",
+                    "property_token": "searchapi-property-token-not-persisted",
+                    "data_id": "0x123:0x456",
+                    "name": "SearchAPI Harbour Hotel",
+                    "link": "https://hotel.example.test/searchapi-book",
+                    "gps_coordinates": {
+                        "latitude": 43.641,
+                        "longitude": -79.381,
+                    },
+                    "price_per_night": {
+                        "extracted_price": 175,
+                        "extracted_price_before_taxes": 150,
+                    },
+                    "total_price": {
+                        "extracted_price": 350,
+                        "extracted_price_before_taxes": 300,
+                    },
+                    "rating": 4.4,
+                    "reviews": 321,
+                }
+            ]
+            if properties is None
+            else properties
+        ),
+    }
+
+
+def _searchapi_provider(
+    tmp_path: Path,
+    client: _SearchApiClient,
+    *,
+    api_key: str | None = "searchapi-secret-not-for-output",
+    limit: int = 100,
+) -> SearchApiHotelPriceProvider:
+    return SearchApiHotelPriceProvider(
+        api_key,
+        usage_path=tmp_path / "shared.sqlite3",
+        lifetime_limit=limit,
+        client=client,
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+
+
+def test_env_factory_shares_searchapi_hotel_and_flight_lifetime_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
+    monkeypatch.setenv("SEARCHAPI_API_KEY", "configured-secret-not-for-output")
+    monkeypatch.setenv("SEARCHAPI_LIFETIME_LIMIT", "100")
+    monkeypatch.setenv("SEARCHAPI_MONTHLY_LIMIT", "100")
+    serpapi_path = tmp_path / "runtime" / "serpapi-usage.sqlite3"
+    alternate_path = serpapi_path.with_name("alternate-provider-usage.sqlite3")
+    ledger = _FreeCallLedger(alternate_path)
+    assert ledger.reserve(
+        SEARCHAPI_PROVIDER_CODE,
+        100,
+        hard_limit=100,
+        require_all=True,
+    ) == 100
+    provider = hotel_price_provider_from_env(serpapi_path)
+    searchapi = provider.providers[1]
+    client = _SearchApiClient(_searchapi_payload())
+    searchapi._client = client
+
+    with pytest.raises(HotelPriceError) as error_info:
+        _search(provider)
+
+    searchapi_run = next(
+        run
+        for run in error_info.value.provider_runs
+        if run.provider_code == "searchapi_google_hotels"
+    )
+    assert searchapi.usage_path == alternate_path
+    assert error_info.value.code == "quota_exhausted"
+    assert searchapi_run.status == "quota_exhausted"
+    assert searchapi_run.error_code == "quota_exhausted"
+    assert searchapi_run.calls_reserved == 0
+    assert client.calls == []
+
+
+def test_searchapi_hotel_search_is_strict_and_uses_shared_lifetime_ledger(
+    tmp_path: Path,
+) -> None:
+    client = _SearchApiClient(_searchapi_payload())
+    provider = _searchapi_provider(tmp_path, client)
+
+    result = _search(provider)
+
+    assert result.status == "available"
+    assert result.provider_code == "searchapi_google_hotels"
+    assert result.provider_name == "SearchAPI.io Google Hotels"
+    assert result.calls_reserved == 1
+    assert result.quota_monthly_used == 1
+    assert result.quota_monthly_limit == 100
+    assert result.quota_scope == "lifetime"
+    assert result.quota_hourly_used is None
+    assert result.quota_hourly_limit is None
+    assert result.offers[0].nightly_price == 175
+    assert result.offers[0].total_price == 350
+    assert result.offers[0].price_source == "SearchAPI.io Google Hotels"
+    assert client.calls[0]["url"] == SEARCHAPI_SEARCH_URL
+    assert "api_key" not in client.calls[0]["params"]
+    assert client.calls[0]["headers"]["Authorization"].startswith("Bearer ")
+    persisted = provider.usage_path.read_bytes()
+    assert b"searchapi-secret-not-for-output" not in persisted
+    assert b"searchapi-property-token-not-persisted" not in persisted
+
+
+def test_transient_hotel_failure_gets_exactly_one_reserved_retry(
+    tmp_path: Path,
+) -> None:
+    client = _SearchApiClient(
+        [
+            TimeoutError("sensitive upstream timeout"),
+            _searchapi_payload(),
+        ]
+    )
+    provider = _searchapi_provider(tmp_path, client)
+
+    result = _search(provider)
+
+    assert result.status == "available"
+    assert result.calls_reserved == 2
+    assert len(client.calls) == 2
+    assert all(call["url"] == SEARCHAPI_SEARCH_URL for call in client.calls)
+
+
+def test_pool_fails_over_from_serpapi_quota_to_searchapi_strict_result(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "shared.sqlite3"
+    serp_client = _Client(_account(monthly=250, hourly=0), _search_payload())
+    serp = SerpApiHotelPriceProvider(
+        "serp-secret-not-for-output",
+        usage_path=path,
+        client=serp_client,
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+    search_client = _SearchApiClient(_searchapi_payload())
+    searchapi = SearchApiHotelPriceProvider(
+        "search-secret-not-for-output",
+        usage_path=path,
+        client=search_client,
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+    pool = StrictHotelPriceProviderPool((serp, searchapi))
+
+    result = _search(pool)
+
+    assert result.status == "available"
+    assert result.provider_code == "searchapi_google_hotels"
+    assert [run.status for run in result.provider_runs] == [
+        "quota_exhausted",
+        "available",
+    ]
+    assert result.provider_runs[0].error_code == "quota_exhausted"
+    assert len(search_client.calls) == 1
+    serialized = json.dumps(
+        [run.as_safe_dict() for run in result.provider_runs]
+    )
+    assert "serp-secret-not-for-output" not in serialized
+    assert "search-secret-not-for-output" not in serialized
+
+
+def test_pool_fails_over_from_serpapi_authentication_to_searchapi(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "shared.sqlite3"
+    serp = SerpApiHotelPriceProvider(
+        "bad-serp-key",
+        usage_path=path,
+        client=_Client(
+            {"error": "secret authentication detail"},
+            _search_payload(),
+            account_status=401,
+        ),
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+    searchapi = SearchApiHotelPriceProvider(
+        "valid-search-key",
+        usage_path=path,
+        client=_SearchApiClient(_searchapi_payload()),
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+
+    result = _search(StrictHotelPriceProviderPool((serp, searchapi)))
+
+    assert result.status == "available"
+    assert [run.status for run in result.provider_runs] == [
+        "authentication_failed",
+        "available",
+    ]
+    assert "secret authentication detail" not in json.dumps(
+        [run.as_safe_dict() for run in result.provider_runs]
+    )
+
+
+def test_provider_run_reports_reserved_call_after_safe_provider_failure(
+    tmp_path: Path,
+) -> None:
+    provider = SerpApiHotelPriceProvider(
+        "serp-key",
+        usage_path=tmp_path / "shared.sqlite3",
+        client=_Client(
+            _account(monthly=0, hourly=0),
+            {"error": "secret upstream response"},
+            search_status=503,
+        ),
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+
+    with pytest.raises(HotelPriceError) as error_info:
+        _search(StrictHotelPriceProviderPool((provider,)))
+
+    assert error_info.value.provider_runs[0].calls_reserved == 2
+    assert error_info.value.provider_runs[0].status == "provider_unavailable"
+    assert "secret upstream response" not in str(error_info.value)
+
+
+def test_searchapi_property_detail_accepts_strict_property_engine_echo(
+    tmp_path: Path,
+) -> None:
+    detail = {
+        "search_metadata": {"id": "searchapi-detail-001", "status": "Success"},
+        "search_parameters": {
+            "engine": "google_hotels_property",
+            "property_token": "searchapi-property-token-not-persisted",
+            "check_in_date": CHECK_IN.isoformat(),
+            "check_out_date": CHECK_OUT.isoformat(),
+            "adults": 2,
+            "currency": "USD",
+            "hl": "en",
+        },
+        "property": {
+            "type": "hotel",
+            "property_token": "searchapi-property-token-not-persisted",
+            "name": "SearchAPI Harbour Hotel",
+            "link": "https://hotel.example.test/searchapi-book",
+            "gps_coordinates": {"latitude": 43.641, "longitude": -79.381},
+            "price_per_night": {"extracted_price": 175},
+            "total_price": {"extracted_price": 350},
+            "rating": 4.5,
+            "reviews": 400,
+            "featured_offers": [
+                {
+                    "source": "Hotel Direct",
+                    "is_official": True,
+                    "link": "https://hotel.example.test/searchapi-book",
+                    "rooms": [
+                        {
+                            "name": "King Room",
+                            "price_per_night": {
+                                "extracted_price": 180,
+                                "extracted_price_before_taxes": 155,
+                            },
+                            "total_price": {
+                                "extracted_price": 360,
+                                "extracted_price_before_taxes": 310,
+                            },
+                            "has_free_cancellation": True,
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    client = _SearchApiClient([_searchapi_payload(), detail])
+    provider = _searchapi_provider(tmp_path, client)
+    listing = _search(provider)
+
+    offer = provider.detail(
+        listing.offers[0].hotel_id,
+        "Toronto",
+        "YYZ",
+        CHECK_IN,
+        CHECK_OUT,
+        adults=2,
+        language="en",
+        explicit=True,
+    )
+
+    assert offer is not None
+    assert offer.room_rates_status == "available"
+    assert offer.room_rates[0].room_name == "King Room"
+    assert offer.room_rates[0].total_price == 360
+    assert client.calls[1]["params"]["engine"] == "google_hotels_property"
+
+
+def test_pool_reports_true_no_results_only_after_all_configured_sources_complete(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "shared.sqlite3"
+    serp = SerpApiHotelPriceProvider(
+        "serp-key",
+        usage_path=path,
+        client=_Client(_account(monthly=0, hourly=0), _search_payload(properties=[])),
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+    searchapi = SearchApiHotelPriceProvider(
+        "search-key",
+        usage_path=path,
+        client=_SearchApiClient(_searchapi_payload(properties=[])),
+        now_provider=lambda: NOW,
+        sleep_provider=lambda _: None,
+    )
+    pool = StrictHotelPriceProviderPool((serp, searchapi))
+
+    result = _search(pool)
+
+    assert result.status == "no_results"
+    assert result.provider_code == "strict_hotel_price_failover"
+    assert [run.status for run in result.provider_runs] == [
+        "no_results",
+        "no_results",
+    ]
+
+
+def test_exact_property_is_not_reported_missing_when_one_source_failed() -> None:
+    class _ExactProvider:
+        configured = True
+
+        def __init__(self, code: str, outcome: object) -> None:
+            self.provider_code = code
+            self.provider_name = code
+            self.outcome = outcome
+
+        def exact_property_detail(self, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+            return self.outcome
+
+    pool = StrictHotelPriceProviderPool(
+        (
+            _ExactProvider("completed_empty", None),  # type: ignore[arg-type]
+            _ExactProvider(
+                "failed_source",
+                HotelPriceError(
+                    "provider_unavailable",
+                    "sanitized provider failure",
+                ),
+            ),  # type: ignore[arg-type]
+        )
+    )
+
+    with pytest.raises(HotelPriceError) as error_info:
+        pool.exact_property_detail()
+
+    assert error_info.value.code == "provider_unavailable"
 
 
 def test_explicit_detail_returns_real_room_rates_and_platform_reviews(

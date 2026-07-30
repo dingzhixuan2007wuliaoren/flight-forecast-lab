@@ -8,13 +8,20 @@ from flight_forecaster import destination_routes
 from flight_forecaster.api import app
 from flight_forecaster.destination_guide import (
     DestinationCity,
+    DestinationDataUnavailable,
     DestinationPlace,
     DestinationPlaceDetail,
     DestinationPlaceList,
+    DestinationProviderAttempt,
     DestinationTransport,
     DestinationTransportOption,
 )
-from flight_forecaster.hotel_prices import HotelPriceOffer, HotelPriceSearchResult
+from flight_forecaster.hotel_prices import (
+    HotelPriceError,
+    HotelPriceOffer,
+    HotelPriceSearchResult,
+    HotelProviderRun,
+)
 
 NOW = datetime(2026, 7, 21, 16, 0, tzinfo=UTC)
 
@@ -250,6 +257,18 @@ class _HotelProvider:
             quota_monthly_limit=250,
             quota_hourly_used=1,
             quota_hourly_limit=50,
+            provider_runs=(
+                HotelProviderRun(
+                    provider_code="serpapi_google_hotels",
+                    provider_name="SerpApi Google Hotels",
+                    configured=True,
+                    status="available",
+                    error_code=None,
+                    calls_reserved=1,
+                    offer_count=1,
+                    observed_at=NOW,
+                ),
+            ),
         )
 
     def detail(self, *args: object, **kwargs: object) -> HotelPriceOffer:
@@ -339,6 +358,50 @@ def test_places_and_detail_expose_source_backed_routes(monkeypatch) -> None:
     assert "transitous_motis" not in body["source"]
 
 
+def test_places_expose_sanitized_all_replica_quota_failure(monkeypatch) -> None:
+    class _UnavailableGuide:
+        def list_places(self, *args: object, **kwargs: object) -> None:
+            raise DestinationDataUnavailable(
+                "provider body must not be exposed",
+                failure_kind="quota_exhausted",
+                http_status=429,
+                provider_attempts=(
+                    DestinationProviderAttempt(
+                        source_key="osm_overpass_fossgis",
+                        endpoint_host="overpass-api.de",
+                        status="failed",
+                        failure_kind="quota_exhausted",
+                        http_status=429,
+                    ),
+                ),
+            )
+
+    monkeypatch.setattr(
+        destination_routes,
+        "get_destination_guide_service",
+        lambda: _UnavailableGuide(),
+    )
+    response = TestClient(app).post(
+        "/v1/destination/places",
+        json={"destination": "YYZ", "kind": "attraction", "language": "zh"},
+    )
+
+    assert response.status_code == 429
+    detail = response.json()["detail"]
+    assert detail["code"] == "destination_quota_exhausted"
+    assert detail["provider_attempts"] == [
+        {
+            "source_key": "osm_overpass_fossgis",
+            "endpoint_host": "overpass-api.de",
+            "status": "failed",
+            "failure_kind": "quota_exhausted",
+            "http_status": 429,
+            "result_count": None,
+        }
+    ]
+    assert "provider body" not in response.text
+
+
 def test_destination_detail_rejects_naive_transit_departure_time(monkeypatch) -> None:
     _install_fakes(monkeypatch)
     response = TestClient(app).post(
@@ -373,9 +436,73 @@ def test_hotel_price_search_is_explicit_and_exposes_safe_quote(monkeypatch) -> N
     assert body["calls_reserved"] == 1
     assert body["offers"][0]["formatted_price"] == "US$210.00 / 晚"
     assert body["offers"][0]["hotel_id"] == _offer().hotel_id
+    assert body["provider_runs"][0]["status"] == "available"
+    assert body["provider_runs"][0]["provider_code"] == "serpapi_google_hotels"
     assert "property_token" not in response.text
     assert "api_key" not in response.text
     assert "serpapi.com" not in response.text.lower()
+
+
+def test_hotel_price_error_exposes_only_sanitized_failover_runs(monkeypatch) -> None:
+    guide = _Guide()
+
+    class _FailedHotelProvider:
+        def search(self, *args: object, **kwargs: object) -> HotelPriceSearchResult:
+            raise HotelPriceError(
+                "quota_exhausted",
+                "All usable strict hotel source allowances are exhausted.",
+                quota_scope="lifetime",
+                provider_runs=(
+                    HotelProviderRun(
+                        provider_code="serpapi_google_hotels",
+                        provider_name="SerpApi Google Hotels",
+                        configured=True,
+                        status="quota_exhausted",
+                        error_code="quota_exhausted",
+                        calls_reserved=0,
+                        offer_count=0,
+                        observed_at=NOW,
+                    ),
+                    HotelProviderRun(
+                        provider_code="searchapi_google_hotels",
+                        provider_name="SearchAPI.io Google Hotels",
+                        configured=True,
+                        status="authentication_failed",
+                        error_code="authentication_failed",
+                        calls_reserved=0,
+                        offer_count=0,
+                        observed_at=NOW,
+                    ),
+                ),
+            )
+
+    monkeypatch.setattr(destination_routes, "get_destination_guide_service", lambda: guide)
+    monkeypatch.setattr(
+        destination_routes,
+        "get_hotel_price_provider",
+        lambda: _FailedHotelProvider(),
+    )
+    response = TestClient(app).post(
+        "/v1/destination/hotel-prices",
+        json={
+            "destination": "YYZ",
+            "check_in": "2026-07-25",
+            "check_out": "2026-07-26",
+            "adults": 1,
+            "language": "en",
+        },
+    )
+
+    assert response.status_code == 429
+    detail = response.json()["detail"]
+    assert detail["code"] == "quota_exhausted"
+    assert detail["quota_scope"] == "lifetime"
+    assert [run["status"] for run in detail["provider_runs"]] == [
+        "quota_exhausted",
+        "authentication_failed",
+    ]
+    assert "api_key" not in response.text
+    assert "secret" not in response.text
 
 
 def test_hotel_price_detail_uses_cached_offer_coordinates_for_routes(monkeypatch) -> None:

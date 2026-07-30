@@ -9,7 +9,9 @@ from threading import Barrier
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
+from flight_forecaster import api as api_module
 from flight_forecaster.alternate_fare_providers import (
     IGNAV_BOOKING_LINKS_URL,
     IGNAV_ONE_WAY_URL,
@@ -1013,21 +1015,24 @@ class _FallbackStub:
         return self.result
 
 
-class _BarrierFallbackStub(_FallbackStub):
+class _SequencedFallbackStub(_FallbackStub):
     def __init__(
         self,
         name: str,
-        result: FlightOfferSearchResult,
+        results: tuple[FlightOfferSearchResult, ...],
         log: list[str],
-        barrier: Barrier,
     ) -> None:
-        super().__init__(name, result, log)
-        self.barrier = barrier
+        super().__init__(name, results[-1], log)
+        self.results = results
+        self.calls = 0
 
-    def search(self, *_args: Any, **_kwargs: Any) -> FlightOfferSearchResult:
-        self.log.append(self.name)
-        self.barrier.wait()
-        return self.result
+    def search(self, *_args: Any, **kwargs: Any) -> FlightOfferSearchResult:
+        self.log.append(
+            f"{self.name}:{str(bool(kwargs.get('force_refresh'))).lower()}"
+        )
+        result = self.results[min(self.calls, len(self.results) - 1)]
+        self.calls += 1
+        return result
 
 
 class _RaisingStrictProvider:
@@ -1172,20 +1177,20 @@ def test_fallback_queries_every_strict_provider_and_aggregates_confirmed_runs() 
     assert sorted(call_log) == ["searchapi", "serpapi"]
 
 
-def test_fallback_runs_strict_providers_concurrently() -> None:
+def test_fallback_runs_strict_providers_in_configured_order() -> None:
     call_log: list[str] = []
-    barrier = Barrier(2, timeout=2)
     provider = FallbackFlightOfferProvider(
         (
-            _BarrierFallbackStub("serpapi", _offer_result(), call_log, barrier),
-            _BarrierFallbackStub(
+            _SequencedFallbackStub("serpapi", (_offer_result(),), call_log),
+            _SequencedFallbackStub(
                 "searchapi",
-                _offer_result(
-                    provider_code=SEARCHAPI_PROVIDER_CODE,
-                    provider_name=SEARCHAPI_PROVIDER_NAME,
+                (
+                    _offer_result(
+                        provider_code=SEARCHAPI_PROVIDER_CODE,
+                        provider_name=SEARCHAPI_PROVIDER_NAME,
+                    ),
                 ),
                 call_log,
-                barrier,
             ),
         )
     )
@@ -1194,8 +1199,83 @@ def test_fallback_runs_strict_providers_concurrently() -> None:
 
     assert result.status == "confirmed_offers"
     assert len(result.provider_runs) == 2
-    assert barrier.broken is False
-    assert sorted(call_log) == ["searchapi", "serpapi"]
+    assert call_log == ["serpapi:false", "searchapi:false"]
+
+
+def test_fallback_retries_one_transient_provider_failure_once() -> None:
+    call_log: list[str] = []
+    transient = FlightOfferSearchResult(
+        offers=(),
+        status="provider_error",
+        observed_at=NOW,
+        environment="production",
+        searched_cabins=(),
+        calls_used=1,
+        cache_hit=False,
+        search_calls_used=1,
+        provider_code=SERPAPI_PROVIDER_CODE,
+        provider_name=SERPAPI_PROVIDER_NAME,
+    )
+    provider = FallbackFlightOfferProvider(
+        (
+            _SequencedFallbackStub(
+                "serpapi",
+                (transient, _offer_result()),
+                call_log,
+            ),
+        )
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.calls_used == 3
+    assert result.search_calls_used == 2
+    assert result.pricing_calls_used == 1
+    assert result.cache_hit is False
+    assert call_log == ["serpapi:false", "serpapi:true"]
+    assert any(
+        diagnostic.exception_type == "ControlledProviderRetry"
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        "authentication_failed",
+        "rate_limited",
+        "budget_exhausted",
+        "no_results",
+    ),
+)
+def test_fallback_does_not_spend_retry_calls_on_terminal_source_status(
+    status: str,
+) -> None:
+    call_log: list[str] = []
+    terminal = (
+        _complete_no_results(SERPAPI_PROVIDER_CODE, SERPAPI_PROVIDER_NAME)
+        if status == "no_results"
+        else FlightOfferSearchResult(
+            offers=(),
+            status=status,
+            observed_at=NOW,
+            environment="production",
+            searched_cabins=(),
+            calls_used=0,
+            cache_hit=False,
+            provider_code=SERPAPI_PROVIDER_CODE,
+            provider_name=SERPAPI_PROVIDER_NAME,
+        )
+    )
+    provider = FallbackFlightOfferProvider(
+        (_SequencedFallbackStub("serpapi", (terminal,), call_log),)
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == status
+    assert call_log == ["serpapi:false"]
 
 
 def test_fallback_isolates_unexpected_later_provider_exception() -> None:
@@ -1218,7 +1298,7 @@ def test_fallback_isolates_unexpected_later_provider_exception() -> None:
         "UnexpectedProviderError"
     )
     assert "sensitive provider detail" not in repr(result)
-    assert sorted(call_log) == ["raising-searchapi", "serpapi"]
+    assert call_log == ["serpapi", "raising-searchapi", "raising-searchapi"]
 
 
 def _complete_no_results(
@@ -1472,6 +1552,103 @@ def test_aggregate_marks_confirmed_plus_budget_exhausted_source_quota_limited() 
         "confirmed_offers",
         "budget_exhausted",
     ]
+
+
+def test_aggregate_authentication_failure_plus_quota_wall_is_structured(
+    trained_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_log: list[str] = []
+    authentication_failed = FlightOfferSearchResult(
+        offers=(),
+        status="authentication_failed",
+        observed_at=NOW,
+        environment="production",
+        searched_cabins=(),
+        calls_used=1,
+        cache_hit=False,
+        search_calls_used=1,
+        provider_code=SERPAPI_PROVIDER_CODE,
+        provider_name=SERPAPI_PROVIDER_NAME,
+    )
+    budget_exhausted = FlightOfferSearchResult(
+        offers=(),
+        status="budget_exhausted",
+        observed_at=NOW,
+        environment="production",
+        searched_cabins=(),
+        calls_used=0,
+        cache_hit=False,
+        provider_code=SEARCHAPI_PROVIDER_CODE,
+        provider_name=SEARCHAPI_PROVIDER_NAME,
+    )
+
+    result = FallbackFlightOfferProvider(
+        (
+            _FallbackStub("serpapi", authentication_failed, call_log),
+            _FallbackStub("searchapi", budget_exhausted, call_log),
+        )
+    ).search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "authentication_failed"
+    assert result.offers == ()
+    assert result.coverage_status == "quota_and_provider_incomplete"
+    assert result.quota_limit == "provider_specific"
+    assert result.retry_quota_limited is False
+    assert [run.status for run in result.provider_runs] == [
+        "authentication_failed",
+        "budget_exhausted",
+    ]
+    metadata = PredictionService._fare_metadata(result)
+    assert metadata.status == "authentication_failed"
+    assert metadata.coverage_status == "quota_and_provider_incomplete"
+    assert metadata.quota_limit == "provider_specific"
+    assert [run.status for run in metadata.provider_runs] == [
+        "authentication_failed",
+        "budget_exhausted",
+    ]
+    assert call_log == ["serpapi", "searchapi"]
+
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "auto")
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-only-serpapi-key")
+    monkeypatch.setenv("SEARCHAPI_API_KEY", "test-only-searchapi-key")
+    service = PredictionService(
+        trained_model_dir,
+        context_provider=ContextProvider(),
+        schedule_provider=_EmptyScheduleProvider(),  # type: ignore[arg-type]
+        flight_offer_provider=FallbackFlightOfferProvider(
+            (
+                _FallbackStub("serpapi", authentication_failed, []),
+                _FallbackStub("searchapi", budget_exhausted, []),
+            )
+        ),
+        now_provider=lambda: NOW,
+    )
+    monkeypatch.setattr(api_module, "get_service", lambda: service)
+
+    response = TestClient(api_module.app).post(
+        "/v1/compare",
+        json={
+            "origin": "YYZ",
+            "destination": "LHR",
+            "departure_date": DEPARTURE_DATE.isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["result_status"] == "fare_provider_authentication_failed"
+    assert payload["offers"] == []
+    assert payload["fare_search_metadata"]["status"] == "authentication_failed"
+    assert (
+        payload["fare_search_metadata"]["coverage_status"]
+        == "quota_and_provider_incomplete"
+    )
+    assert payload["fare_search_metadata"]["quota_limit"] == "provider_specific"
+    assert [
+        run["status"] for run in payload["fare_search_metadata"]["provider_runs"]
+    ] == ["authentication_failed", "budget_exhausted"]
 
 
 def test_search_result_rejects_offer_from_a_different_provider() -> None:

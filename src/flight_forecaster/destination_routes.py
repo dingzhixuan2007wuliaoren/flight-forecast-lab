@@ -25,7 +25,7 @@ from flight_forecaster.hotel_prices import (
     HotelPriceError,
     HotelPriceOffer,
     HotelPriceValidationError,
-    SerpApiHotelPriceProvider,
+    StrictHotelPriceProviderPool,
     hotel_price_provider_from_env,
 )
 from flight_forecaster.serpapi_transit import serpapi_transit_provider_from_env
@@ -116,7 +116,7 @@ def get_destination_guide_service() -> DestinationGuideService:
 
 
 @lru_cache(maxsize=1)
-def get_hotel_price_provider() -> SerpApiHotelPriceProvider:
+def get_hotel_price_provider() -> StrictHotelPriceProviderPool:
     return hotel_price_provider_from_env(_runtime_dir() / "serpapi-usage.sqlite3")
 
 
@@ -228,6 +228,29 @@ def _destination_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, (DestinationAirportNotFound, DestinationPlaceNotFound)):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, DestinationDataUnavailable):
+        failure_kind = exc.failure_kind
+        status = {
+            "quota_exhausted": 429,
+            "rate_limited": 429,
+            "invalid_response": 502,
+            "provider_error": 502,
+            "timeout": 503,
+            "request_budget_exhausted": 503,
+        }.get(failure_kind, 503)
+        attempts = [
+            item.model_dump(mode="json")
+            for item in exc.provider_attempts
+            if hasattr(item, "model_dump")
+        ][:64]
+        return HTTPException(
+            status_code=status,
+            detail={
+                "code": f"destination_{failure_kind}",
+                "message": "All usable destination data replicas failed.",
+                "provider_attempts": attempts,
+            },
+        )
     return HTTPException(
         status_code=503,
         detail="Destination place data is temporarily unavailable.",
@@ -262,6 +285,9 @@ def _hotel_error(exc: HotelPriceError) -> HTTPException:
             "code": exc.code,
             "message": str(exc),
             "quota_scope": exc.quota_scope,
+            "provider_runs": [
+                run.as_safe_dict() for run in exc.provider_runs
+            ],
         },
     )
 
@@ -389,15 +415,20 @@ def destination_hotel_prices(request: HotelPricesRequest) -> dict[str, object]:
         for item in result.offers
     ]
     warning = (
-        "结果来自一小时脱敏缓存，本次未消耗 SerpApi 查询额度。"
+        "结果来自一小时脱敏缓存，本次未消耗实时酒店来源额度。"
         if request.language != "en" and result.cache_hit
-        else "Results came from the one-hour sanitized cache; no SerpApi query was used."
+        else (
+            "Results came from the one-hour sanitized cache; "
+            "no live hotel-source allowance was used."
+        )
         if result.cache_hit
-        else "本次实时酒店价格查询与严格机票查询共用 SerpApi 免费额度。"
+        else (
+            f"严格酒店来源已按顺序查询；本次结果来自 {result.provider_name}。"
+        )
         if request.language != "en"
         else (
-            "This live hotel-price search shares the SerpApi free quota "
-            "with strict flight searches."
+            "Strict hotel sources were tried in order; "
+            f"this result came from {result.provider_name}."
         )
     )
     return {
@@ -415,6 +446,10 @@ def destination_hotel_prices(request: HotelPricesRequest) -> dict[str, object]:
         "quota_monthly_limit": result.quota_monthly_limit,
         "quota_hourly_used": result.quota_hourly_used,
         "quota_hourly_limit": result.quota_hourly_limit,
+        "quota_scope": result.quota_scope,
+        "provider_runs": [
+            run.as_safe_dict() for run in result.provider_runs
+        ],
         "quota_warning": warning,
     }
 
