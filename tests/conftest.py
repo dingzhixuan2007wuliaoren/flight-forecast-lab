@@ -15,6 +15,8 @@ def isolate_external_api_credentials(
 
     monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
     monkeypatch.delenv("SEARCHAPI_API_KEY", raising=False)
+    monkeypatch.delenv("SCRAPPA_API_KEY", raising=False)
+    monkeypatch.delenv("SCRAPPA_MONTHLY_LIMIT", raising=False)
     monkeypatch.delenv("SEARCHAPI_LIFETIME_LIMIT", raising=False)
     monkeypatch.delenv("SEARCHAPI_MONTHLY_LIMIT", raising=False)
     monkeypatch.delenv("IGNAV_API_KEY", raising=False)

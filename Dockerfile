@@ -9,6 +9,7 @@ COPY pyproject.toml constraints.txt README.md LICENSE ./
 COPY src ./src
 COPY artifacts/demo ./artifacts/demo
 RUN pip install --no-cache-dir -c constraints.txt . && \
+    python -c "from zoneinfo import ZoneInfo; ZoneInfo('America/Toronto'); ZoneInfo('Asia/Shanghai')" && \
     addgroup --system app && \
     adduser --system --ingroup app app && \
     mkdir -p /app/artifacts/runtime && \

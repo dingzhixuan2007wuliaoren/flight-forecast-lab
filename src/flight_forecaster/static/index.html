@@ -2214,6 +2214,7 @@
           fareProviderErrorBody: "当前严格报价提供商返回终态、HTTP 或网络错误，因此无法验证当前价格和余位；系统没有显示未验证航班。",
           fareProviderUnavailableTitle: "报价服务暂时不可用",
           fareProviderUnavailableBody: "无法验证当前价格与余位，请稍后重试。下方时刻表仅供参考。",
+          fareAggregateRecoveryBody: "系统已自动依次切换全部当前启用的严格报价源。暂时性失败来源每次最多受控重试一次；认证失败或额度错误不会盲目重试。请稍后发起新查询，或在提供商状态页检查需要人工修复的凭据。",
           fareProviderCoverageLimitedTitle: "本次验证覆盖受限",
           fareProviderCoverageLimitedBody: "本次已找到候选，但实际免费额度不足，未能验证全部候选；已验证子集中没有找到合格报价，不能据此断言其余候选不可购买。",
           fareNoResultsTitle: "未找到当前可售报价",
@@ -2487,6 +2488,7 @@
           fareProviderErrorBody: "The active strict-fare provider returned a terminal, HTTP, or transport error, so current price and availability could not be verified; no unverified flight is shown.",
           fareProviderUnavailableTitle: "Fare provider is temporarily unavailable",
           fareProviderUnavailableBody: "Current price and availability could not be verified. Try again later; timetable rows below are reference only.",
+          fareAggregateRecoveryBody: "The system automatically tried every currently enabled strict-fare source in order. A transiently failing source is retried at most once; authentication and quota failures are not retried blindly. Start a new search later, or check the provider-status page for credentials that require repair.",
           fareProviderCoverageLimitedTitle: "Verification coverage was limited",
           fareProviderCoverageLimitedBody: "Candidates were found, but actual free quota did not permit every candidate to be verified. No eligible offer was found in the verified subset; this does not prove the remaining candidates are unbookable.",
           fareNoResultsTitle: "No currently bookable fare found",
@@ -4120,6 +4122,24 @@
           if (keys[status]) {
             titleKey = keys[status][0];
             bodyKey = keys[status][1];
+          }
+          var providerRuns = Array.isArray(metadata.provider_runs) ? metadata.provider_runs : [];
+          var aggregateFailureStatuses = {
+            fare_provider_authentication_failed: true,
+            fare_provider_rate_limited: true,
+            fare_provider_budget_exhausted: true,
+            fare_provider_processing: true,
+            fare_provider_error: true,
+            fare_provider_unavailable: true,
+            authentication_failed: true,
+            rate_limited: true,
+            budget_exhausted: true,
+            provider_processing: true,
+            provider_error: true,
+            provider_unavailable: true
+          };
+          if (providerRuns.length > 1 && aggregateFailureStatuses[status]) {
+            bodyKey = "fareAggregateRecoveryBody";
           }
         }
         byId("empty-title").textContent = t(titleKey);

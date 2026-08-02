@@ -14,6 +14,7 @@ import pytest
 from flight_forecaster.alternate_fare_providers import (
     FallbackFlightOfferProvider,
     IgnavQuarantineFlightOfferProvider,
+    ScrappaFlightOfferProvider,
     SearchApiFlightOfferProvider,
 )
 from flight_forecaster.availability import (
@@ -2120,9 +2121,10 @@ def test_env_factory_auto_enables_released_ignav_strict_fallback(
 
     assert isinstance(provider, FallbackFlightOfferProvider)
     assert provider.environment == "production"
-    assert len(provider.providers) == 3
+    assert len(provider.providers) == 4
     assert isinstance(provider.providers[0], SerpApiFlightOfferProvider)
     assert isinstance(provider.providers[1], SearchApiFlightOfferProvider)
-    assert isinstance(provider.providers[2], IgnavQuarantineFlightOfferProvider)
-    assert provider.providers[2].provider_code == IGNAV_VERIFIED_PROVIDER_CODE
+    assert isinstance(provider.providers[2], ScrappaFlightOfferProvider)
+    assert isinstance(provider.providers[3], IgnavQuarantineFlightOfferProvider)
+    assert provider.providers[3].provider_code == IGNAV_VERIFIED_PROVIDER_CODE
     assert provider.providers[-1].strict_release_enabled is True
