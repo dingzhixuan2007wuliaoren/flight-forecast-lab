@@ -2326,21 +2326,60 @@ def _scrappa_search_parameters_match(
     cabin: Cabin,
 ) -> bool:
     metadata = payload.get("search_metadata")
+    flights = payload.get("flights")
+    # Scrappa's documented empty-result response uses an empty metadata array.
+    # It is safe to accept only when the provider also returned no candidates.
+    if flights == [] and metadata == []:
+        return True
     if not isinstance(metadata, dict):
         return False
-    passengers = metadata.get("passengers")
-    return bool(
+    if not (
         _iata(metadata.get("origin")) == origin
         and _iata(metadata.get("destination")) == destination
         and str(metadata.get("departure_date", "")) == departure_date.isoformat()
-        and _normalized_phrase(metadata.get("cabin_class"))
-        == _normalized_phrase(cabin)
-        and isinstance(passengers, dict)
-        and passengers.get("adults") == 1
-        and all(passengers.get(key, 0) == 0 for key in (
-            "children", "infants_in_seat", "infants_on_lap"
-        ))
-    )
+    ):
+        return False
+
+    # The public success contract does not always echo cabin or passenger
+    # fields.  When Scrappa does echo them they remain fail-closed: every value
+    # must agree with the request that produced this synchronous response.
+    if "cabin_class" in metadata and (
+        _normalized_phrase(metadata.get("cabin_class"))
+        != _normalized_phrase(cabin)
+    ):
+        return False
+
+    expected_counts = {
+        "adults": 1,
+        "children": 0,
+        "infants_in_seat": 0,
+        "infants_on_lap": 0,
+    }
+    if "passengers" in metadata:
+        passengers = metadata.get("passengers")
+        if not isinstance(passengers, dict):
+            return False
+        if any(
+            key in passengers
+            and not _scrappa_count_matches(passengers.get(key), expected)
+            for key, expected in expected_counts.items()
+        ):
+            return False
+    if any(
+        key in metadata
+        and not _scrappa_count_matches(metadata.get(key), expected)
+        for key, expected in expected_counts.items()
+    ):
+        return False
+    return True
+
+
+def _scrappa_count_matches(value: Any, expected: int) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == expected
+    return isinstance(value, str) and value.strip() == str(expected)
 
 
 def _select_scrappa_candidates(

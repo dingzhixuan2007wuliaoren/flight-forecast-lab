@@ -25,6 +25,7 @@ from flight_forecaster.alternate_fare_providers import (
     _parse_ignav_segments,
     _parse_scrappa_segments,
     _parse_searchapi_segments,
+    _scrappa_search_parameters_match,
 )
 from flight_forecaster.availability import (
     AGGREGATE_PROVIDER_CODE,
@@ -1467,6 +1468,93 @@ def test_scrappa_numeric_flight_number_and_zero_search_price_are_verified(
     assert all(offer.total_amount_usd == 510 for offer in result.offers)
     assert all(offer.segments[0].flight_number == "801" for offer in result.offers)
     assert sum(url == SCRAPPA_BOOKING_DETAILS_URL for url, _ in client.calls) == 4
+
+
+def test_scrappa_accepts_documented_minimal_search_metadata() -> None:
+    payload = {
+        "flights": [{"booking_token": "redacted-test-token"}],
+        "search_metadata": {
+            "origin": "YYZ",
+            "destination": "LHR",
+            "departure_date": DEPARTURE_DATE.isoformat(),
+            "response_time_ms": 842,
+        },
+    }
+
+    assert _scrappa_search_parameters_match(
+        payload,
+        origin="YYZ",
+        destination="LHR",
+        departure_date=DEPARTURE_DATE,
+        cabin="economy",
+    )
+
+
+def test_scrappa_validates_optional_flat_passenger_metadata() -> None:
+    payload = {
+        "flights": [{"booking_token": "redacted-test-token"}],
+        "search_metadata": {
+            "origin": "YYZ",
+            "destination": "LHR",
+            "departure_date": DEPARTURE_DATE.isoformat(),
+            "cabin_class": "economy",
+            "adults": "1",
+            "children": 0,
+        },
+    }
+
+    assert _scrappa_search_parameters_match(
+        payload,
+        origin="YYZ",
+        destination="LHR",
+        departure_date=DEPARTURE_DATE,
+        cabin="economy",
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata_patch",
+    (
+        {"destination": "JFK"},
+        {"cabin_class": "business"},
+        {"adults": 2},
+        {"passengers": {"adults": 1, "children": 1}},
+    ),
+)
+def test_scrappa_rejects_contradictory_optional_search_metadata(
+    metadata_patch: dict[str, Any],
+) -> None:
+    metadata: dict[str, Any] = {
+        "origin": "YYZ",
+        "destination": "LHR",
+        "departure_date": DEPARTURE_DATE.isoformat(),
+    }
+    metadata.update(metadata_patch)
+
+    assert not _scrappa_search_parameters_match(
+        {"flights": [{"booking_token": "redacted-test-token"}], "search_metadata": metadata},
+        origin="YYZ",
+        destination="LHR",
+        departure_date=DEPARTURE_DATE,
+        cabin="economy",
+    )
+
+
+def test_scrappa_accepts_documented_empty_result_metadata_array() -> None:
+    assert _scrappa_search_parameters_match(
+        {"flights": [], "search_metadata": []},
+        origin="YYZ",
+        destination="LHR",
+        departure_date=DEPARTURE_DATE,
+        cabin="economy",
+    )
+    assert not _scrappa_search_parameters_match(
+        {"flights": [{"booking_token": "redacted-test-token"}], "search_metadata": []},
+        origin="YYZ",
+        destination="LHR",
+        departure_date=DEPARTURE_DATE,
+        cabin="economy",
+    )
 
 
 def test_scrappa_http_200_search_error_envelope_is_provider_error(
