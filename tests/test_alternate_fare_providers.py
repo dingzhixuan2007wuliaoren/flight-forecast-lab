@@ -23,6 +23,7 @@ from flight_forecaster.alternate_fare_providers import (
     ScrappaFlightOfferProvider,
     SearchApiFlightOfferProvider,
     _parse_ignav_segments,
+    _parse_scrappa_segments,
     _parse_searchapi_segments,
 )
 from flight_forecaster.availability import (
@@ -315,8 +316,18 @@ class _NoCallClient:
 
 
 class _ScrappaClient:
-    def __init__(self, *, candidates_per_cabin: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        candidates_per_cabin: int = 2,
+        zero_search_price: bool = False,
+        search_error_envelope: bool = False,
+        booking_error_envelope: bool = False,
+    ) -> None:
         self.candidates_per_cabin = candidates_per_cabin
+        self.zero_search_price = zero_search_price
+        self.search_error_envelope = search_error_envelope
+        self.booking_error_envelope = booking_error_envelope
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def get(
@@ -332,12 +343,22 @@ class _ScrappaClient:
         self.calls.append((url, dict(params)))
         cabin = str(params["cabin_class"])
         if url == SCRAPPA_ONE_WAY_URL:
+            if self.search_error_envelope:
+                return _Response(
+                    {
+                        "error": "upstream search failed",
+                        "service": "google_flights_one_way",
+                        "request_id": f"scrappa-search-error-{cabin}",
+                    }
+                )
             return _Response(
                 {
                     "flights": [
                         {
                             "booking_token": f"scrappa-token-{cabin}-{index}",
-                            "price": 500 + index,
+                            "price": (
+                                0 if self.zero_search_price else 500 + index
+                            ),
                             "currency": "USD",
                             "total_duration_minutes": 720,
                             "legs": [
@@ -349,7 +370,7 @@ class _ScrappaClient:
                                     "duration_minutes": 420,
                                     "airline": "AC",
                                     "airline_name": "Air Canada",
-                                    "flight_number": "AC 801",
+                                    "flight_number": "801",
                                     "stops": 0,
                                 }
                             ],
@@ -372,6 +393,16 @@ class _ScrappaClient:
                 }
             )
         assert url == SCRAPPA_BOOKING_DETAILS_URL
+        if self.booking_error_envelope:
+            return _Response(
+                {
+                    "error": "upstream booking verification failed",
+                    "service": "google_flights_booking_details",
+                    "failed_stage": "booking_request_exhausted",
+                    "reason": "cookie_session_unavailable",
+                    "request_id": f"scrappa-booking-error-{cabin}",
+                }
+            )
         index = int(str(params["booking_token"]).rsplit("-", 1)[1])
         return _Response(
             {
@@ -1413,6 +1444,122 @@ def test_scrappa_verifies_every_candidate_without_a_six_offer_cap(tmp_path: Path
     assert sum(url == SCRAPPA_ONE_WAY_URL for url, _ in client.calls) == 4
     assert sum(url == SCRAPPA_BOOKING_DETAILS_URL for url, _ in client.calls) == 8
     assert all(offer.total_amount_usd == 510 for offer in result.offers)
+
+
+def test_scrappa_numeric_flight_number_and_zero_search_price_are_verified(
+    tmp_path: Path,
+) -> None:
+    client = _ScrappaClient(candidates_per_cabin=1, zero_search_price=True)
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.eligible_candidate_count == 4
+    assert result.verification_attempted_count == 4
+    assert result.verified_candidate_count == 4
+    assert len(result.offers) == 4
+    assert all(offer.total_amount_usd == 510 for offer in result.offers)
+    assert all(offer.segments[0].flight_number == "801" for offer in result.offers)
+    assert sum(url == SCRAPPA_BOOKING_DETAILS_URL for url, _ in client.calls) == 4
+
+
+def test_scrappa_http_200_search_error_envelope_is_provider_error(
+    tmp_path: Path,
+) -> None:
+    client = _ScrappaClient(search_error_envelope=True)
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "provider_error"
+    assert result.search_failed_cabin_count == 4
+    assert result.eligible_candidate_count == 0
+    assert result.coverage_status == "provider_incomplete"
+    assert all(item.exception_type == "ProviderError" for item in result.diagnostics)
+
+
+def test_scrappa_http_200_booking_error_envelope_is_not_a_strict_rejection(
+    tmp_path: Path,
+) -> None:
+    client = _ScrappaClient(candidates_per_cabin=1, booking_error_envelope=True)
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "provider_error"
+    assert result.eligible_candidate_count == 4
+    assert result.verification_attempted_count == 4
+    assert result.provider_failed_candidate_count == 4
+    assert result.strictly_rejected_candidate_count == 0
+    assert result.verified_candidate_count == 0
+    assert all(item.exception_type == "ProviderError" for item in result.diagnostics)
+
+
+def test_scrappa_accepts_numeric_flight_number_with_separate_airline_code() -> None:
+    segments = _parse_scrappa_segments(
+        [
+            {
+                "departure_airport": "YYZ",
+                "arrival_airport": "HKG",
+                "departure_time": f"{DEPARTURE_DATE.isoformat()}T09:00",
+                "arrival_time": f"{DEPARTURE_DATE.isoformat()}T21:00",
+                "duration_minutes": 720,
+                "airline": "CX",
+                "flight_number": "821",
+                "stops": 0,
+            }
+        ],
+        "economy",
+    )
+
+    assert len(segments) == 1
+    assert segments[0].marketing_airline_code == "CX"
+    assert segments[0].flight_number == "821"
+
+
+@pytest.mark.parametrize(
+    ("airline", "flight_number"),
+    (
+        (None, "821"),
+        ("CX", "AC 821"),
+        ("Cathay Pacific", "821"),
+        ("CX", "CX821"),
+    ),
+)
+def test_scrappa_rejects_ambiguous_or_mismatched_flight_numbers(
+    airline: str | None,
+    flight_number: str,
+) -> None:
+    legs = [
+        {
+            "departure_airport": "YYZ",
+            "arrival_airport": "HKG",
+            "departure_time": f"{DEPARTURE_DATE.isoformat()}T09:00",
+            "arrival_time": f"{DEPARTURE_DATE.isoformat()}T21:00",
+            "duration_minutes": 720,
+            "airline": airline,
+            "flight_number": flight_number,
+            "stops": 0,
+        }
+    ]
+
+    assert _parse_scrappa_segments(legs, "economy") == ()
 
 
 def test_scrappa_local_hard_wall_resets_by_utc_calendar_month(tmp_path: Path) -> None:

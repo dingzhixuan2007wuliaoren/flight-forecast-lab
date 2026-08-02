@@ -55,6 +55,7 @@ from flight_forecaster.availability import (
     _checked_bags_quantity,
     _direct_first_cabin_round_robin,
     _finite_amount,
+    _flight_number,
     _google_market_for_origin,
     _iata,
     _normalized_phrase,
@@ -2222,6 +2223,15 @@ class ScrappaFlightOfferProvider(_AdapterBase):
                 "User-Agent": "flight-forecast-lab/0.2.0 (strict booking verification)",
             },
         )
+        if _scrappa_error_envelope(payload):
+            diagnostics.record(
+                stage="cabin_search",
+                http_status=http_status,
+                exception_type="ProviderError",
+                search_id=_scrappa_payload_id(payload),
+                observed_at=received_at,
+            )
+            raise _ProviderError("Scrappa returned a search error envelope")
         if not _scrappa_search_parameters_match(
             payload,
             origin=origin,
@@ -2247,7 +2257,7 @@ class ScrappaFlightOfferProvider(_AdapterBase):
         departure_date: date,
         diagnostics: _Diagnostics,
     ) -> tuple[dict[str, Any], datetime, int]:
-        return self._request_json(
+        payload, received_at, http_status = self._request_json(
             "GET",
             SCRAPPA_BOOKING_DETAILS_URL,
             stage="booking_options",
@@ -2271,6 +2281,23 @@ class ScrappaFlightOfferProvider(_AdapterBase):
                 "User-Agent": "flight-forecast-lab/0.2.0 (strict booking verification)",
             },
         )
+        if _scrappa_error_envelope(payload):
+            diagnostics.record(
+                stage="booking_options",
+                http_status=http_status,
+                exception_type="ProviderError",
+                search_id=_scrappa_payload_id(payload),
+                observed_at=received_at,
+            )
+            raise _ProviderError("Scrappa returned a booking error envelope")
+        return payload, received_at, http_status
+
+
+def _scrappa_error_envelope(payload: dict[str, Any]) -> bool:
+    if payload.get("success") is False:
+        return True
+    error = payload.get("error")
+    return isinstance(error, (str, dict, list)) and bool(error)
 
 
 def _scrappa_payload_id(payload: Any) -> str | None:
@@ -2369,7 +2396,7 @@ def _parse_scrappa_candidate(
         token is None
         or len(token) > 4_096
         or amount is None
-        or amount <= 0
+        or amount < 0
         or currency != "USD"
         or total_duration is None
         or not isinstance(raw_legs, list)
@@ -2405,7 +2432,18 @@ def _parse_scrappa_segments(
         destination = _iata(row.get("arrival_airport"))
         departure_at = _naive_iso_datetime(row.get("departure_time"))
         arrival_at = _naive_iso_datetime(row.get("arrival_time"))
-        parsed_number = _split_full_flight_number(row.get("flight_number"))
+        raw_number = row.get("flight_number")
+        parsed_number = _split_full_flight_number(raw_number)
+        returned_airline = _airline_code(row.get("airline"))
+        if parsed_number is None:
+            number = _flight_number(raw_number)
+            if number is None or not number.isdigit() or returned_airline is None:
+                return ()
+            airline_code = returned_airline
+        else:
+            airline_code, number = parsed_number
+            if returned_airline is not None and returned_airline != airline_code:
+                return ()
         duration = _positive_duration(row.get("duration_minutes"))
         if (
             origin is None
@@ -2414,7 +2452,6 @@ def _parse_scrappa_segments(
             or departure_at is None
             or arrival_at is None
             or arrival_at <= departure_at
-            or parsed_number is None
             or duration is None
         ):
             return ()
@@ -2422,10 +2459,6 @@ def _parse_scrappa_segments(
             segments[-1].destination != origin
             or departure_at <= segments[-1].arrival_at
         ):
-            return ()
-        airline_code, number = parsed_number
-        returned_airline = _airline_code(row.get("airline"))
-        if returned_airline is not None and returned_airline != airline_code:
             return ()
         segments.append(
             FlightOfferSegment(
