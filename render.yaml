@@ -31,6 +31,6 @@ services:
       - key: IGNAV_LIFETIME_LIMIT
         value: "1000"
       - key: IGNAV_STRICT_RELEASE
-        value: "0"
+        value: "1"
       - key: IGNAV_FREE_ACCOUNT_ATTESTED
-        value: "0"
+        value: "1"

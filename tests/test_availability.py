@@ -11,7 +11,13 @@ from typing import Any
 
 import pytest
 
+from flight_forecaster.alternate_fare_providers import (
+    FallbackFlightOfferProvider,
+    IgnavQuarantineFlightOfferProvider,
+    SearchApiFlightOfferProvider,
+)
 from flight_forecaster.availability import (
+    IGNAV_VERIFIED_PROVIDER_CODE,
     SERPAPI_ACCOUNT_URL,
     SERPAPI_SEARCH_ARCHIVE_URL,
     SERPAPI_SEARCH_URL,
@@ -2097,3 +2103,26 @@ def test_env_factory_is_fail_closed_and_uses_serpapi_names(
     assert configured.configured is True
     assert configured.environment == "production"
     assert configured.monthly_limit == 250
+
+
+def test_env_factory_auto_enables_released_ignav_strict_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "auto")
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-only-serpapi-key")
+    monkeypatch.setenv("SEARCHAPI_API_KEY", "test-only-searchapi-key")
+    monkeypatch.setenv("IGNAV_API_KEY", "test-only-ignav-key")
+    monkeypatch.setenv("IGNAV_STRICT_RELEASE", "1")
+    monkeypatch.setenv("IGNAV_FREE_ACCOUNT_ATTESTED", "1")
+
+    provider = flight_offer_provider_from_env(tmp_path / "usage.sqlite3")
+
+    assert isinstance(provider, FallbackFlightOfferProvider)
+    assert provider.environment == "production"
+    assert len(provider.providers) == 3
+    assert isinstance(provider.providers[0], SerpApiFlightOfferProvider)
+    assert isinstance(provider.providers[1], SearchApiFlightOfferProvider)
+    assert isinstance(provider.providers[2], IgnavQuarantineFlightOfferProvider)
+    assert provider.providers[2].provider_code == IGNAV_VERIFIED_PROVIDER_CODE
+    assert provider.providers[-1].strict_release_enabled is True
