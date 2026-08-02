@@ -58,6 +58,8 @@ SERPAPI_PROVIDER_CODE = "serpapi_google_flights"
 SERPAPI_PROVIDER_NAME = "SerpApi Google Flights"
 SEARCHAPI_PROVIDER_CODE = "searchapi_google_flights"
 SEARCHAPI_PROVIDER_NAME = "SearchAPI.io Google Flights"
+SCRAPPA_PROVIDER_CODE = "scrappa_google_flights"
+SCRAPPA_PROVIDER_NAME = "Scrappa Google Flights"
 IGNAV_QUARANTINE_PROVIDER_CODE = "ignav_quarantine"
 IGNAV_QUARANTINE_PROVIDER_NAME = "Ignav (strict quarantine)"
 IGNAV_VERIFIED_PROVIDER_CODE = "ignav_verified_fares"
@@ -237,6 +239,7 @@ class ConfirmedFlightOffer:
         allowed_provider_names = {
             SERPAPI_PROVIDER_CODE: SERPAPI_PROVIDER_NAME,
             SEARCHAPI_PROVIDER_CODE: SEARCHAPI_PROVIDER_NAME,
+            SCRAPPA_PROVIDER_CODE: SCRAPPA_PROVIDER_NAME,
             IGNAV_VERIFIED_PROVIDER_CODE: IGNAV_VERIFIED_PROVIDER_NAME,
         }
         if allowed_provider_names.get(self.provider_code) != self.provider_name:
@@ -449,6 +452,7 @@ class FlightOfferSearchResult:
             "none": "No strict fare provider",
             SERPAPI_PROVIDER_CODE: SERPAPI_PROVIDER_NAME,
             SEARCHAPI_PROVIDER_CODE: SEARCHAPI_PROVIDER_NAME,
+            SCRAPPA_PROVIDER_CODE: SCRAPPA_PROVIDER_NAME,
             IGNAV_QUARANTINE_PROVIDER_CODE: IGNAV_QUARANTINE_PROVIDER_NAME,
             IGNAV_VERIFIED_PROVIDER_CODE: IGNAV_VERIFIED_PROVIDER_NAME,
             AGGREGATE_PROVIDER_CODE: AGGREGATE_PROVIDER_NAME,
@@ -2264,6 +2268,7 @@ def flight_offer_provider_from_env(
         )
     if provider in {
         "searchapi",
+        "scrappa",
         "ignav",
         "ignav_quarantine",
         "ignav_verified_fares",
@@ -2275,6 +2280,7 @@ def flight_offer_provider_from_env(
         from flight_forecaster.alternate_fare_providers import (
             FallbackFlightOfferProvider,
             IgnavQuarantineFlightOfferProvider,
+            ScrappaFlightOfferProvider,
             SearchApiFlightOfferProvider,
         )
 
@@ -2289,6 +2295,13 @@ def flight_offer_provider_from_env(
         )
         if provider == "searchapi":
             return searchapi
+        scrappa = ScrappaFlightOfferProvider(
+            os.getenv("SCRAPPA_API_KEY"),
+            usage_path=alternate_usage_path,
+            monthly_limit=os.getenv("SCRAPPA_MONTHLY_LIMIT", "500"),
+        )
+        if provider == "scrappa":
+            return scrappa
         ignav = IgnavQuarantineFlightOfferProvider(
             os.getenv("IGNAV_API_KEY") or os.getenv("IGNAV_TOKEN"),
             usage_path=alternate_usage_path,
@@ -2310,7 +2323,7 @@ def flight_offer_provider_from_env(
             usage_path=usage_path,
             monthly_limit=_environment_monthly_limit(),
         )
-        providers = (serpapi, searchapi)
+        providers = (serpapi, searchapi, scrappa)
         if provider == "auto":
             providers += (ignav,)
         return FallbackFlightOfferProvider(providers)

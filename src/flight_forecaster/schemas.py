@@ -48,6 +48,7 @@ ScheduleSource = Literal[
     "model_fallback",
     "serpapi_google_flights_booking",
     "searchapi_google_flights_booking",
+    "scrappa_google_flights_booking",
     "ignav_verified_booking",
 ]
 DepartureTimeBasis = Literal[
@@ -322,6 +323,11 @@ ProviderRuntimeStatus = Literal[
     "configured",
     "quota_available",
     "quota_exhausted",
+    "authentication_failed",
+    "temporarily_rate_limited",
+    "temporarily_processing",
+    "provider_error",
+    "provider_unavailable",
     "quarantined",
     "reference_only",
 ]
@@ -843,6 +849,7 @@ class LiveFare(BaseModel):
     provider_code: Literal[
         "serpapi_google_flights",
         "searchapi_google_flights",
+        "scrappa_google_flights",
         "ignav_verified_fares",
     ] = "serpapi_google_flights"
     provider_name: str = Field(min_length=1, max_length=255)
@@ -875,6 +882,7 @@ class LiveFare(BaseModel):
         provider_names = {
             "serpapi_google_flights": "SerpApi Google Flights",
             "searchapi_google_flights": "SearchAPI.io Google Flights",
+            "scrappa_google_flights": "Scrappa Google Flights",
             "ignav_verified_fares": "Ignav Verified Fares",
         }
         if self.provider_name != provider_names[self.provider_code]:
@@ -936,6 +944,7 @@ class FareSearchMetadata(BaseModel):
     provider_code: Literal[
         "serpapi_google_flights",
         "searchapi_google_flights",
+        "scrappa_google_flights",
         "ignav_quarantine",
         "ignav_verified_fares",
         "strict_fare_aggregate",
@@ -1152,6 +1161,7 @@ class FareSearchMetadata(BaseModel):
             maximum = {
                 "serpapi_google_flights": 250,
                 "searchapi_google_flights": 100,
+                "scrappa_google_flights": 500,
                 "ignav_quarantine": 1_000,
                 "ignav_verified_fares": 1_000,
                 "strict_fare_aggregate": 0,
@@ -1176,6 +1186,7 @@ class FareSearchMetadata(BaseModel):
         provider_names = {
             "serpapi_google_flights": "SerpApi Google Flights",
             "searchapi_google_flights": "SearchAPI.io Google Flights",
+            "scrappa_google_flights": "Scrappa Google Flights",
             "ignav_quarantine": "Ignav (strict quarantine)",
             "ignav_verified_fares": "Ignav Verified Fares",
             "strict_fare_aggregate": "Strict Fare Provider Aggregate",
@@ -1188,6 +1199,7 @@ class FareSearchMetadata(BaseModel):
         expected_quota_unit = {
             "serpapi_google_flights": "billing_period_requests",
             "searchapi_google_flights": "lifetime_requests",
+            "scrappa_google_flights": "billing_period_requests",
             "ignav_quarantine": "lifetime_requests",
             "ignav_verified_fares": "lifetime_requests",
             "strict_fare_aggregate": None,
@@ -1292,6 +1304,7 @@ class ComparisonOffer(BaseModel):
         priced_sources = {
             "serpapi_google_flights": "serpapi_google_flights_booking",
             "searchapi_google_flights": "searchapi_google_flights_booking",
+            "scrappa_google_flights": "scrappa_google_flights_booking",
             "ignav_verified_fares": "ignav_verified_booking",
         }
         if self.routing_status == "provider_itinerary":
@@ -1689,6 +1702,7 @@ class ItineraryLeg(BaseModel):
         "airlabs_recurring_timetable_projection",
         "serpapi_booking_confirmed",
         "searchapi_booking_confirmed",
+        "scrappa_booking_confirmed",
         "ignav_verified_booking_confirmed",
         "model_duration_only",
     ]
@@ -1750,6 +1764,7 @@ class ItineraryLeg(BaseModel):
         if self.data_basis in {
             "serpapi_booking_confirmed",
             "searchapi_booking_confirmed",
+            "scrappa_booking_confirmed",
             "ignav_verified_booking_confirmed",
         } and (
             self.marketing_airline_code is None or self.cabin is None
@@ -1898,6 +1913,7 @@ class OfferItinerary(BaseModel):
                 not in {
                     "serpapi_booking_confirmed",
                     "searchapi_booking_confirmed",
+                    "scrappa_booking_confirmed",
                     "ignav_verified_booking_confirmed",
                 }
                 for leg in self.legs
@@ -1942,6 +1958,7 @@ class PriceForecastCurve(BaseModel):
     anchor_provider_code: Literal[
         "serpapi_google_flights",
         "searchapi_google_flights",
+        "scrappa_google_flights",
         "ignav_verified_fares",
     ]
     raw_model_start_price_usd: float = Field(ge=0.0, allow_inf_nan=False)
@@ -2001,6 +2018,7 @@ class OfferDetailResponse(BaseModel):
         provider_basis = {
             "serpapi_google_flights": "serpapi_booking_confirmed",
             "searchapi_google_flights": "searchapi_booking_confirmed",
+            "scrappa_google_flights": "scrappa_booking_confirmed",
             "ignav_verified_fares": "ignav_verified_booking_confirmed",
         }[fare.provider_code]
         if any(leg.data_basis != provider_basis for leg in self.itinerary.legs):

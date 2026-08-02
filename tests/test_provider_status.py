@@ -48,6 +48,7 @@ def test_provider_status_reports_true_quota_scopes_without_secrets(monkeypatch) 
     secrets = {
         "SERPAPI_API_KEY": "serp-secret-not-for-response",
         "SEARCHAPI_API_KEY": "search-secret-not-for-response",
+        "SCRAPPA_API_KEY": "scrappa-secret-not-for-response",
         "IGNAV_API_KEY": "ignav-secret-not-for-response",
         "SCRAPE_DO_API_TOKEN": "scrapedo-secret-not-for-response",
         "AIRLABS_API_KEY": "airlabs-secret-not-for-response",
@@ -67,6 +68,7 @@ def test_provider_status_reports_true_quota_scopes_without_secrets(monkeypatch) 
     assert set(providers) == {
         "serpapi_google_flights",
         "searchapi_google_flights",
+        "scrappa_google_flights",
         "ignav_quarantine",
         "scrape_do_google_flights_reference",
         "airlabs_reference",
@@ -88,6 +90,14 @@ def test_provider_status_reports_true_quota_scopes_without_secrets(monkeypatch) 
         "lifetime_requests",
     )
     assert "does not renew monthly" in searchapi["notice"]["en"]
+
+    scrappa = providers["scrappa_google_flights"]
+    assert (scrappa["active"], scrappa["quota_limit"], scrappa["quota_unit"]) == (
+        True,
+        500,
+        "billing_period_requests",
+    )
+    assert "UTC calendar-month local safety ceiling" in scrappa["notice"]["en"]
 
     ignav = providers["ignav_quarantine"]
     assert ignav["status"] == "quarantined"
@@ -295,7 +305,7 @@ def test_hourly_rate_limit_preserves_real_billing_balance(
 
     assert (serpapi.active, serpapi.status, serpapi.quota_status) == (
         True,
-        "quota_available",
+        "temporarily_rate_limited",
         "available",
     )
     assert (serpapi.quota_used, serpapi.quota_limit, serpapi.quota_remaining) == (
@@ -304,6 +314,41 @@ def test_hourly_rate_limit_preserves_real_billing_balance(
         80,
     )
     assert serpapi.temporarily_rate_limited is True
+
+
+@pytest.mark.parametrize(
+    ("fare_status", "expected_runtime_status"),
+    (
+        ("authentication_failed", "authentication_failed"),
+        ("provider_processing", "temporarily_processing"),
+        ("provider_error", "provider_error"),
+        ("provider_unavailable", "provider_unavailable"),
+    ),
+)
+def test_current_strict_run_failure_overrides_configured_or_available_badge(
+    monkeypatch,
+    fare_status: str,
+    expected_runtime_status: str,
+) -> None:
+    monkeypatch.setenv("SERPAPI_API_KEY", "configured-but-never-returned")
+    monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "serpapi")
+    metadata = SimpleNamespace(
+        provider_code="serpapi_google_flights",
+        status=fare_status,
+        coverage_status="provider_incomplete",
+        monthly_calls_used=12,
+        monthly_call_limit=250,
+        quota_unit="billing_period_requests",
+        quota_limit=None,
+    )
+
+    providers = {item.code: item for item in _runtime_provider_status(metadata).providers}
+    serpapi = providers["serpapi_google_flights"]
+
+    assert serpapi.status == expected_runtime_status
+    assert serpapi.quota_status == "available"
+    assert (serpapi.quota_used, serpapi.quota_remaining) == (12, 238)
+    assert serpapi.active is True
 
 
 def test_billing_period_rate_limit_can_mark_account_quota_exhausted(monkeypatch) -> None:
@@ -554,9 +599,18 @@ def test_dashboard_only_shows_per_provider_quota_summary_and_links_to_detail() -
         "The provider does not publish verifiable usage to this interface",
         "额度账本暂时不可读取",
         "Quota ledger is temporarily unavailable",
+        "本次认证失败",
+        "Authentication failed for this search",
+        "本次供应商错误",
+        "Provider error for this search",
+        'authentication_failed:["statusAuthenticationFailed","risk"]',
+        'provider_unavailable:["statusProviderUnavailable","warn"]',
         'if(remaining!==null)quotaCell(quota,t(basis.remaining)',
         'basisKey==="configured_limit_only"',
-        'if(cached){render(cached);setState("loading",t("cached"),"cached")}load()',
+        "mergeRecentComparisonStatus",
+        "age>300000",
+        "comparisonSnapshot=cached",
+        "payload=mergeRecentComparisonStatus(payload,comparisonSnapshot)",
         "if(!present(value))return null",
         "flight-forecast-provider-status-v1",
         'href="/#provider-status-title"',

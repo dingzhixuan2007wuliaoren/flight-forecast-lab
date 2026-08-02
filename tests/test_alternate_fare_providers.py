@@ -15,9 +15,12 @@ from flight_forecaster import api as api_module
 from flight_forecaster.alternate_fare_providers import (
     IGNAV_BOOKING_LINKS_URL,
     IGNAV_ONE_WAY_URL,
+    SCRAPPA_BOOKING_DETAILS_URL,
+    SCRAPPA_ONE_WAY_URL,
     SEARCHAPI_SEARCH_URL,
     FallbackFlightOfferProvider,
     IgnavQuarantineFlightOfferProvider,
+    ScrappaFlightOfferProvider,
     SearchApiFlightOfferProvider,
     _parse_ignav_segments,
     _parse_searchapi_segments,
@@ -29,6 +32,8 @@ from flight_forecaster.availability import (
     IGNAV_QUARANTINE_PROVIDER_NAME,
     IGNAV_VERIFIED_PROVIDER_CODE,
     IGNAV_VERIFIED_PROVIDER_NAME,
+    SCRAPPA_PROVIDER_CODE,
+    SCRAPPA_PROVIDER_NAME,
     SEARCHAPI_PROVIDER_CODE,
     SEARCHAPI_PROVIDER_NAME,
     SERPAPI_PROVIDER_CODE,
@@ -307,6 +312,94 @@ class _BoundedConcurrentIgnavClient:
 class _NoCallClient:
     def get(self, *_args: Any, **_kwargs: Any) -> _Response:
         raise AssertionError("provider network must not be called")
+
+
+class _ScrappaClient:
+    def __init__(self, *, candidates_per_cabin: int = 2) -> None:
+        self.candidates_per_cabin = candidates_per_cabin
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        assert headers["x-api-key"] == "scrappa-test-key"
+        assert timeout > 0
+        self.calls.append((url, dict(params)))
+        cabin = str(params["cabin_class"])
+        if url == SCRAPPA_ONE_WAY_URL:
+            return _Response(
+                {
+                    "flights": [
+                        {
+                            "booking_token": f"scrappa-token-{cabin}-{index}",
+                            "price": 500 + index,
+                            "currency": "USD",
+                            "total_duration_minutes": 720,
+                            "legs": [
+                                {
+                                    "departure_airport": "YYZ",
+                                    "arrival_airport": "LHR",
+                                    "departure_time": f"{DEPARTURE_DATE.isoformat()}T09:00",
+                                    "arrival_time": f"{DEPARTURE_DATE.isoformat()}T21:00",
+                                    "duration_minutes": 420,
+                                    "airline": "AC",
+                                    "airline_name": "Air Canada",
+                                    "flight_number": "AC 801",
+                                    "stops": 0,
+                                }
+                            ],
+                        }
+                        for index in range(self.candidates_per_cabin)
+                    ],
+                    "search_metadata": {
+                        "origin": "YYZ",
+                        "destination": "LHR",
+                        "departure_date": DEPARTURE_DATE.isoformat(),
+                        "cabin_class": cabin,
+                        "passengers": {
+                            "adults": 1,
+                            "children": 0,
+                            "infants_in_seat": 0,
+                            "infants_on_lap": 0,
+                        },
+                        "request_id": f"scrappa-search-{cabin}",
+                    },
+                }
+            )
+        assert url == SCRAPPA_BOOKING_DETAILS_URL
+        index = int(str(params["booking_token"]).rsplit("-", 1)[1])
+        return _Response(
+            {
+                "flight_details": {
+                    "airline_code": "AC",
+                    "airline_name": "Air Canada",
+                    "total_duration_minutes": 720,
+                    "leg": {"flight_number": "801"},
+                },
+                "fare_options": [
+                    {
+                        "provider": "Air Canada",
+                        "price": 510 + index,
+                        "currency": "USD",
+                        "booking_url": "https://www.aircanada.com/booking/scrappa-test",
+                        "flight_numbers": ["AC 801"],
+                    }
+                ],
+                "booking_metadata": {
+                    "origin": "YYZ",
+                    "destination": "LHR",
+                    "departure_date": DEPARTURE_DATE.isoformat(),
+                    "airline": "AC",
+                    "flight_number": "801",
+                    "request_id": f"scrappa-booking-{cabin}-{index}",
+                },
+            }
+        )
 
     def post(self, *_args: Any, **_kwargs: Any) -> _Response:
         raise AssertionError("provider network must not be called")
@@ -1240,6 +1333,115 @@ def test_fallback_retries_one_transient_provider_failure_once() -> None:
     )
 
 
+def test_aggregate_failure_notice_explains_bounded_recovery_in_both_languages() -> None:
+    call_log: list[str] = []
+    authentication_failed = FlightOfferSearchResult(
+        offers=(),
+        status="authentication_failed",
+        observed_at=NOW,
+        environment="production",
+        searched_cabins=(),
+        calls_used=1,
+        cache_hit=False,
+        search_calls_used=1,
+        provider_code=SERPAPI_PROVIDER_CODE,
+        provider_name=SERPAPI_PROVIDER_NAME,
+    )
+    provider_unavailable = FlightOfferSearchResult(
+        offers=(),
+        status="provider_unavailable",
+        observed_at=NOW,
+        environment="production",
+        searched_cabins=(),
+        calls_used=1,
+        cache_hit=False,
+        search_calls_used=1,
+        provider_code=IGNAV_VERIFIED_PROVIDER_CODE,
+        provider_name=IGNAV_VERIFIED_PROVIDER_NAME,
+    )
+    result = FallbackFlightOfferProvider(
+        (
+            _SequencedFallbackStub(
+                "serpapi",
+                (authentication_failed,),
+                call_log,
+            ),
+            _SequencedFallbackStub(
+                "ignav",
+                (provider_unavailable, provider_unavailable),
+                call_log,
+            ),
+        )
+    ).search("YYZ", "PVG", DEPARTURE_DATE, fetched_at=NOW)
+
+    metadata = PredictionService._fare_metadata(result)
+
+    assert result.status == "provider_unavailable"
+    assert call_log == ["serpapi:false", "ignav:false", "ignav:true"]
+    assert "SerpApi Google Flights：认证失败" in metadata.notice.zh
+    assert "Ignav Verified Fares：供应商暂不可用" in metadata.notice.zh
+    assert "最多完成一次额度受控重试" in metadata.notice.zh
+    assert "不会对其盲目重复请求" in metadata.notice.zh
+    assert "authentication_failed" not in metadata.notice.zh
+    assert "provider_unavailable" not in metadata.notice.zh
+    assert "SerpApi Google Flights: authentication failed" in metadata.notice.en
+    assert "Ignav Verified Fares: provider temporarily unavailable" in metadata.notice.en
+    assert "at most one quota-controlled retry" in metadata.notice.en
+    assert "is not retried blindly" in metadata.notice.en
+
+
+def test_scrappa_verifies_every_candidate_without_a_six_offer_cap(tmp_path: Path) -> None:
+    client = _ScrappaClient(candidates_per_cabin=2)
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.provider_code == SCRAPPA_PROVIDER_CODE
+    assert result.provider_name == SCRAPPA_PROVIDER_NAME
+    assert result.eligible_candidate_count == 8
+    assert result.verification_attempted_count == 8
+    assert result.verified_candidate_count == 8
+    assert result.deduplicated_verified_count == 4
+    assert len(result.offers) == 4
+    assert result.calls_used == 12
+    assert sum(url == SCRAPPA_ONE_WAY_URL for url, _ in client.calls) == 4
+    assert sum(url == SCRAPPA_BOOKING_DETAILS_URL for url, _ in client.calls) == 8
+    assert all(offer.total_amount_usd == 510 for offer in result.offers)
+
+
+def test_scrappa_local_hard_wall_resets_by_utc_calendar_month(tmp_path: Path) -> None:
+    clock = {"now": datetime(2026, 8, 31, 23, 59, tzinfo=UTC)}
+    client = _ScrappaClient(candidates_per_cabin=0)
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        monthly_limit=4,
+        client=client,
+        now_provider=lambda: clock["now"],
+    )
+
+    august = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    august_exhausted = provider.search(
+        "YYZ", "CDG", DEPARTURE_DATE, fetched_at=NOW, force_refresh=True
+    )
+    clock["now"] = datetime(2026, 9, 1, tzinfo=UTC)
+    september = provider.search(
+        "YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW, force_refresh=True
+    )
+
+    assert august.status == "no_results"
+    assert august_exhausted.status == "budget_exhausted"
+    assert august_exhausted.quota_limit == "monthly"
+    assert september.status == "no_results"
+    assert september.search_monthly_used == 4
+
+
 @pytest.mark.parametrize(
     "status",
     (
@@ -1651,6 +1853,13 @@ def test_aggregate_authentication_failure_plus_quota_wall_is_structured(
     assert [
         run["status"] for run in payload["fare_search_metadata"]["provider_runs"]
     ] == ["authentication_failed", "budget_exhausted"]
+    serpapi_status = next(
+        provider
+        for provider in payload["provider_statuses"]
+        if provider["code"] == SERPAPI_PROVIDER_CODE
+    )
+    assert serpapi_status["status"] == "authentication_failed"
+    assert serpapi_status["active"] is True
     searchapi_status = next(
         provider
         for provider in payload["provider_statuses"]

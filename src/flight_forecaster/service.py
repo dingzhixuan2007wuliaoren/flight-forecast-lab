@@ -99,16 +99,19 @@ from flight_forecaster.training import ARTIFACT_FILENAME, SCHEMA_VERSION
 _FARE_PROVIDER_SOURCE_URLS = {
     "serpapi_google_flights": "https://serpapi.com/google-flights-api",
     "searchapi_google_flights": "https://www.searchapi.io/google-flights",
+    "scrappa_google_flights": "https://scrappa.co/services/google-flights-api",
     "ignav_verified_fares": "https://ignav.com/",
 }
 _FARE_PROVIDER_SCHEDULE_SOURCES = {
     "serpapi_google_flights": "serpapi_google_flights_booking",
     "searchapi_google_flights": "searchapi_google_flights_booking",
+    "scrappa_google_flights": "scrappa_google_flights_booking",
     "ignav_verified_fares": "ignav_verified_booking",
 }
 _FARE_PROVIDER_DETAIL_BASES = {
     "serpapi_google_flights": "serpapi_booking_confirmed",
     "searchapi_google_flights": "searchapi_booking_confirmed",
+    "scrappa_google_flights": "scrappa_booking_confirmed",
     "ignav_verified_fares": "ignav_verified_booking_confirmed",
 }
 
@@ -721,21 +724,89 @@ class PredictionService:
             monthly_used = None
         notice = notices[result.status]
         if result.provider_runs:
-            run_summary = "; ".join(
-                f"{run.provider_name}: {run.status}" for run in result.provider_runs
+            status_labels_zh = {
+                "confirmed_offers": "已验证报价",
+                "no_results": "确认无结果",
+                "not_configured": "未配置",
+                "test_environment_rejected": "测试环境已拒绝",
+                "authentication_failed": "认证失败",
+                "rate_limited": "暂时限流",
+                "budget_not_configured": "免费额度保护未配置",
+                "budget_exhausted": "免费额度已耗尽",
+                "provider_processing": "暂时处理中",
+                "provider_error": "供应商错误",
+                "provider_unavailable": "供应商暂不可用",
+            }
+            status_labels_en = {
+                "confirmed_offers": "verified offers",
+                "no_results": "confirmed no results",
+                "not_configured": "not configured",
+                "test_environment_rejected": "test environment rejected",
+                "authentication_failed": "authentication failed",
+                "rate_limited": "temporarily rate limited",
+                "budget_not_configured": "free-quota guard not configured",
+                "budget_exhausted": "free quota exhausted",
+                "provider_processing": "temporarily processing",
+                "provider_error": "provider error",
+                "provider_unavailable": "provider temporarily unavailable",
+            }
+            run_summary_zh = "；".join(
+                f"{run.provider_name}：{status_labels_zh[run.status]}"
+                for run in result.provider_runs
+            )
+            run_summary_en = "; ".join(
+                f"{run.provider_name}: {status_labels_en[run.status]}"
+                for run in result.provider_runs
+            )
+            transient_statuses = {
+                "provider_processing",
+                "provider_error",
+                "provider_unavailable",
+            }
+            transient_recovery_zh = (
+                " 暂时性失败来源已最多完成一次额度受控重试；"
+                "后续新查询仍会自动切换可用来源。"
+                if any(run.status in transient_statuses for run in result.provider_runs)
+                else ""
+            )
+            transient_recovery_en = (
+                " Transiently failing sources received at most one quota-controlled "
+                "retry; a later new search will still fail over across eligible sources."
+                if any(run.status in transient_statuses for run in result.provider_runs)
+                else ""
+            )
+            credential_recovery_zh = (
+                " 认证失败来源需要修复凭据，系统不会对其盲目重复请求。"
+                if any(
+                    run.status == "authentication_failed"
+                    for run in result.provider_runs
+                )
+                else ""
+            )
+            credential_recovery_en = (
+                " A source with failed authentication requires a credential repair and "
+                "is not retried blindly."
+                if any(
+                    run.status == "authentication_failed"
+                    for run in result.provider_runs
+                )
+                else ""
             )
             notice = BilingualText(
                 zh=(
                     f"系统已执行 {len(result.provider_runs)} 个可用严格报价源，"
                     "并仅聚合各来源独立完成二次购票验证的结果。"
-                    f"同一完整航段与舱位只保留最低最终确认价；逐源状态：{run_summary}。"
+                    "同一完整航段与舱位只保留最低最终确认价；"
+                    f"逐源状态：{run_summary_zh}。"
+                    f"{transient_recovery_zh}{credential_recovery_zh}"
                 ),
                 en=(
                     f"The system ran {len(result.provider_runs)} available strict fare "
                     "sources and aggregated only offers that independently passed each "
                     "source's second-stage booking verification. Equivalent complete "
                     "itineraries and cabins retain only the lowest final confirmed fare. "
-                    f"Per-source status: {run_summary}."
+                    f"Per-source status: {run_summary_en}."
+                    f"{transient_recovery_en}{credential_recovery_en}"
                 ),
             )
         elif result.coverage_status in {"quota_limited", "quota_and_provider_incomplete"}:

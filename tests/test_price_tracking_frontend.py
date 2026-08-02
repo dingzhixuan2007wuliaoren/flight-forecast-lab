@@ -42,6 +42,8 @@ def test_main_page_keeps_provider_chain_diagnostics_in_empty_state() -> None:
 
 def test_render_uses_auto_strict_provider_failover_without_committed_secrets() -> None:
     assert "key: FLIGHT_OFFER_PROVIDER\n        value: auto" in RENDER_BLUEPRINT
+    assert 'key: IGNAV_STRICT_RELEASE\n        value: "1"' in RENDER_BLUEPRINT
+    assert 'key: IGNAV_FREE_ACCOUNT_ATTESTED\n        value: "1"' in RENDER_BLUEPRINT
     assert "key: SERPAPI_API_KEY\n        sync: false" in RENDER_BLUEPRINT
     assert "key: SEARCHAPI_API_KEY\n        sync: false" in RENDER_BLUEPRINT
     assert "key: IGNAV_API_KEY\n        sync: false" in RENDER_BLUEPRINT

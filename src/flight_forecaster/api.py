@@ -19,6 +19,7 @@ from flight_forecaster.airlabs_quota import (
 )
 from flight_forecaster.alternate_fare_providers import (
     read_alternate_provider_quota_snapshot,
+    read_monthly_provider_quota_snapshot,
 )
 from flight_forecaster.availability import read_serpapi_quota_snapshot
 from flight_forecaster.destination_guide import DESTINATION_SOURCE_REGISTRY
@@ -137,6 +138,8 @@ def _selected_provider_codes() -> set[str]:
         "searchapi": {"searchapi_google_flights"},
         "searchapi_io": {"searchapi_google_flights"},
         "searchapi_google_flights": {"searchapi_google_flights"},
+        "scrappa": {"scrappa_google_flights"},
+        "scrappa_google_flights": {"scrappa_google_flights"},
         "serpapi_searchapi": {
             "serpapi_google_flights",
             "searchapi_google_flights",
@@ -144,6 +147,7 @@ def _selected_provider_codes() -> set[str]:
         "auto": {
             "serpapi_google_flights",
             "searchapi_google_flights",
+            "scrappa_google_flights",
             ignav_code,
         },
         "ignav": {ignav_code},
@@ -194,6 +198,14 @@ def _ignav_quota_limit() -> int:
         ("IGNAV_LIFETIME_LIMIT",),
         default=1_000,
         maximum=1_000,
+    )
+
+
+def _scrappa_quota_limit() -> int:
+    return _bounded_quota_limit(
+        ("SCRAPPA_MONTHLY_LIMIT",),
+        default=500,
+        maximum=500,
     )
 
 
@@ -289,6 +301,7 @@ def _runtime_provider_status(
     selected = _selected_provider_codes()
     serpapi_configured = _credential_present("SERPAPI_API_KEY")
     searchapi_configured = _credential_present("SEARCHAPI_API_KEY")
+    scrappa_configured = _credential_present("SCRAPPA_API_KEY")
     ignav_configured = _credential_present("IGNAV_API_KEY", "IGNAV_TOKEN")
     ignav_released = _ignav_strict_release_active()
     scrape_do_configured = _credential_present(
@@ -340,6 +353,17 @@ def _runtime_provider_status(
             now=now,
         )
         if searchapi_configured
+        else QuotaLedgerSnapshot.unavailable()
+    )
+    scrappa_limit = _scrappa_quota_limit()
+    scrappa_snapshot = (
+        read_monthly_provider_quota_snapshot(
+            alternate_path,
+            provider_code="scrappa_google_flights",
+            hard_limit=scrappa_limit,
+            now=now,
+        )
+        if scrappa_configured
         else QuotaLedgerSnapshot.unavailable()
     )
     ignav_limit = _ignav_quota_limit()
@@ -555,6 +579,30 @@ def _runtime_provider_status(
             },
         ),
         strict_item(
+            code="scrappa_google_flights",
+            name="Scrappa Google Flights",
+            configured=scrappa_configured,
+            eligible=True,
+            quota_limit=scrappa_limit,
+            quota_unit="billing_period_requests",
+            quota_snapshot=scrappa_snapshot,
+            notice={
+                "zh": (
+                    "严格后备报价源；供应商公开说明免费额度为每月 500 credits。"
+                    "页面额度是 UTC 自然月本地安全硬上限，不是供应商上报余额，"
+                    "也不声称精确重置时刻。HTTP 402 或 429 会立即停止该来源；"
+                    "每个报价仍须通过完整行程、正 USD 价格和安全购票路径验证。"
+                ),
+                "en": (
+                    "Strict fallback fare source. The provider documents 500 free credits each "
+                    "month. The displayed quota is a UTC calendar-month local safety ceiling, "
+                    "not a provider-reported balance or exact reset timestamp. HTTP 402/429 "
+                    "stops this source; every offer still requires complete-itinerary, positive-"
+                    "USD-fare, and safe booking-path verification."
+                ),
+            },
+        ),
+        strict_item(
             code=("ignav_verified_fares" if ignav_released else "ignav_quarantine"),
             name=("Ignav Verified Fares" if ignav_released else "Ignav (strict quarantine)"),
             configured=ignav_configured,
@@ -739,6 +787,7 @@ def _runtime_provider_status(
         provider_code = {
             "serpapi": "serpapi_google_flights",
             "searchapi": "searchapi_google_flights",
+            "scrappa": "scrappa_google_flights",
             "ignav": "ignav_verified_fares" if ignav_released else "ignav_quarantine",
         }.get(provider_code, provider_code)
         if provider_code == "none" or not provider_code:
@@ -827,6 +876,21 @@ def _runtime_provider_status(
             update.update(status="quota_exhausted", quota_status="exhausted")
         elif quota_available and provider.status != "quarantined":
             update.update(status="quota_available", quota_status="available")
+        operational_status = {
+            "authentication_failed": "authentication_failed",
+            "provider_processing": "temporarily_processing",
+            "provider_error": "provider_error",
+            "provider_unavailable": "provider_unavailable",
+        }.get(fare_status)
+        if temporarily_rate_limited:
+            operational_status = "temporarily_rate_limited"
+        # Quota and operational health are independent. Keep the measured quota
+        # fields below, but let the current comparison expose a credential or
+        # provider outage instead of misleadingly labelling that source merely
+        # "configured" or "quota available". A confirmed account-level quota
+        # wall remains the stronger state.
+        if operational_status is not None and not exhausted:
+            update["status"] = operational_status
         if effective_used is not None:
             update["quota_used"] = effective_used
         if effective_limit is not None:

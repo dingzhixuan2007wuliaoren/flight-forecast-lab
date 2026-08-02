@@ -60,6 +60,10 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert "fare_provider_error" in dashboard
     assert "报价任务仍在处理中" in dashboard
     assert "Fare provider returned an error" in dashboard
+    assert "fareAggregateRecoveryBody" in dashboard
+    assert "暂时性失败来源每次最多受控重试一次" in dashboard
+    assert "A transiently failing source is retried at most once" in dashboard
+    assert "providerRuns.length > 1 && aggregateFailureStatuses[status]" in dashboard
     assert "isProcessingComparison" in dashboard
     assert "本次准点预测已忽略天气变量。" in dashboard
     assert "Weather was omitted from this on-time prediction." in dashboard

@@ -37,6 +37,8 @@ from flight_forecaster.availability import (
     IGNAV_VERIFIED_PROVIDER_NAME,
     MAX_CACHE_ENTRIES,
     MAX_PROVIDER_RESPONSE_BYTES,
+    SCRAPPA_PROVIDER_CODE,
+    SCRAPPA_PROVIDER_NAME,
     SEARCHAPI_PROVIDER_CODE,
     SEARCHAPI_PROVIDER_NAME,
     SERPAPI_PROVIDER_CODE,
@@ -77,6 +79,10 @@ from flight_forecaster.schemas import MAX_STRICT_ITINERARY_SEGMENTS
 SEARCHAPI_SEARCH_URL = "https://www.searchapi.io/api/v1/search"
 SEARCHAPI_FREE_CALL_LIMIT = 100
 
+SCRAPPA_ONE_WAY_URL = "https://scrappa.co/api/flights/one-way"
+SCRAPPA_BOOKING_DETAILS_URL = "https://scrappa.co/api/flights/booking-details"
+SCRAPPA_FREE_MONTHLY_LIMIT = 500
+
 IGNAV_ONE_WAY_URL = "https://ignav.com/api/fares/one-way"
 IGNAV_BOOKING_LINKS_URL = "https://ignav.com/api/fares/booking-links"
 IGNAV_FREE_CALL_LIMIT = 1_000
@@ -116,9 +122,12 @@ _FREE_LEDGER_PROVIDER_CODES = {
 _STRICT_PROVIDER_NAMES = {
     SERPAPI_PROVIDER_CODE: SERPAPI_PROVIDER_NAME,
     SEARCHAPI_PROVIDER_CODE: SEARCHAPI_PROVIDER_NAME,
+    SCRAPPA_PROVIDER_CODE: SCRAPPA_PROVIDER_NAME,
     IGNAV_QUARANTINE_PROVIDER_CODE: IGNAV_QUARANTINE_PROVIDER_NAME,
     IGNAV_VERIFIED_PROVIDER_CODE: IGNAV_VERIFIED_PROVIDER_NAME,
 }
+
+_MONTHLY_LEDGER_PROVIDER_CODES = {SCRAPPA_PROVIDER_CODE}
 
 
 class _AdapterError(RuntimeError):
@@ -157,9 +166,15 @@ class _TransportError(_AdapterError):
 
 
 class _UrllibResponse:
-    def __init__(self, status_code: int, body: bytes) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        body: bytes,
+        headers: Any = None,
+    ) -> None:
         self.status_code = status_code
         self.content = body
+        self.headers = headers or {}
 
     @property
     def text(self) -> str:
@@ -184,14 +199,14 @@ class _UrllibClient:
         try:
             with request.urlopen(call, timeout=timeout) as response:  # noqa: S310
                 body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
-                return _UrllibResponse(int(response.status), body)
+                return _UrllibResponse(int(response.status), body, response.headers)
         except Exception as exc:
             status = getattr(exc, "code", None)
             if isinstance(status, int):
                 body = getattr(exc, "read", lambda *_args: b"")(
                     MAX_PROVIDER_RESPONSE_BYTES + 1
                 )
-                return _UrllibResponse(status, body)
+                return _UrllibResponse(status, body, getattr(exc, "headers", None))
             raise
 
     def post(
@@ -211,14 +226,14 @@ class _UrllibClient:
         try:
             with request.urlopen(call, timeout=timeout) as response:  # noqa: S310
                 content = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
-                return _UrllibResponse(int(response.status), content)
+                return _UrllibResponse(int(response.status), content, response.headers)
         except Exception as exc:
             status = getattr(exc, "code", None)
             if isinstance(status, int):
                 content = getattr(exc, "read", lambda *_args: b"")(
                     MAX_PROVIDER_RESPONSE_BYTES + 1
                 )
-                return _UrllibResponse(status, content)
+                return _UrllibResponse(status, content, getattr(exc, "headers", None))
             raise
 
 
@@ -351,6 +366,154 @@ class _FreeCallLedger:
             raise ValueError("unsupported free-call ledger provider")
 
 
+class _MonthlyFreeCallLedger:
+    """UTC calendar-month hard wall for documented recurring free credits.
+
+    Scrappa documents 500 free credits "every month" but does not expose a
+    public balance/reset endpoint or an exact reset timestamp.  This ledger is
+    therefore deliberately labelled as a local ceiling: it uses the provider
+    clock's UTC calendar month and still stops immediately on provider 402/429
+    evidence.  It must never be presented as the supplier-reported balance.
+    """
+
+    def __init__(self, path: Path, now_provider: Any) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._now_provider = now_provider
+        self._lock = threading.Lock()
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS alternate_provider_monthly_usage (
+                    provider_code TEXT NOT NULL,
+                    period_key TEXT NOT NULL,
+                    reserved_calls INTEGER NOT NULL CHECK (reserved_calls >= 0),
+                    PRIMARY KEY(provider_code, period_key)
+                );
+                CREATE TABLE IF NOT EXISTS alternate_provider_diagnostics (
+                    diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider_code TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    http_status INTEGER,
+                    exception_type TEXT NOT NULL,
+                    search_id TEXT
+                );
+                """
+            )
+
+    def period_key(self) -> str:
+        value = self._now_provider()
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError("monthly free-call period clock is invalid")
+        return value.astimezone(UTC).strftime("%Y-%m")
+
+    def snapshot(self, provider_code: str) -> int:
+        self._validate_provider(provider_code)
+        period_key = self.period_key()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT reserved_calls FROM alternate_provider_monthly_usage
+                WHERE provider_code = ? AND period_key = ?
+                """,
+                (provider_code, period_key),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def reserve(
+        self,
+        provider_code: str,
+        calls: int,
+        *,
+        hard_limit: int,
+        require_all: bool = False,
+    ) -> int:
+        self._validate_provider(provider_code)
+        if isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
+            raise ValueError("monthly free-call reservation is invalid")
+        if isinstance(hard_limit, bool) or not isinstance(hard_limit, int) or hard_limit < 0:
+            raise ValueError("monthly free-call hard limit is invalid")
+        if not isinstance(require_all, bool):
+            raise ValueError("monthly free-call reservation mode is invalid")
+        if calls == 0:
+            return 0
+        period_key = self.period_key()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT reserved_calls FROM alternate_provider_monthly_usage
+                WHERE provider_code = ? AND period_key = ?
+                """,
+                (provider_code, period_key),
+            ).fetchone()
+            used = int(row[0]) if row is not None else 0
+            available = max(0, hard_limit - used)
+            reserved = calls if require_all and available >= calls else (
+                0 if require_all else min(calls, available)
+            )
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO alternate_provider_monthly_usage(
+                        provider_code, period_key, reserved_calls
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (provider_code, period_key, reserved),
+                )
+            elif reserved:
+                connection.execute(
+                    """
+                    UPDATE alternate_provider_monthly_usage
+                    SET reserved_calls = reserved_calls + ?
+                    WHERE provider_code = ? AND period_key = ?
+                    """,
+                    (reserved, provider_code, period_key),
+                )
+            connection.commit()
+        return reserved
+
+    def record(self, provider_code: str, diagnostic: ProviderDiagnostic) -> None:
+        self._validate_provider(provider_code)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO alternate_provider_diagnostics(
+                    provider_code, observed_at, stage, http_status,
+                    exception_type, search_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    provider_code,
+                    diagnostic.observed_at.isoformat(),
+                    diagnostic.stage,
+                    diagnostic.http_status,
+                    diagnostic.exception_type,
+                    diagnostic.search_id,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM alternate_provider_diagnostics
+                WHERE diagnostic_id IN (
+                    SELECT diagnostic_id FROM alternate_provider_diagnostics
+                    ORDER BY diagnostic_id DESC LIMIT -1 OFFSET 500
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30.0)
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+
+    @staticmethod
+    def _validate_provider(provider_code: str) -> None:
+        if provider_code not in _MONTHLY_LEDGER_PROVIDER_CODES:
+            raise ValueError("unsupported monthly free-call ledger provider")
+
+
 def read_alternate_provider_quota_snapshot(
     path: str | Path,
     *,
@@ -400,11 +563,62 @@ def read_alternate_provider_quota_snapshot(
             connection.close()
 
 
+def read_monthly_provider_quota_snapshot(
+    path: str | Path,
+    *,
+    provider_code: str,
+    hard_limit: int,
+    now: datetime,
+) -> QuotaLedgerSnapshot:
+    """Read the current UTC-month local ceiling without mutating its DB."""
+
+    ledger_path = Path(path)
+    if provider_code not in _MONTHLY_LEDGER_PROVIDER_CODES or not ledger_path.is_file():
+        return QuotaLedgerSnapshot.unavailable()
+    try:
+        limit = max(0, int(hard_limit))
+        observed_at = _utc(now)
+    except (TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    if limit < 1:
+        return QuotaLedgerSnapshot.unavailable()
+    period_key = observed_at.strftime("%Y-%m")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(ledger_path), timeout=1.0)
+        connection.execute("PRAGMA query_only = ON")
+        row = connection.execute(
+            """
+            SELECT reserved_calls FROM alternate_provider_monthly_usage
+            WHERE provider_code = ? AND period_key = ?
+            """,
+            (provider_code, period_key),
+        ).fetchone()
+        raw_used = int(row[0]) if row is not None else 0
+        if raw_used < 0:
+            return QuotaLedgerSnapshot.unavailable()
+        used = min(raw_used, limit)
+        return QuotaLedgerSnapshot(
+            available=True,
+            used=used,
+            limit=limit,
+            remaining=max(0, limit - used),
+            period_key=period_key,
+            data_basis="local_hard_limit",
+            observed_at=observed_at,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return QuotaLedgerSnapshot.unavailable()
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 class _Diagnostics:
     def __init__(
         self,
         provider_code: str,
-        ledger: _FreeCallLedger,
+        ledger: Any,
         now_provider: Any,
     ) -> None:
         self.provider_code = provider_code
@@ -463,6 +677,28 @@ class _SearchApiCandidate:
     @property
     def identity(self) -> tuple[Any, ...]:
         return _segment_identity(self.segments)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScrappaCandidate:
+    booking_token: str
+    cabin: Cabin
+    search_price_usd: float
+    total_duration_minutes: int
+    segments: tuple[FlightOfferSegment, ...]
+    airline_name: str
+
+    @property
+    def identity(self) -> tuple[Any, ...]:
+        return _segment_identity(self.segments)
+
+    @property
+    def lead_airline_code(self) -> str:
+        return self.segments[0].marketing_airline_code
+
+    @property
+    def lead_flight_number(self) -> str:
+        return self.segments[0].flight_number
 
 
 def _searchapi_failed_cabin_status(statuses: list[SearchStatus]) -> SearchStatus:
@@ -723,6 +959,15 @@ class _AdapterBase:
 
 
 def _response_search_id(response: Any) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        for key in ("x-request-id", "x-search-id"):
+            try:
+                candidate = str(headers.get(key, "")).strip()
+            except Exception:
+                candidate = ""
+            if _SAFE_ID_PATTERN.fullmatch(candidate):
+                return candidate
     try:
         payload = _safe_response_json(response)
     except Exception:
@@ -1641,6 +1886,739 @@ def _phrase_flag(
     if any(marker in phrase for phrase in phrases for marker in positive):
         return True
     return None
+
+
+class ScrappaFlightOfferProvider(_AdapterBase):
+    """Strict Scrappa Google Flights adapter with a UTC-month local hard wall.
+
+    Scrappa documents 500 recurring free credits per month.  Its public API
+    does not expose the account reset timestamp or remaining balance, so the
+    counter below is intentionally conservative and is never represented as a
+    provider-reported balance.  HTTP 402/429 evidence stops the current sweep.
+    """
+
+    provider_code = SCRAPPA_PROVIDER_CODE
+    provider_name = SCRAPPA_PROVIDER_NAME
+    ledger_provider_code = SCRAPPA_PROVIDER_CODE
+
+    def __init__(
+        self,
+        api_key: str | None,
+        *,
+        usage_path: Path,
+        monthly_limit: int | None = SCRAPPA_FREE_MONTHLY_LIMIT,
+        client: Any = None,
+        timeout_seconds: float = 25.0,
+        now_provider: Any = None,
+    ) -> None:
+        super().__init__(
+            usage_path=usage_path,
+            client=client,
+            timeout_seconds=timeout_seconds,
+            now_provider=now_provider,
+        )
+        self._api_key = (api_key or "").strip() or None
+        parsed_limit = _optional_positive_int(monthly_limit)
+        self.free_call_limit = min(
+            parsed_limit or SCRAPPA_FREE_MONTHLY_LIMIT,
+            SCRAPPA_FREE_MONTHLY_LIMIT,
+        )
+        self._ledger = _MonthlyFreeCallLedger(usage_path, self._now_provider)
+
+    @property
+    def configured(self) -> bool:
+        return self._api_key is not None
+
+    @property
+    def environment(self) -> str:
+        return "production" if self.configured else "disabled"
+
+    @property
+    def monthly_limit(self) -> int:
+        return self.free_call_limit
+
+    def search(
+        self,
+        origin: str,
+        destination: str,
+        departure_date: date,
+        *,
+        fetched_at: datetime,
+        force_refresh: bool = False,
+    ) -> FlightOfferSearchResult:
+        observed_at = _utc(fetched_at)
+        route = (_iata(origin), _iata(destination))
+        if not self.configured:
+            return self._result("not_configured", observed_at)
+        if (
+            route[0] is None
+            or route[1] is None
+            or route[0] == route[1]
+            or not isinstance(departure_date, date)
+            or isinstance(departure_date, datetime)
+        ):
+            return self._result("no_results", observed_at)
+        key = (route[0], route[1], departure_date)
+        with self._operation_lock:
+            cached = self._cached(key, observed_at, force_refresh=force_refresh)
+            if cached is not None:
+                return cached
+            result = self._search_uncached(route[0], route[1], departure_date, observed_at)
+            if result.status in {"confirmed_offers", "no_results"}:
+                self._remember(key, result)
+            return result
+
+    def _search_uncached(
+        self,
+        origin: str,
+        destination: str,
+        departure_date: date,
+        observed_at: datetime,
+    ) -> FlightOfferSearchResult:
+        diagnostics = _Diagnostics(self.ledger_provider_code, self._ledger, self._provider_now)
+        if self.free_call_limit - self._ledger.snapshot(self.ledger_provider_code) < len(_CABINS):
+            return self._result(
+                "budget_exhausted",
+                observed_at,
+                diagnostics=diagnostics.snapshot(),
+                quota_limit="monthly",
+            )
+        reserved_searches = self._ledger.reserve(
+            self.ledger_provider_code,
+            len(_CABINS),
+            hard_limit=self.free_call_limit,
+            require_all=True,
+        )
+        if reserved_searches != len(_CABINS):
+            return self._result(
+                "budget_exhausted",
+                observed_at,
+                diagnostics=diagnostics.snapshot(),
+                quota_limit="monthly",
+            )
+
+        payloads: dict[Cabin, dict[str, Any]] = {}
+        searched_cabins: list[Cabin] = []
+        failed_statuses: list[SearchStatus] = []
+        for cabin in _CABINS:
+            searched_cabins.append(cabin)
+            try:
+                payloads[cabin] = self._search_cabin(
+                    origin,
+                    destination,
+                    departure_date,
+                    cabin,
+                    diagnostics,
+                )
+            except _AdapterError as exc:
+                failed_statuses.append(exc.status)
+                # Provider quota/rate evidence is authoritative for this run.
+                if exc.status in {"budget_exhausted", "rate_limited"}:
+                    is_rate_limited = exc.status == "rate_limited"
+                    return self._result(
+                        exc.status,
+                        observed_at,
+                        searched_cabins=tuple(searched_cabins),
+                        search_calls_used=len(searched_cabins),
+                        diagnostics=diagnostics.snapshot(),
+                        search_failed_cabin_count=(1 if is_rate_limited else 0),
+                        coverage_status=(
+                            "quota_and_provider_incomplete"
+                            if is_rate_limited
+                            else "not_evaluated"
+                        ),
+                        quota_limit=("hourly" if is_rate_limited else "monthly"),
+                        retry_quota_limited=is_rate_limited,
+                    )
+            except Exception:
+                failed_statuses.append("provider_unavailable")
+                diagnostics.record(
+                    stage="cabin_search",
+                    http_status=None,
+                    exception_type="PayloadError",
+                )
+
+        candidates = _select_scrappa_candidates(
+            payloads,
+            origin,
+            destination,
+            departure_date,
+        )
+        if not candidates:
+            status = (
+                _searchapi_failed_cabin_status(failed_statuses)
+                if failed_statuses
+                else "no_results"
+            )
+            return self._result(
+                status,
+                observed_at,
+                searched_cabins=tuple(searched_cabins),
+                search_calls_used=len(searched_cabins),
+                diagnostics=diagnostics.snapshot(),
+                search_failed_cabin_count=len(failed_statuses),
+                coverage_status=("provider_incomplete" if failed_statuses else "complete"),
+            )
+
+        # A partial verification sweep would silently omit bookable flights.
+        # Reserve the whole candidate set atomically or fail closed before any
+        # booking-details call.  The worker count controls concurrency only.
+        reserved_candidates = self._ledger.reserve(
+            self.ledger_provider_code,
+            len(candidates),
+            hard_limit=self.free_call_limit,
+            require_all=True,
+        )
+        if reserved_candidates != len(candidates):
+            return self._result(
+                "budget_exhausted",
+                observed_at,
+                searched_cabins=tuple(searched_cabins),
+                search_calls_used=len(searched_cabins),
+                diagnostics=diagnostics.snapshot(),
+                eligible_candidate_count=len(candidates),
+                quota_skipped_candidate_count=len(candidates),
+                search_failed_cabin_count=len(failed_statuses),
+                coverage_status=(
+                    "quota_and_provider_incomplete" if failed_statuses else "quota_limited"
+                ),
+                quota_limit="monthly",
+            )
+
+        confirmed_by_position: dict[int, ConfirmedFlightOffer] = {}
+        provider_failures = 0
+        strict_rejections = 0
+        booking_statuses: list[SearchStatus] = []
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_ALTERNATE_BOOKING_WORKERS, len(candidates)),
+            thread_name_prefix="scrappa-booking",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._booking_details,
+                    candidate,
+                    origin,
+                    destination,
+                    departure_date,
+                    diagnostics,
+                ): (position, candidate)
+                for position, candidate in enumerate(candidates)
+            }
+            stop_for_quota = False
+            for future in as_completed(futures):
+                position, candidate = futures[future]
+                if future.cancelled():
+                    continue
+                try:
+                    payload, received_at, http_status = future.result()
+                    offer = _parse_scrappa_booking_confirmation(
+                        payload,
+                        candidate,
+                        origin,
+                        destination,
+                        departure_date,
+                        received_at,
+                    )
+                except _AdapterError as exc:
+                    provider_failures += 1
+                    booking_statuses.append(exc.status)
+                    if exc.status in {"budget_exhausted", "rate_limited"}:
+                        stop_for_quota = True
+                        for pending in futures:
+                            if not pending.done():
+                                pending.cancel()
+                    continue
+                except Exception:
+                    provider_failures += 1
+                    booking_statuses.append("provider_unavailable")
+                    diagnostics.record(
+                        stage="validation",
+                        http_status=None,
+                        exception_type="PayloadError",
+                    )
+                    continue
+                if offer is None:
+                    strict_rejections += 1
+                    diagnostics.record(
+                        stage="validation",
+                        http_status=http_status,
+                        exception_type="StrictCandidateRejected",
+                        search_id=_scrappa_payload_id(payload),
+                        observed_at=received_at,
+                    )
+                else:
+                    confirmed_by_position[position] = offer
+            if stop_for_quota:
+                # Running requests cannot be forcefully interrupted safely; no
+                # new work or controlled retry is issued after the evidence.
+                pass
+
+        attempted = provider_failures + strict_rejections + len(confirmed_by_position)
+        cancelled = len(candidates) - attempted
+        offers, deduplicated = _lowest_verified_offers(confirmed_by_position, len(candidates))
+        coverage_status = _candidate_coverage_status(
+            evaluated=True,
+            provider_failed=provider_failures,
+            quota_skipped=cancelled,
+            search_failed_cabins=len(failed_statuses),
+        )
+        common: dict[str, Any] = {
+            "searched_cabins": tuple(searched_cabins),
+            "search_calls_used": len(searched_cabins),
+            "pricing_calls_used": attempted,
+            "diagnostics": diagnostics.snapshot(),
+            "eligible_candidate_count": len(candidates),
+            "verification_attempted_count": attempted,
+            "verified_candidate_count": len(confirmed_by_position),
+            "strictly_rejected_candidate_count": strict_rejections,
+            "provider_failed_candidate_count": provider_failures,
+            "search_failed_cabin_count": len(failed_statuses),
+            "quota_skipped_candidate_count": cancelled,
+            "deduplicated_verified_count": deduplicated,
+            "coverage_status": coverage_status,
+            "quota_limit": (
+                (
+                    "hourly"
+                    if "rate_limited" in booking_statuses
+                    else "monthly"
+                )
+                if cancelled
+                else None
+            ),
+        }
+        if offers:
+            return self._result("confirmed_offers", observed_at, offers=offers, **common)
+        statuses = failed_statuses + booking_statuses
+        status = _searchapi_failed_cabin_status(statuses) if statuses else "no_results"
+        return self._result(status, observed_at, **common)
+
+    def _search_cabin(
+        self,
+        origin: str,
+        destination: str,
+        departure_date: date,
+        cabin: Cabin,
+        diagnostics: _Diagnostics,
+    ) -> dict[str, Any]:
+        payload, received_at, http_status = self._request_json(
+            "GET",
+            SCRAPPA_ONE_WAY_URL,
+            stage="cabin_search",
+            diagnostics=diagnostics,
+            params={
+                "origin": origin,
+                "destination": destination,
+                "departure_date": departure_date.isoformat(),
+                "adults": 1,
+                "cabin_class": cabin,
+                "max_stops": "any",
+                "hl": "en",
+                "gl": _google_market_for_origin(origin),
+                "currency": "USD",
+            },
+            headers={
+                "Accept": "application/json",
+                "x-api-key": str(self._api_key),
+                "User-Agent": "flight-forecast-lab/0.2.0 (strict booking verification)",
+            },
+        )
+        if not _scrappa_search_parameters_match(
+            payload,
+            origin=origin,
+            destination=destination,
+            departure_date=departure_date,
+            cabin=cabin,
+        ):
+            diagnostics.record(
+                stage="validation",
+                http_status=http_status,
+                exception_type="PayloadError",
+                search_id=_scrappa_payload_id(payload),
+                observed_at=received_at,
+            )
+            raise _PayloadError("Scrappa search parameters did not match")
+        return payload
+
+    def _booking_details(
+        self,
+        candidate: _ScrappaCandidate,
+        origin: str,
+        destination: str,
+        departure_date: date,
+        diagnostics: _Diagnostics,
+    ) -> tuple[dict[str, Any], datetime, int]:
+        return self._request_json(
+            "GET",
+            SCRAPPA_BOOKING_DETAILS_URL,
+            stage="booking_options",
+            diagnostics=diagnostics,
+            params={
+                "booking_token": candidate.booking_token,
+                "origin": origin,
+                "destination": destination,
+                "departure_date": departure_date.isoformat(),
+                "airline": candidate.lead_airline_code,
+                "flight_number": candidate.lead_flight_number,
+                "adults": 1,
+                "cabin_class": candidate.cabin,
+                "hl": "en",
+                "gl": _google_market_for_origin(origin),
+                "currency": "USD",
+            },
+            headers={
+                "Accept": "application/json",
+                "x-api-key": str(self._api_key),
+                "User-Agent": "flight-forecast-lab/0.2.0 (strict booking verification)",
+            },
+        )
+
+
+def _scrappa_payload_id(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for container_name in ("search_metadata", "booking_metadata"):
+        container = payload.get(container_name)
+        if isinstance(container, dict):
+            for key in ("request_id", "search_id", "id"):
+                candidate = _safe_search_id(container.get(key))
+                if candidate is not None:
+                    return candidate
+    for key in ("request_id", "search_id"):
+        candidate = _safe_search_id(payload.get(key))
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _scrappa_search_parameters_match(
+    payload: dict[str, Any],
+    *,
+    origin: str,
+    destination: str,
+    departure_date: date,
+    cabin: Cabin,
+) -> bool:
+    metadata = payload.get("search_metadata")
+    if not isinstance(metadata, dict):
+        return False
+    passengers = metadata.get("passengers")
+    return bool(
+        _iata(metadata.get("origin")) == origin
+        and _iata(metadata.get("destination")) == destination
+        and str(metadata.get("departure_date", "")) == departure_date.isoformat()
+        and _normalized_phrase(metadata.get("cabin_class"))
+        == _normalized_phrase(cabin)
+        and isinstance(passengers, dict)
+        and passengers.get("adults") == 1
+        and all(passengers.get(key, 0) == 0 for key in (
+            "children", "infants_in_seat", "infants_on_lap"
+        ))
+    )
+
+
+def _select_scrappa_candidates(
+    payloads: dict[Cabin, dict[str, Any]],
+    origin: str,
+    destination: str,
+    departure_date: date,
+) -> tuple[_ScrappaCandidate, ...]:
+    by_cabin: dict[Cabin, list[_ScrappaCandidate]] = {cabin: [] for cabin in _CABINS}
+    for cabin in _CABINS:
+        rows = payloads.get(cabin, {}).get("flights")
+        if not isinstance(rows, list):
+            continue
+        by_token: dict[str, _ScrappaCandidate] = {}
+        conflicts: set[str] = set()
+        for row in rows:
+            candidate = _parse_scrappa_candidate(
+                row,
+                cabin,
+                origin,
+                destination,
+                departure_date,
+            )
+            if candidate is None or candidate.booking_token in conflicts:
+                continue
+            previous = by_token.get(candidate.booking_token)
+            if previous is None:
+                by_token[candidate.booking_token] = candidate
+            elif previous.identity != candidate.identity:
+                by_token.pop(candidate.booking_token, None)
+                conflicts.add(candidate.booking_token)
+            elif candidate.search_price_usd < previous.search_price_usd:
+                by_token[candidate.booking_token] = candidate
+        by_cabin[cabin] = list(by_token.values())
+    return _direct_first_cabin_round_robin(by_cabin)
+
+
+def _parse_scrappa_candidate(
+    row: Any,
+    cabin: Cabin,
+    origin: str,
+    destination: str,
+    departure_date: date,
+) -> _ScrappaCandidate | None:
+    if not isinstance(row, dict):
+        return None
+    token = _opaque_token(row.get("booking_token"))
+    amount = _finite_amount(row.get("price"))
+    currency = str(row.get("currency", "")).strip().upper()
+    raw_legs = row.get("legs")
+    total_duration = _positive_duration(row.get("total_duration_minutes"))
+    if (
+        token is None
+        or len(token) > 4_096
+        or amount is None
+        or amount <= 0
+        or currency != "USD"
+        or total_duration is None
+        or not isinstance(raw_legs, list)
+    ):
+        return None
+    segments = _parse_scrappa_segments(raw_legs, cabin)
+    if not _segments_match_request(segments, origin, destination, departure_date):
+        return None
+    return _ScrappaCandidate(
+        booking_token=token,
+        cabin=cabin,
+        search_price_usd=amount,
+        total_duration_minutes=total_duration,
+        segments=segments,
+        airline_name=_short_text(
+            raw_legs[0].get("airline_name") or raw_legs[0].get("airline"),
+            max_length=160,
+        ) or segments[0].marketing_airline_code,
+    )
+
+
+def _parse_scrappa_segments(
+    rows: list[Any],
+    cabin: Cabin,
+) -> tuple[FlightOfferSegment, ...]:
+    if not 1 <= len(rows) <= MAX_STRICT_ITINERARY_SEGMENTS:
+        return ()
+    segments: list[FlightOfferSegment] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("stops", 0) != 0:
+            return ()
+        origin = _iata(row.get("departure_airport"))
+        destination = _iata(row.get("arrival_airport"))
+        departure_at = _naive_iso_datetime(row.get("departure_time"))
+        arrival_at = _naive_iso_datetime(row.get("arrival_time"))
+        parsed_number = _split_full_flight_number(row.get("flight_number"))
+        duration = _positive_duration(row.get("duration_minutes"))
+        if (
+            origin is None
+            or destination is None
+            or origin == destination
+            or departure_at is None
+            or arrival_at is None
+            or arrival_at <= departure_at
+            or parsed_number is None
+            or duration is None
+        ):
+            return ()
+        if segments and (
+            segments[-1].destination != origin
+            or departure_at <= segments[-1].arrival_at
+        ):
+            return ()
+        airline_code, number = parsed_number
+        returned_airline = _airline_code(row.get("airline"))
+        if returned_airline is not None and returned_airline != airline_code:
+            return ()
+        segments.append(
+            FlightOfferSegment(
+                segment_id=f"{airline_code}{number}-{departure_at:%Y%m%d%H%M}-{index}",
+                origin=origin,
+                destination=destination,
+                departure_at=departure_at,
+                arrival_at=arrival_at,
+                marketing_airline_code=airline_code,
+                operating_airline_code=None,
+                flight_number=number,
+                departure_terminal=None,
+                arrival_terminal=None,
+                aircraft_icao=_short_text(row.get("aircraft"), max_length=40),
+                cabin=cabin,
+                booking_class=None,
+                fare_basis=None,
+                fare_brand=None,
+                checked_bags_quantity=None,
+                checked_bags_weight=None,
+                checked_bags_weight_unit=None,
+            )
+        )
+    return tuple(segments)
+
+
+def _parse_scrappa_booking_confirmation(
+    payload: dict[str, Any],
+    candidate: _ScrappaCandidate,
+    origin: str,
+    destination: str,
+    departure_date: date,
+    received_at: datetime,
+) -> ConfirmedFlightOffer | None:
+    metadata = payload.get("booking_metadata")
+    details = payload.get("flight_details")
+    if not isinstance(metadata, dict) or not isinstance(details, dict):
+        return None
+    if (
+        _iata(metadata.get("origin")) != origin
+        or _iata(metadata.get("destination")) != destination
+        or str(metadata.get("departure_date", "")) != departure_date.isoformat()
+        or _airline_code(metadata.get("airline")) != candidate.lead_airline_code
+        or str(metadata.get("flight_number", "")).strip().upper()
+        != candidate.lead_flight_number
+    ):
+        return None
+    detail_code = _airline_code(details.get("airline_code"))
+    detail_leg = details.get("leg")
+    if detail_code != candidate.lead_airline_code or not isinstance(detail_leg, dict):
+        return None
+    detail_number = str(detail_leg.get("flight_number", "")).strip().upper()
+    parsed_detail = _split_full_flight_number(detail_number)
+    normalized_detail_number = (
+        parsed_detail[1] if parsed_detail is not None else detail_number
+    )
+    if normalized_detail_number != candidate.lead_flight_number:
+        return None
+    total_duration = _positive_duration(details.get("total_duration_minutes"))
+    if total_duration is None or abs(total_duration - candidate.total_duration_minutes) > 5:
+        return None
+    evidence = _scrappa_booking_evidence(payload, candidate)
+    if evidence is None:
+        return None
+    segments = candidate.segments
+    if evidence.fare_brand is not None:
+        segments = tuple(replace(segment, fare_brand=evidence.fare_brand) for segment in segments)
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "token": _opaque_token_digest(candidate.booking_token),
+                "seller": evidence.booking_provider,
+                "url": evidence.booking_url,
+                "price": evidence.amount_usd,
+                "segments": _segment_identity(segments),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return ConfirmedFlightOffer(
+        provider_offer_id=f"scrappa-{digest}",
+        validating_airline_code=candidate.lead_airline_code,
+        airline_name=_short_text(details.get("airline_name"), max_length=160)
+        or candidate.airline_name,
+        cabin=candidate.cabin,
+        total_amount_usd=evidence.amount_usd,
+        base_amount_usd=None,
+        last_ticketing_date=None,
+        number_of_bookable_seats=None,
+        seat_count_capped=False,
+        verified_at=_utc(received_at),
+        provider_cache_hit=False,
+        provider_cache_age_seconds=0,
+        segments=segments,
+        refundable_fare=evidence.refundable,
+        no_penalty_fare=evidence.no_penalty,
+        no_restriction_fare=evidence.no_restriction,
+        booking_url=evidence.booking_url,
+        booking_url_kind=evidence.booking_url_kind,
+        booking_provider=evidence.booking_provider,
+        provider_code=SCRAPPA_PROVIDER_CODE,
+        provider_name=SCRAPPA_PROVIDER_NAME,
+        environment="production",
+    )
+
+
+def _scrappa_booking_evidence(
+    payload: dict[str, Any],
+    candidate: _ScrappaCandidate,
+) -> _BookingEvidence | None:
+    options = payload.get("fare_options")
+    if not isinstance(options, list):
+        return None
+    expected_numbers = [
+        f"{segment.marketing_airline_code}{segment.flight_number}"
+        for segment in candidate.segments
+    ]
+    evidence: list[_BookingEvidence] = []
+    for option in options:
+        if not isinstance(option, dict) or option.get("is_split_booking") is True:
+            continue
+        currency = str(option.get("currency", "")).strip().upper()
+        amount = _finite_amount(
+            option.get("price")
+            if option.get("price") is not None
+            else option.get("total_price")
+        )
+        provider = _short_text(
+            option.get("provider") or option.get("book_with") or option.get("seller"),
+            max_length=160,
+        )
+        url = _safe_public_https_url(
+            option.get("booking_url") or option.get("url") or option.get("deeplink")
+        )
+        request_data = option.get("booking_request")
+        if url is None and isinstance(request_data, dict) and request_data.get("post_data") is None:
+            url = _safe_public_https_url(request_data.get("url"))
+        raw_numbers = option.get("flight_numbers")
+        if (
+            currency != "USD"
+            or amount is None
+            or amount <= 0
+            or provider is None
+            or url is None
+            or not isinstance(raw_numbers, list)
+        ):
+            continue
+        normalized_numbers: list[str] = []
+        for value in raw_numbers:
+            parsed = _split_full_flight_number(value)
+            if parsed is None:
+                break
+            normalized_numbers.append(f"{parsed[0]}{parsed[1]}")
+        if normalized_numbers != expected_numbers:
+            continue
+        phrases = (
+            [_normalized_phrase(value) for value in option.get("extensions", [])]
+            if isinstance(option.get("extensions"), list)
+            else []
+        )
+        evidence.append(
+            _BookingEvidence(
+                amount_usd=amount,
+                booking_url=url,
+                booking_url_kind="direct_get",
+                booking_provider=provider,
+                fare_brand=_short_text(
+                    option.get("fare_brand") or option.get("fare_class"),
+                    max_length=80,
+                ),
+                refundable=_phrase_flag(
+                    phrases,
+                    positive=("refundable", "refunds allowed"),
+                    negative=("nonrefundable", "non refundable", "no refunds"),
+                ),
+                no_penalty=_phrase_flag(
+                    phrases,
+                    positive=("free changes", "changes permitted without fee"),
+                    negative=("changes for a fee", "no changes"),
+                ),
+                no_restriction=_phrase_flag(
+                    phrases,
+                    positive=("no restrictions",),
+                    negative=("restrictions apply",),
+                ),
+            )
+        )
+    return (
+        min(evidence, key=lambda item: (item.amount_usd, item.booking_provider))
+        if evidence
+        else None
+    )
 
 
 class IgnavQuarantineFlightOfferProvider(_AdapterBase):
