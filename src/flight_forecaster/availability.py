@@ -30,6 +30,15 @@ from flight_forecaster.schemas import MAX_STRICT_ITINERARY_SEGMENTS
 
 Cabin = Literal["economy", "premium_economy", "business", "first"]
 BookingUrlKind = Literal["direct_get", "google_flights_itinerary"]
+CredentialVerificationState = Literal[
+    "missing",
+    "plausible",
+    "verified",
+    "invalid",
+    "forbidden",
+    "inactive",
+    "unknown",
+]
 SearchStatus = Literal[
     "confirmed_offers",
     "no_results",
@@ -125,6 +134,20 @@ _FULL_FLIGHT_NUMBER_PATTERN = re.compile(r"^([A-Z0-9]{2,3})\s+([A-Z0-9]{1,8})$")
 _SAFE_SHORT_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]+$")
 _SEARCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _EXCEPTION_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_CREDENTIAL_EXCEPTION_TYPES = frozenset(
+    {
+        "AccountForbidden",
+        "AccountInactive",
+        "AccountStatusMissing",
+        "CredentialInvalid",
+        "PayloadError",
+        "ProviderHttpError",
+        "RateLimitError",
+        "TransientProviderHttpError",
+        "TransportError",
+        "UnknownError",
+    }
+)
 
 
 def _google_market_for_origin(origin: str) -> str:
@@ -171,6 +194,47 @@ class ProviderDiagnostic:
             raise ValueError("provider diagnostic exception type is invalid")
         if self.search_id is not None and not _SEARCH_ID_PATTERN.fullmatch(self.search_id):
             raise ValueError("provider diagnostic search ID is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialPreflightStatus:
+    """Secret-free result of SerpApi's no-charge account preflight.
+
+    The object intentionally contains no credential fingerprint, account ID,
+    email address, quota payload, or provider response body.  ``unknown`` is a
+    fail-soft observation: callers must not make readiness fail merely because
+    the free account endpoint had a transient network or 5xx response.
+    """
+
+    state: CredentialVerificationState
+    checked_at: datetime | None
+    http_status: int | None
+    exception_type: str | None
+    transient: bool
+
+    def __post_init__(self) -> None:
+        if self.checked_at is not None:
+            object.__setattr__(self, "checked_at", _utc(self.checked_at))
+        if self.http_status is not None and not 100 <= self.http_status <= 599:
+            raise ValueError("credential preflight HTTP status is invalid")
+        if (
+            self.exception_type is not None
+            and self.exception_type not in _CREDENTIAL_EXCEPTION_TYPES
+        ):
+            raise ValueError("credential preflight exception type is not allowlisted")
+        if self.state in {"missing", "plausible"} and any(
+            value is not None
+            for value in (self.checked_at, self.http_status, self.exception_type)
+        ):
+            raise ValueError("unchecked credential state cannot contain observations")
+        if self.state == "verified" and (
+            self.checked_at is None
+            or self.http_status is None
+            or not 200 <= self.http_status <= 299
+            or self.exception_type is not None
+            or self.transient
+        ):
+            raise ValueError("verified credential state is inconsistent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1244,6 +1308,14 @@ class SerpApiFlightOfferProvider:
         self._sleep_provider = sleep_provider or sleep
         self._ledger = _UsageLedger(Path(usage_path))
         self._operation_lock = threading.Lock()
+        self._credential_state_lock = threading.Lock()
+        self._credential_state = CredentialPreflightStatus(
+            state="plausible" if self._api_key is not None else "missing",
+            checked_at=None,
+            http_status=None,
+            exception_type=None,
+            transient=False,
+        )
         self._cache_lock = threading.Lock()
         self._cache: dict[
             tuple[str, str, date],
@@ -1263,6 +1335,43 @@ class SerpApiFlightOfferProvider:
         return self._monthly_limit
 
     @property
+    def credential_preflight_status(self) -> CredentialPreflightStatus:
+        """Return the latest immutable, secret-free credential observation."""
+
+        with self._credential_state_lock:
+            return self._credential_state
+
+    def preflight_credentials(self) -> CredentialPreflightStatus:
+        """Check only SerpApi's free Account API and return sanitized state.
+
+        This method never reserves quota and never submits a Google Flights or
+        booking-options request.  Provider/network errors are represented as an
+        ``unknown`` state instead of escaping or making service readiness fail.
+        The operation lock prevents startup and user searches from racing two
+        account checks through the same provider instance.
+        """
+
+        if not self.configured:
+            return self.credential_preflight_status
+        diagnostics = _DiagnosticCollector(self._ledger)
+        with self._operation_lock:
+            try:
+                self._account_quota(diagnostics)
+            except _ProviderError:
+                # Every expected account failure updates the sanitized state at
+                # the point where its HTTP/payload evidence is available.
+                pass
+            except Exception:
+                self._set_credential_preflight_status(
+                    "unknown",
+                    checked_at=self._credential_checked_at(),
+                    http_status=None,
+                    exception_type="UnknownError",
+                    transient=False,
+                )
+        return self.credential_preflight_status
+
+    @property
     def authentication_recheck_seconds(self) -> float:
         """Allow the fallback chain to re-run only the free account preflight.
 
@@ -1273,6 +1382,40 @@ class SerpApiFlightOfferProvider:
         """
 
         return 300.0
+
+    def _set_credential_preflight_status(
+        self,
+        state: CredentialVerificationState,
+        *,
+        checked_at: datetime,
+        http_status: int | None,
+        exception_type: str | None,
+        transient: bool,
+    ) -> None:
+        safe_exception_type = (
+            None
+            if exception_type is None
+            else (
+                exception_type
+                if exception_type in _CREDENTIAL_EXCEPTION_TYPES
+                else "UnknownError"
+            )
+        )
+        status = CredentialPreflightStatus(
+            state=state,
+            checked_at=checked_at,
+            http_status=http_status,
+            exception_type=safe_exception_type,
+            transient=transient,
+        )
+        with self._credential_state_lock:
+            self._credential_state = status
+
+    def _credential_checked_at(self) -> datetime:
+        try:
+            return self._provider_now()
+        except _ProviderError:
+            return datetime.now(UTC)
 
     def search(
         self,
@@ -1683,6 +1826,13 @@ class SerpApiFlightOfferProvider:
         )
         raw_account_status = payload.get("account_status")
         if not isinstance(raw_account_status, str) or not raw_account_status.strip():
+            self._set_credential_preflight_status(
+                "unknown",
+                checked_at=received_at,
+                http_status=http_status,
+                exception_type="AccountStatusMissing",
+                transient=False,
+            )
             diagnostics.record(
                 observed_at=received_at,
                 stage="account",
@@ -1693,6 +1843,13 @@ class SerpApiFlightOfferProvider:
             raise _AccountPayloadError("provider account status is missing or invalid")
         account_status = raw_account_status.strip().lower()
         if account_status != "active":
+            self._set_credential_preflight_status(
+                "inactive",
+                checked_at=received_at,
+                http_status=http_status,
+                exception_type="AccountInactive",
+                transient=False,
+            )
             diagnostics.record(
                 observed_at=received_at,
                 stage="account",
@@ -1716,6 +1873,13 @@ class SerpApiFlightOfferProvider:
             or provider_hourly_limit is None
             or renewal_date is None
         ):
+            self._set_credential_preflight_status(
+                "unknown",
+                checked_at=received_at,
+                http_status=http_status,
+                exception_type="PayloadError",
+                transient=False,
+            )
             diagnostics.record(
                 observed_at=received_at,
                 stage="account",
@@ -1724,6 +1888,13 @@ class SerpApiFlightOfferProvider:
                 search_id=None,
             )
             raise _PayloadError("provider account quota metadata is missing or invalid")
+        self._set_credential_preflight_status(
+            "verified",
+            checked_at=received_at,
+            http_status=http_status,
+            exception_type=None,
+            transient=False,
+        )
         return _AccountQuota(
             billing_cycle_key=f"renewal:{renewal_date.isoformat()}",
             hour_bucket_key=received_at.strftime("%Y-%m-%dT%H"),
@@ -1937,6 +2108,14 @@ class SerpApiFlightOfferProvider:
             )
         except Exception as exc:
             received_at = self._provider_now()
+            if stage == "account":
+                self._set_credential_preflight_status(
+                    "unknown",
+                    checked_at=received_at,
+                    http_status=None,
+                    exception_type="TransportError",
+                    transient=True,
+                )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
@@ -1948,6 +2127,13 @@ class SerpApiFlightOfferProvider:
         received_at = self._provider_now()
         status = _status_code(response)
         if status == 401:
+            self._set_credential_preflight_status(
+                "invalid",
+                checked_at=received_at,
+                http_status=status,
+                exception_type="CredentialInvalid",
+                transient=False,
+            )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
@@ -1957,6 +2143,13 @@ class SerpApiFlightOfferProvider:
             )
             raise _CredentialInvalidError("provider credential is invalid")
         if status == 403:
+            self._set_credential_preflight_status(
+                "forbidden",
+                checked_at=received_at,
+                http_status=status,
+                exception_type="AccountForbidden",
+                transient=False,
+            )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
@@ -1966,6 +2159,14 @@ class SerpApiFlightOfferProvider:
             )
             raise _AccountForbiddenError("provider account is forbidden")
         if status == 429:
+            if stage == "account":
+                self._set_credential_preflight_status(
+                    "unknown",
+                    checked_at=received_at,
+                    http_status=status,
+                    exception_type="RateLimitError",
+                    transient=True,
+                )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
@@ -1975,6 +2176,14 @@ class SerpApiFlightOfferProvider:
             )
             raise _RateLimitError("provider rate limit reached")
         if status in {408, 425} or 500 <= status <= 599:
+            if stage == "account":
+                self._set_credential_preflight_status(
+                    "unknown",
+                    checked_at=received_at,
+                    http_status=status,
+                    exception_type="TransientProviderHttpError",
+                    transient=True,
+                )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
@@ -1984,6 +2193,14 @@ class SerpApiFlightOfferProvider:
             )
             raise _TransientProviderHttpError("provider request failed transiently")
         if status < 200 or status >= 300:
+            if stage == "account":
+                self._set_credential_preflight_status(
+                    "unknown",
+                    checked_at=received_at,
+                    http_status=status,
+                    exception_type="ProviderHttpError",
+                    transient=False,
+                )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
@@ -1995,6 +2212,14 @@ class SerpApiFlightOfferProvider:
         try:
             payload = _safe_response_json(response)
         except _PayloadError:
+            if stage == "account":
+                self._set_credential_preflight_status(
+                    "unknown",
+                    checked_at=received_at,
+                    http_status=status,
+                    exception_type="PayloadError",
+                    transient=False,
+                )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
@@ -2004,6 +2229,14 @@ class SerpApiFlightOfferProvider:
             )
             raise
         if not isinstance(payload, dict):
+            if stage == "account":
+                self._set_credential_preflight_status(
+                    "unknown",
+                    checked_at=received_at,
+                    http_status=status,
+                    exception_type="PayloadError",
+                    transient=False,
+                )
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,

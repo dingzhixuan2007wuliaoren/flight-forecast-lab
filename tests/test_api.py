@@ -35,6 +35,57 @@ def test_optional_site_basic_auth(monkeypatch) -> None:
     assert client.get("/", auth=("flight", "test-only-password")).status_code == 200
 
 
+def test_structured_api_responses_are_never_cached(
+    monkeypatch: pytest.MonkeyPatch,
+    trained_model_dir: Path,
+) -> None:
+    monkeypatch.setenv("MODEL_DIR", str(trained_model_dir))
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    monkeypatch.setenv("SITE_ACCESS_USERNAME", "flight")
+    monkeypatch.setenv("SITE_ACCESS_PASSWORD", "test-only-password")
+    monkeypatch.setenv("UNRELATED_DEPLOY_SECRET", "must-not-appear-in-cache-header")
+    get_service.cache_clear()
+    client = TestClient(app)
+
+    public_responses = [
+        client.get("/health"),
+        client.get("/ready"),
+        client.get("/version"),
+    ]
+    authenticated_api = client.get(
+        "/v1/model-info",
+        auth=("flight", "test-only-password"),
+    )
+    denied_api = client.get("/v1/model-info")
+    invalid_api = client.post(
+        "/v1/predict/on-time",
+        auth=("flight", "test-only-password"),
+        json={},
+    )
+    missing_api = client.get(
+        "/v1/does-not-exist",
+        auth=("flight", "test-only-password"),
+    )
+
+    assert all(response.status_code == 200 for response in public_responses)
+    assert authenticated_api.status_code == 200
+    assert denied_api.status_code == 401
+    assert invalid_api.status_code == 422
+    assert missing_api.status_code == 404
+    for response in [
+        *public_responses,
+        authenticated_api,
+        denied_api,
+        invalid_api,
+        missing_api,
+    ]:
+        assert response.headers["cache-control"] == "no-store"
+        assert "must-not-appear-in-cache-header" not in response.headers["cache-control"]
+
+    static_page = client.get("/", auth=("flight", "test-only-password"))
+    assert "cache-control" not in static_page.headers
+
+
 def test_readiness_fails_when_model_is_missing(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MODEL_DIR", str(tmp_path / "missing-model"))
     get_service.cache_clear()
@@ -42,6 +93,7 @@ def test_readiness_fails_when_model_is_missing(monkeypatch, tmp_path: Path) -> N
     response = TestClient(app).get("/ready")
 
     assert response.status_code == 503
+    assert response.headers["cache-control"] == "no-store"
     assert response.json()["detail"] == "model artifact is missing"
 
 
@@ -82,7 +134,7 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert "暂时性失败来源每次最多受控重试一次" in dashboard
     assert "A transiently failing source is retried at most once" in dashboard
     assert "providerRuns.length > 1 && aggregateFailureStatuses[status]" in dashboard
-    assert "isProcessingComparison" in dashboard
+    assert "isProcessingComparison" not in dashboard
     assert "本次准点预测已忽略天气变量。" in dashboard
     assert "Weather was omitted from this on-time prediction." in dashboard
     for field in (

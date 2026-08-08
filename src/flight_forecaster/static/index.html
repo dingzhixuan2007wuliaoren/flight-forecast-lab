@@ -2636,7 +2636,8 @@
       var priceTrackingDetail = null;
       var priceTrackingRequestKey = "";
       var priceTrackingController = null;
-      var sessionKey = "flight-forecast-session-v1";
+      var sessionKey = "flight-forecast-session-v2";
+      var legacySessionKey = "flight-forecast-session-v1";
       var activeComparison = null;
       var comparisonTimeoutMs = 600000;
       var slowComparisonThresholdMs = 30000;
@@ -2673,21 +2674,11 @@
         };
       }
 
-      function isProcessingComparison(data) {
-        if (!data || typeof data !== "object") return false;
-        var metadata = data.fare_search_metadata && typeof data.fare_search_metadata === "object" ? data.fare_search_metadata : {};
-        var status = normalizeKey(data.result_status) || normalizeKey(metadata.status);
-        return status === "fare_provider_processing" || status === "provider_processing";
-      }
-
       function saveSessionState() {
         try {
           window.sessionStorage.setItem(sessionKey, JSON.stringify({
             form: formState(),
-            language: currentLanguage,
-            ranking: activeRanking,
-            cabin: activeCabin,
-            comparison: isProcessingComparison(lastData) ? null : lastData
+            language: currentLanguage
           }));
         } catch (error) { /* storage may be unavailable or full */ }
       }
@@ -2705,7 +2696,6 @@
           if (/^\d{4}-\d{2}-\d{2}$/.test(savedDate)) {
             byId("departure-time").value = savedDate;
           }
-          if (state.comparison && typeof state.comparison === "object" && !isProcessingComparison(state.comparison)) lastData = state.comparison;
           return state;
         } catch (error) {
           return null;
@@ -3015,7 +3005,7 @@
         });
         byId("provider-status-time").textContent = formatDate(data && data.generated_at, true);
         if (providers.length) {
-          try { window.sessionStorage.setItem("flight-forecast-provider-status-v1", JSON.stringify(data)); } catch (error) { /* sanitized snapshot is optional */ }
+          try { window.sessionStorage.setItem("flight-forecast-provider-status-v2", JSON.stringify(data)); } catch (error) { /* sanitized snapshot is optional */ }
         }
       }
 
@@ -3420,6 +3410,7 @@
             method: "POST",
             headers: { "Accept": "application/json", "Content-Type": "application/json" },
             body: JSON.stringify(payload),
+            cache: "no-store",
             signal: state.controller.signal
           });
           var data = {};
@@ -4343,9 +4334,10 @@
       });
 
       setDefaultDeparture();
+      try { window.sessionStorage.removeItem(legacySessionKey); } catch (error) { /* legacy state is optional */ }
       var restoredState = restoreSessionState();
-      var restoredRanking = restoredState && ["direct_first", "lowest_price", "student_first"].indexOf(restoredState.ranking) >= 0 ? restoredState.ranking : "direct_first";
-      var restoredCabin = restoredState && ["all", "economy", "premium_economy", "business", "first"].indexOf(restoredState.cabin) >= 0 ? restoredState.cabin : "all";
+      var restoredRanking = "direct_first";
+      var restoredCabin = "all";
       activeCabin = restoredCabin;
       selectRanking(restoredRanking, false);
       var storedLanguage = "zh";
