@@ -630,11 +630,27 @@ class _AuthenticationError(_ProviderError):
     pass
 
 
+class _CredentialInvalidError(_AuthenticationError):
+    pass
+
+
+class _AccountForbiddenError(_AuthenticationError):
+    pass
+
+
+class _AccountInactiveError(_AuthenticationError):
+    pass
+
+
 class _RateLimitError(_ProviderError):
     pass
 
 
 class _PayloadError(_ProviderError):
+    pass
+
+
+class _AccountPayloadError(_PayloadError):
     pass
 
 
@@ -1246,6 +1262,18 @@ class SerpApiFlightOfferProvider:
     def monthly_limit(self) -> int:
         return self._monthly_limit
 
+    @property
+    def authentication_recheck_seconds(self) -> float:
+        """Allow the fallback chain to re-run only the free account preflight.
+
+        ``search`` always calls SerpApi's no-charge Account API before it
+        reserves or submits a Google Flights request.  Exposing this bounded
+        interval lets an inactive account recover in the same process without
+        turning a bad credential into a paid-query retry loop.
+        """
+
+        return 300.0
+
     def search(
         self,
         origin: str,
@@ -1653,16 +1681,26 @@ class SerpApiFlightOfferProvider:
                 ACCOUNT_REQUEST_TIMEOUT_SECONDS,
             ),
         )
-        account_status = str(payload.get("account_status", "")).strip().lower()
+        raw_account_status = payload.get("account_status")
+        if not isinstance(raw_account_status, str) or not raw_account_status.strip():
+            diagnostics.record(
+                observed_at=received_at,
+                stage="account",
+                http_status=http_status,
+                exception_type="AccountStatusMissing",
+                search_id=None,
+            )
+            raise _AccountPayloadError("provider account status is missing or invalid")
+        account_status = raw_account_status.strip().lower()
         if account_status != "active":
             diagnostics.record(
                 observed_at=received_at,
                 stage="account",
                 http_status=http_status,
-                exception_type="AuthenticationError",
+                exception_type="AccountInactive",
                 search_id=None,
             )
-            raise _AuthenticationError("provider account is not active")
+            raise _AccountInactiveError("provider account is not active")
         monthly_usage = _optional_nonnegative_int(payload.get("this_month_usage"))
         hourly_usage = _optional_nonnegative_int(payload.get("this_hour_searches"))
         provider_monthly_limit = _optional_positive_int(payload.get("searches_per_month"))
@@ -1909,15 +1947,24 @@ class SerpApiFlightOfferProvider:
             raise _TransportError("provider transport failed") from exc
         received_at = self._provider_now()
         status = _status_code(response)
-        if status in {401, 403}:
+        if status == 401:
             diagnostics.record(
                 observed_at=received_at,
                 stage=stage,
                 http_status=status,
-                exception_type="AuthenticationError",
+                exception_type="CredentialInvalid",
                 search_id=_response_search_id(response),
             )
-            raise _AuthenticationError("provider authentication failed")
+            raise _CredentialInvalidError("provider credential is invalid")
+        if status == 403:
+            diagnostics.record(
+                observed_at=received_at,
+                stage=stage,
+                http_status=status,
+                exception_type="AccountForbidden",
+                search_id=_response_search_id(response),
+            )
+            raise _AccountForbiddenError("provider account is forbidden")
         if status == 429:
             diagnostics.record(
                 observed_at=received_at,
@@ -3010,6 +3057,10 @@ def _safe_response_json(response: Any) -> Any:
 
 
 def _failure_status(failures: list[BaseException]) -> SearchStatus | None:
+    # Authentication is deterministic for the active credential and must not be
+    # hidden by a concurrent cabin's rate-limit or retry-budget failure.
+    if any(isinstance(exc, _AuthenticationError) for exc in failures):
+        return "authentication_failed"
     if any(isinstance(exc, _RateLimitError) for exc in failures):
         return "rate_limited"
     retry_quota_failures = [
@@ -3019,8 +3070,6 @@ def _failure_status(failures: list[BaseException]) -> SearchStatus | None:
         if any(exc.limiting_quota == "hourly" for exc in retry_quota_failures):
             return "rate_limited"
         return "budget_exhausted"
-    if any(isinstance(exc, _AuthenticationError) for exc in failures):
-        return "authentication_failed"
     if any(
         isinstance(
             exc,

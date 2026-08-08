@@ -89,6 +89,11 @@ source .venv/bin/activate
 
 Every external call reserves free allowance before network I/O. The provider stops at the local hard ceiling—there is no automatic purchase or overage, and reference data is never promoted into a bookable flight. `GET /v1/provider-status` and the dashboard expose only configuration booleans, roles, sanitized quota state, and bilingual notices; they never expose credentials, raw provider errors, or complete outbound URLs.
 
+凭据轮换、候选级重试规则，以及“可恢复供应商故障”和“不可验证报价”的边界详见
+[严格报价供应商恢复说明](docs/strict-provider-recovery.md)。Credential rotation,
+candidate-scoped retry rules, and the boundary between a recoverable provider
+failure and an unverifiable fare are documented in the same runbook.
+
 `/v1/provider-status` 是只读的本地脱敏账本：访问端点、刷新主页或刷新提供商二级页都不会请求外部提供商，因此不消耗其查询额度。每个额度数字都必须标明 `quota_data_basis`：`provider_reported` 是先前业务响应或受控同步已取得的供应商脱敏快照；`local_ledger` 是本地保守预留账本，不是供应商账户余额；`provider_and_local_ledger` 是两者的保守组合，不是相加。没有可验证数据时保持“未知”，不猜测为零或满额。
 
 `/v1/provider-status` is a read-only sanitized local ledger. Loading the endpoint or refreshing either status view makes no external-provider request and consumes no provider allowance. Every quota number carries a `quota_data_basis`: `provider_reported` is a sanitized snapshot already captured from an earlier business response or controlled sync; `local_ledger` is a conservative local reservation ledger, not the provider account balance; and `provider_and_local_ledger` is a conservative combination, never a sum. Unverifiable usage remains unknown rather than being guessed as zero or full.
