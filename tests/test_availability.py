@@ -1595,6 +1595,136 @@ def test_shared_monthly_limit_defaults_and_clamps_to_250(tmp_path: Path) -> None
     assert client.booking_calls == []
 
 
+def test_credential_preflight_states_start_secret_free_and_make_no_paid_call(
+    tmp_path: Path,
+) -> None:
+    missing = SerpApiFlightOfferProvider(
+        None,
+        usage_path=tmp_path / "missing.sqlite3",
+        client=_Client(),
+        now_provider=lambda: _FETCHED_AT,
+    )
+    missing_status = missing.preflight_credentials()
+
+    assert missing_status.state == "missing"
+    assert missing_status.checked_at is None
+    assert missing_status.http_status is None
+    assert missing_status.exception_type is None
+    assert missing_status.transient is False
+
+    client = _Client()
+    provider = _provider(tmp_path / "configured", client)
+    assert provider.credential_preflight_status.state == "plausible"
+
+    status = provider.preflight_credentials()
+
+    assert status.state == "verified"
+    assert status.checked_at == _FETCHED_AT
+    assert status.http_status == 200
+    assert status.exception_type is None
+    assert status.transient is False
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+@pytest.mark.parametrize(
+    ("account_status", "account_state", "state", "exception_type"),
+    [
+        (401, "Active", "invalid", "CredentialInvalid"),
+        (403, "Active", "forbidden", "AccountForbidden"),
+        (200, "Suspended", "inactive", "AccountInactive"),
+    ],
+)
+def test_credential_preflight_records_definitive_account_failures_without_search(
+    tmp_path: Path,
+    account_status: int,
+    account_state: str,
+    state: str,
+    exception_type: str,
+) -> None:
+    client = _Client(account_status=account_status, account_state=account_state)
+    status = _provider(tmp_path, client).preflight_credentials()
+
+    assert status.state == state
+    assert status.checked_at == _FETCHED_AT
+    assert status.http_status == account_status
+    assert status.exception_type == exception_type
+    assert status.transient is False
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+@pytest.mark.parametrize("account_status", [408, 425, 500, 503])
+def test_credential_preflight_treats_transient_http_failure_as_unknown(
+    tmp_path: Path,
+    account_status: int,
+) -> None:
+    client = _Client(account_status=account_status)
+    status = _provider(tmp_path, client).preflight_credentials()
+
+    assert status.state == "unknown"
+    assert status.checked_at == _FETCHED_AT
+    assert status.http_status == account_status
+    assert status.exception_type == "TransientProviderHttpError"
+    assert status.transient is True
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+def test_credential_preflight_treats_transport_failure_as_unknown(tmp_path: Path) -> None:
+    class _TransportAccountClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            if url == SERPAPI_ACCOUNT_URL:
+                self.account_calls.append(kwargs)
+                raise OSError("test transport failure")
+            return super().get(url, **kwargs)
+
+    client = _TransportAccountClient()
+    status = _provider(tmp_path, client).preflight_credentials()
+
+    assert status.state == "unknown"
+    assert status.checked_at == _FETCHED_AT
+    assert status.http_status is None
+    assert status.exception_type == "TransportError"
+    assert status.transient is True
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+def test_credential_preflight_status_is_thread_safe_and_contains_no_secrets(
+    tmp_path: Path,
+) -> None:
+    secret_payload = {
+        "api_key": "test-only-response-secret",
+        "account_email": "test-only@example.invalid",
+        "account_id": "test-only-account-id",
+    }
+
+    class _SecretBearingAccountClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            if url == SERPAPI_ACCOUNT_URL and response.status_code == 200:
+                return _Response({**response.payload, **secret_payload})
+            return response
+
+    client = _SecretBearingAccountClient()
+    provider = _provider(tmp_path, client)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        statuses = tuple(pool.map(lambda _index: provider.preflight_credentials(), range(8)))
+
+    assert all(status.state == "verified" for status in statuses)
+    assert len(client.account_calls) == 8
+    serialized = repr((statuses, provider.credential_preflight_status))
+    for secret in secret_payload.values():
+        assert secret not in serialized
+    assert "serpapi-key" not in serialized
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
 @pytest.mark.parametrize("account_state", ["Suspended", "Disabled"])
 def test_non_active_account_is_distinct_and_stops_before_search(
     tmp_path: Path,

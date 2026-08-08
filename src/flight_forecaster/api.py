@@ -3,10 +3,11 @@ from __future__ import annotations
 import base64
 import binascii
 import hmac
+import logging
 import os
 import re
+import threading
 from datetime import UTC, datetime
-from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -62,8 +63,19 @@ app = FastAPI(
 )
 app.include_router(destination_router)
 
+logger = logging.getLogger(__name__)
+
 _BUILD_SHA_PATTERN = re.compile(r"^[0-9A-Fa-f]{7,40}$")
 _BUILD_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+_NO_STORE_EXACT_PATHS = frozenset({"/health", "/ready", "/version"})
+
+
+def _prevent_structured_response_caching(path: str, response: Response) -> Response:
+    """Keep operational and API responses out of browser and proxy caches."""
+
+    if path in _NO_STORE_EXACT_PATHS or path == "/v1" or path.startswith("/v1/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.middleware("http")
@@ -71,8 +83,10 @@ async def require_optional_site_access(request: Request, call_next):
     """Protect public deployments without changing the local-development flow."""
 
     expected_password = os.getenv("SITE_ACCESS_PASSWORD", "")
-    if not expected_password or request.url.path in {"/health", "/ready", "/version"}:
-        return await call_next(request)
+    path = request.url.path
+    if not expected_password or path in _NO_STORE_EXACT_PATHS:
+        response = await call_next(request)
+        return _prevent_structured_response_caching(path, response)
 
     expected_username = os.getenv("SITE_ACCESS_USERNAME", "flight").strip() or "flight"
     authorization = request.headers.get("authorization", "")
@@ -90,7 +104,7 @@ async def require_optional_site_access(request: Request, call_next):
         hmac.compare_digest(username, expected_username)
         and hmac.compare_digest(supplied_password, expected_password)
     ):
-        return Response(
+        response = Response(
             content="Authentication required",
             status_code=401,
             media_type="text/plain",
@@ -98,16 +112,81 @@ async def require_optional_site_access(request: Request, call_next):
                 "WWW-Authenticate": 'Basic realm="Flight Forecast Lab", charset="UTF-8"'
             },
         )
-    return await call_next(request)
+        return _prevent_structured_response_caching(path, response)
+    response = await call_next(request)
+    return _prevent_structured_response_caching(path, response)
 
 
 def model_dir() -> Path:
     return Path(os.getenv("MODEL_DIR", "artifacts/demo"))
 
 
-@lru_cache(maxsize=1)
-def get_service() -> PredictionService:
-    return PredictionService(model_dir())
+def _run_strict_provider_credential_preflight(service: PredictionService) -> None:
+    """Probe the free account endpoint without delaying liveness/readiness."""
+
+    try:
+        status = service.preflight_strict_provider_credentials()
+    except Exception:
+        # Do not log a raw exception: a third-party client could include a URL
+        # containing credentials in its message. The adapter normally converts
+        # expected failures into an allowlisted secret-free status.
+        logger.warning(
+            "strict_provider_credential_preflight "
+            "provider=serpapi_google_flights state=unknown "
+            "http_status=None exception_type=UnexpectedPreflightError transient=False"
+        )
+        return
+    if status is not None:
+        logger.info(
+            "strict_provider_credential_preflight "
+            "provider=serpapi_google_flights state=%s http_status=%s "
+            "exception_type=%s transient=%s",
+            status.state,
+            status.http_status,
+            status.exception_type,
+            status.transient,
+        )
+
+
+class _ServiceAccessor:
+    """Process-local single-flight service factory with a test reset hook."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._service: PredictionService | None = None
+
+    def __call__(self) -> PredictionService:
+        with self._lock:
+            if self._service is not None:
+                return self._service
+            service = PredictionService(model_dir())
+            self._service = service
+            if _environment_enabled(
+                "SERPAPI_CREDENTIAL_PREFLIGHT_ENABLED", default=False
+            ):
+                try:
+                    threading.Thread(
+                        target=_run_strict_provider_credential_preflight,
+                        args=(service,),
+                        name="strict-provider-credential-preflight",
+                        daemon=True,
+                    ).start()
+                except RuntimeError:
+                    logger.warning(
+                        "strict_provider_credential_preflight "
+                        "provider=serpapi_google_flights state=unknown "
+                        "http_status=None exception_type=ThreadStartError transient=False"
+                    )
+            return service
+
+    def cache_clear(self) -> None:
+        """Reset the process-local instance for deterministic tests."""
+
+        with self._lock:
+            self._service = None
+
+
+get_service = _ServiceAccessor()
 
 
 def _service_or_503() -> PredictionService:
@@ -307,6 +386,28 @@ def _destination_runtime_capabilities() -> list[RuntimeDestinationCapability]:
     return capabilities
 
 
+def _serpapi_credential_status_fields() -> dict[str, object]:
+    """Read the in-process free preflight result without exposing credentials."""
+
+    try:
+        service = get_service()
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    status_provider = getattr(service, "serpapi_credential_preflight_status", None)
+    if not callable(status_provider):
+        return {}
+    status = status_provider()
+    if status is None:
+        return {}
+    return {
+        "credential_state": status.state,
+        "checked_at": status.checked_at,
+        "http_status": status.http_status,
+        "exception_type": status.exception_type,
+        "transient": status.transient,
+    }
+
+
 def _runtime_provider_status(
     fare_metadata: object | None = None,
 ) -> RuntimeProviderStatusResponse:
@@ -315,6 +416,7 @@ def _runtime_provider_status(
     )
     selected = _selected_provider_codes()
     serpapi_configured = _credential_present("SERPAPI_API_KEY")
+    serpapi_credential_fields = _serpapi_credential_status_fields()
     searchapi_configured = _credential_present("SEARCHAPI_API_KEY")
     scrappa_configured = _credential_present("SCRAPPA_API_KEY")
     ignav_configured = _credential_present("IGNAV_API_KEY", "IGNAV_TOKEN")
@@ -459,7 +561,12 @@ def _runtime_provider_status(
         quota_unit: str | None = None,
         quota_snapshot: QuotaLedgerSnapshot | None = None,
         notice: dict[str, str] | None = None,
+        credential_fields: dict[str, object] | None = None,
     ) -> RuntimeProviderStatusItem:
+        credential_state = str(
+            (credential_fields or {}).get("credential_state", "") or ""
+        ).strip().lower()
+        credential_blocked = credential_state in {"invalid", "forbidden", "inactive"}
         if quarantined:
             status = "quarantined"
             quota_status = "not_applicable"
@@ -480,6 +587,8 @@ def _runtime_provider_status(
             exhausted = snapshot.remaining == 0
             quota_status = "exhausted" if exhausted else "available"
             status = "quota_exhausted" if exhausted else "quota_available"
+        if credential_blocked:
+            status = "authentication_failed"
         if notice is None and quarantined:
             notice = {
                 "zh": "该来源处于隔离状态；即使已配置，也不能向严格航班列表提供报价。",
@@ -513,8 +622,9 @@ def _runtime_provider_status(
             ),
             quota_reset_at=(snapshot.reset_at if configured and not quarantined else None),
             quota_unit=quota_unit if quota_limit is not None else None,
-            can_supply_strict_offers=eligible,
+            can_supply_strict_offers=eligible and not credential_blocked,
             notice=notice,
+            **(credential_fields or {}),
         )
 
     def reference_quota_fields(
@@ -556,6 +666,7 @@ def _runtime_provider_status(
             name="SerpApi · Google Flights",
             configured=serpapi_configured,
             eligible=True,
+            credential_fields=serpapi_credential_fields,
             quota_limit=serpapi_limit,
             quota_unit="billing_period_requests",
             quota_snapshot=serpapi_snapshot,
@@ -790,7 +901,7 @@ def _runtime_provider_status(
             else ()
         )
     else:
-        metadata_runs = (metadata,)
+        metadata_runs = () if metadata is None else (metadata,)
 
     provider_indexes = {
         provider.code: index
@@ -932,6 +1043,9 @@ def _runtime_provider_status(
                 }
                 else "billing_period_requests"
             )
+        if provider.credential_state in {"invalid", "forbidden", "inactive"}:
+            update["status"] = "authentication_failed"
+            update["can_supply_strict_offers"] = False
         providers[provider_index] = RuntimeProviderStatusItem.model_validate(
             {**provider.model_dump(), **update}
         )

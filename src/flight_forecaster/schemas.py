@@ -332,6 +332,27 @@ ProviderRuntimeStatus = Literal[
     "reference_only",
 ]
 ProviderQuotaStatus = Literal["unknown", "available", "exhausted", "not_applicable"]
+ProviderCredentialState = Literal[
+    "missing",
+    "plausible",
+    "verified",
+    "invalid",
+    "forbidden",
+    "inactive",
+    "unknown",
+]
+ProviderCredentialExceptionType = Literal[
+    "AccountForbidden",
+    "AccountInactive",
+    "AccountStatusMissing",
+    "CredentialInvalid",
+    "PayloadError",
+    "ProviderHttpError",
+    "RateLimitError",
+    "TransientProviderHttpError",
+    "TransportError",
+    "UnknownError",
+]
 ProviderQuotaDataBasis = Literal[
     "provider_reported",
     "local_ledger",
@@ -360,6 +381,26 @@ class RuntimeProviderStatusItem(BaseModel):
     quota_observed_at: datetime | None = None
     quota_reset_at: datetime | None = None
     temporarily_rate_limited: bool = Field(default=False, strict=True)
+    credential_state: ProviderCredentialState | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    checked_at: datetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    http_status: int | None = Field(
+        default=None,
+        ge=100,
+        le=599,
+        exclude_if=lambda value: value is None,
+    )
+    exception_type: ProviderCredentialExceptionType | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    transient: bool | None = Field(
+        default=None,
+        strict=True,
+        exclude_if=lambda value: value is None,
+    )
     quota_unit: (
         Literal[
             "hour",
@@ -460,6 +501,85 @@ class RuntimeProviderStatusItem(BaseModel):
             raise ValueError("provider quota counts require a quota unit")
         if self.quota_cost_per_call is not None and self.quota_unit is None:
             raise ValueError("provider quota cost requires a quota unit")
+        credential_observations = (
+            self.checked_at,
+            self.http_status,
+            self.exception_type,
+            self.transient,
+        )
+        if self.credential_state is None:
+            if any(value is not None for value in credential_observations):
+                raise ValueError("credential observations require a credential state")
+            return self
+        if self.credential_state == "missing":
+            if self.configured:
+                raise ValueError("missing credential state cannot be configured")
+        elif not self.configured:
+            raise ValueError("configured credential state requires provider configuration")
+        if self.credential_state in {"invalid", "forbidden", "inactive"} and (
+            self.status != "authentication_failed" or self.can_supply_strict_offers
+        ):
+            raise ValueError(
+                "definitive credential failure must disable current strict offers"
+            )
+        if self.credential_state in {"missing", "plausible"}:
+            if any(
+                value is not None
+                for value in (self.checked_at, self.http_status, self.exception_type)
+            ) or self.transient is not False:
+                raise ValueError("unchecked credential state cannot contain observations")
+            return self
+        if self.checked_at is None or self.transient is None:
+            raise ValueError("checked credential state requires time and transient flag")
+        _require_timezone(self.checked_at)
+        if self.credential_state == "verified":
+            if (
+                self.http_status is None
+                or not 200 <= self.http_status <= 299
+                or self.exception_type is not None
+                or self.transient
+            ):
+                raise ValueError("verified credential state is inconsistent")
+            return self
+        definitive_failures = {
+            "invalid": (401, "CredentialInvalid"),
+            "forbidden": (403, "AccountForbidden"),
+        }
+        expected_failure = definitive_failures.get(self.credential_state)
+        if expected_failure is not None:
+            if (self.http_status, self.exception_type) != expected_failure or self.transient:
+                raise ValueError("definitive credential failure is inconsistent")
+            return self
+        if self.credential_state == "inactive":
+            if (
+                self.http_status is None
+                or not 200 <= self.http_status <= 299
+                or self.exception_type != "AccountInactive"
+                or self.transient
+            ):
+                raise ValueError("inactive credential state is inconsistent")
+            return self
+        if self.exception_type is None:
+            raise ValueError("unknown credential state requires a sanitized exception type")
+        transient_exceptions = {
+            "RateLimitError",
+            "TransientProviderHttpError",
+            "TransportError",
+        }
+        if self.transient != (self.exception_type in transient_exceptions):
+            raise ValueError("credential transient flag contradicts exception type")
+        if self.exception_type == "TransportError" and self.http_status is not None:
+            raise ValueError("transport credential failure cannot report an HTTP status")
+        if self.exception_type == "RateLimitError" and self.http_status != 429:
+            raise ValueError("credential rate-limit failure must report HTTP 429")
+        if self.exception_type == "TransientProviderHttpError" and (
+            self.http_status is None
+            or (
+                self.http_status not in {408, 425}
+                and not 500 <= self.http_status <= 599
+            )
+        ):
+            raise ValueError("transient provider failure has an invalid HTTP status")
         return self
 
 

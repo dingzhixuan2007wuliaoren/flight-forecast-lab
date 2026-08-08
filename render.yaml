@@ -17,6 +17,8 @@ services:
         value: auto
       - key: SERPAPI_MONTHLY_LIMIT
         value: "250"
+      - key: SERPAPI_CREDENTIAL_PREFLIGHT_ENABLED
+        value: "1"
       - key: SITE_ACCESS_USERNAME
         value: flight
       - key: SITE_ACCESS_PASSWORD

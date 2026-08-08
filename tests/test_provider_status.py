@@ -552,7 +552,7 @@ def test_dashboard_only_shows_per_provider_quota_summary_and_links_to_detail() -
         "balances.push({",
         "balance.name",
         "providerQuotaUnitLabel(balance.unit)",
-        "flight-forecast-provider-status-v1",
+        "flight-forecast-provider-status-v2",
     ):
         assert fragment in dashboard
     assert 'id="provider-status-grid"' not in dashboard

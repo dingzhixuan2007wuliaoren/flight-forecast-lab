@@ -19,9 +19,11 @@ from timezonefinder import TimezoneFinder
 from flight_forecaster.airlabs_quota import AirLabsQuotaGate
 from flight_forecaster.availability import (
     ConfirmedFlightOffer,
+    CredentialPreflightStatus,
     FlightOfferSearchResult,
     FlightOfferSegment,
     RouteCabinMarketHistory,
+    SerpApiFlightOfferProvider,
     flight_offer_provider_from_env,
 )
 from flight_forecaster.catalog import AirlineProfile, get_airline_profile
@@ -308,6 +310,34 @@ class PredictionService:
     @property
     def model_version(self) -> str:
         return str(self.bundle["model_version"])
+
+    def _strict_fare_providers(self) -> tuple[Any, ...]:
+        """Return the concrete strict providers behind the configured adapter."""
+
+        providers = getattr(self.flight_offer_provider, "providers", None)
+        if isinstance(providers, tuple):
+            return providers
+        return (self.flight_offer_provider,)
+
+    def serpapi_credential_preflight_status(
+        self,
+    ) -> CredentialPreflightStatus | None:
+        """Return SerpApi's latest secret-free account observation, if present."""
+
+        for provider in self._strict_fare_providers():
+            if isinstance(provider, SerpApiFlightOfferProvider):
+                return provider.credential_preflight_status
+        return None
+
+    def preflight_strict_provider_credentials(
+        self,
+    ) -> CredentialPreflightStatus | None:
+        """Run only free credential checks; never submit a fare search."""
+
+        for provider in self._strict_fare_providers():
+            if isinstance(provider, SerpApiFlightOfferProvider):
+                return provider.preflight_credentials()
+        return None
 
     def _route(self, origin: str, destination: str, stops: int = 0) -> RouteEstimate:
         return estimate_route(
