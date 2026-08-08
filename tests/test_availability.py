@@ -24,8 +24,12 @@ from flight_forecaster.availability import (
     SERPAPI_SEARCH_URL,
     NullFlightOfferProvider,
     SerpApiFlightOfferProvider,
+    _AuthenticationError,
+    _ControlledRetryQuotaError,
+    _failure_status,
     _google_market_for_origin,
     _parse_google_segments,
+    _RateLimitError,
     flight_offer_provider_from_env,
 )
 
@@ -1591,8 +1595,8 @@ def test_shared_monthly_limit_defaults_and_clamps_to_250(tmp_path: Path) -> None
     assert client.booking_calls == []
 
 
-@pytest.mark.parametrize("account_state", [None, "", "Suspended"])
-def test_account_status_must_be_explicitly_active(
+@pytest.mark.parametrize("account_state", ["Suspended", "Disabled"])
+def test_non_active_account_is_distinct_and_stops_before_search(
     tmp_path: Path,
     account_state: Any,
 ) -> None:
@@ -1601,7 +1605,29 @@ def test_account_status_must_be_explicitly_active(
         "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
     )
     assert result.status == "authentication_failed"
+    assert len(client.account_calls) == 1
     assert client.search_calls == []
+    assert client.booking_calls == []
+    assert [item.exception_type for item in result.diagnostics] == ["AccountInactive"]
+
+
+@pytest.mark.parametrize("account_state", [None, ""])
+def test_missing_account_status_is_payload_failure_and_stops_before_search(
+    tmp_path: Path,
+    account_state: Any,
+) -> None:
+    client = _Client(account_state=account_state)
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "provider_unavailable"
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+    assert [item.exception_type for item in result.diagnostics] == [
+        "AccountStatusMissing"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2048,12 +2074,14 @@ def test_booking_token_verification_runs_in_parallel(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("account_status", "search_status", "expected"),
+    ("account_status", "search_status", "expected", "exception_type"),
     [
-        (401, 200, "authentication_failed"),
-        (200, 401, "authentication_failed"),
-        (200, 429, "rate_limited"),
-        (503, 200, "provider_error"),
+        (401, 200, "authentication_failed", "CredentialInvalid"),
+        (403, 200, "authentication_failed", "AccountForbidden"),
+        (200, 401, "authentication_failed", "CredentialInvalid"),
+        (200, 403, "authentication_failed", "AccountForbidden"),
+        (200, 429, "rate_limited", "RateLimitError"),
+        (503, 200, "provider_error", "TransientProviderHttpError"),
     ],
 )
 def test_provider_errors_are_distinguished_and_fail_closed(
@@ -2061,6 +2089,7 @@ def test_provider_errors_are_distinguished_and_fail_closed(
     account_status: int,
     search_status: int,
     expected: str,
+    exception_type: str,
 ) -> None:
     client = _Client(account_status=account_status, search_status=search_status)
     result = _provider(tmp_path, client).search(
@@ -2071,6 +2100,49 @@ def test_provider_errors_are_distinguished_and_fail_closed(
     )
     assert result.status == expected
     assert result.offers == ()
+    assert {item.exception_type for item in result.diagnostics} == {exception_type}
+    if account_status != 200:
+        assert len(client.account_calls) == 1
+        assert client.search_calls == []
+        assert client.booking_calls == []
+
+
+def test_failure_status_prioritizes_authentication_over_concurrent_quota_failures() -> None:
+    authentication = _AuthenticationError("test authentication failure")
+
+    assert _failure_status(
+        [_RateLimitError("test rate limit"), authentication]
+    ) == "authentication_failed"
+    assert _failure_status(
+        [_ControlledRetryQuotaError("hourly"), authentication]
+    ) == "authentication_failed"
+
+
+def test_account_preflight_never_persists_secret_account_fields(tmp_path: Path) -> None:
+    secrets = {
+        "api_key": "test-only-account-api-key",
+        "account_email": "test-only@example.invalid",
+        "account_id": "test-only-account-id",
+    }
+
+    class _SecretBearingAccountClient(_Client):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            response = super().get(url, **kwargs)
+            if url == SERPAPI_ACCOUNT_URL and response.status_code == 200:
+                return _Response({**response.payload, **secrets})
+            return response
+
+    client = _SecretBearingAccountClient()
+    result = _provider(tmp_path, client).search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert result.status == "confirmed_offers"
+    serialized_result = repr(result)
+    ledger_bytes = (tmp_path / "private" / "usage.sqlite3").read_bytes()
+    for secret in secrets.values():
+        assert secret not in serialized_result
+        assert secret.encode("utf-8") not in ledger_bytes
 
 
 def test_env_factory_is_fail_closed_and_uses_serpapi_names(
