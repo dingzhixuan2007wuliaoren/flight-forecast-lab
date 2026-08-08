@@ -10,6 +10,17 @@ from flight_forecaster.api import app, get_service
 from flight_forecaster.schemas import ComparisonResponse
 
 
+def _set_optional_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str | None,
+) -> None:
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+
 def test_optional_site_basic_auth(monkeypatch) -> None:
     monkeypatch.setenv("SITE_ACCESS_USERNAME", "flight")
     monkeypatch.setenv("SITE_ACCESS_PASSWORD", "test-only-password")
@@ -37,6 +48,8 @@ def test_readiness_fails_when_model_is_missing(monkeypatch, tmp_path: Path) -> N
 def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     monkeypatch.setenv("MODEL_DIR", str(trained_model_dir))
     monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    monkeypatch.delenv("RENDER_GIT_COMMIT", raising=False)
+    monkeypatch.delenv("RENDER_GIT_BRANCH", raising=False)
     get_service.cache_clear()
     client = TestClient(app)
     health = client.get("/health")
@@ -44,7 +57,12 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     assert health.json()["model_ready"] is True
     ready = client.get("/ready")
     assert ready.status_code == 200
-    assert ready.json() == {"status": "ready", "model_ready": True}
+    assert ready.json() == {
+        "status": "ready",
+        "model_ready": True,
+        "build_sha": "unknown",
+        "branch": "unknown",
+    }
     dashboard = client.get("/").text
     assert "Flight Forecast Lab" in dashboard
     assert 'id="strict-mode-notice"' in dashboard
@@ -150,6 +168,95 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     )
     assert ontime.status_code == 200
     assert 0 <= ontime.json()["on_time_probability"] <= 1
+
+
+@pytest.mark.parametrize(
+    ("build_sha", "branch"),
+    [
+        ("1234abc", "main"),
+        ("0123456789abcdef0123456789abcdef01234567", "codex/provider-fix_1.2"),
+    ],
+)
+def test_health_and_ready_expose_only_sanitized_render_build_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    trained_model_dir: Path,
+    build_sha: str,
+    branch: str,
+) -> None:
+    monkeypatch.setenv("MODEL_DIR", str(trained_model_dir))
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", build_sha)
+    monkeypatch.setenv("RENDER_GIT_BRANCH", branch)
+    monkeypatch.setenv("UNRELATED_DEPLOY_SECRET", "must-not-appear-in-health-output")
+    monkeypatch.setenv(
+        "RENDER_EXTERNAL_URL",
+        "https://secret.example.invalid/?token=must-not-appear",
+    )
+    get_service.cache_clear()
+
+    client = TestClient(app)
+    health = client.get("/health")
+    ready = client.get("/ready")
+
+    assert health.status_code == 200
+    assert health.json() == {
+        "status": "ok",
+        "model_ready": True,
+        "fare_provider_configured": False,
+        "fare_provider_environment": "disabled",
+        "build_sha": build_sha,
+        "branch": branch,
+    }
+    assert ready.status_code == 200
+    assert ready.json() == {
+        "status": "ready",
+        "model_ready": True,
+        "build_sha": build_sha,
+        "branch": branch,
+    }
+    serialized = health.text + ready.text
+    assert "must-not-appear-in-health-output" not in serialized
+    assert "must-not-appear" not in serialized
+    assert "RENDER_EXTERNAL_URL" not in serialized
+    assert "UNRELATED_DEPLOY_SECRET" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("build_sha", "branch", "expected_sha", "expected_branch"),
+    [
+        (None, None, "unknown", "unknown"),
+        ("abcdef", "main", "unknown", "main"),
+        ("a" * 41, "main", "unknown", "main"),
+        ("12345gg", "main", "unknown", "main"),
+        ("1234abc\nInjected", "main", "unknown", "main"),
+        ("1234abc", "feature/<script>", "1234abc", "unknown"),
+        ("1234abc", "main\nX-Injected: true", "1234abc", "unknown"),
+    ],
+)
+def test_health_and_ready_replace_missing_or_unsafe_build_metadata_with_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    trained_model_dir: Path,
+    build_sha: str | None,
+    branch: str | None,
+    expected_sha: str,
+    expected_branch: str,
+) -> None:
+    monkeypatch.setenv("MODEL_DIR", str(trained_model_dir))
+    monkeypatch.setenv("EXTERNAL_CONTEXT_ENABLED", "0")
+    _set_optional_environment(monkeypatch, "RENDER_GIT_COMMIT", build_sha)
+    _set_optional_environment(monkeypatch, "RENDER_GIT_BRANCH", branch)
+    get_service.cache_clear()
+
+    client = TestClient(app)
+    health = client.get("/health")
+    ready = client.get("/ready")
+
+    assert health.status_code == 200
+    assert health.json()["build_sha"] == expected_sha
+    assert health.json()["branch"] == expected_branch
+    assert ready.status_code == 200
+    assert ready.json()["build_sha"] == expected_sha
+    assert ready.json()["branch"] == expected_branch
 
 
 def test_invalid_request_is_rejected(monkeypatch, trained_model_dir: Path) -> None:

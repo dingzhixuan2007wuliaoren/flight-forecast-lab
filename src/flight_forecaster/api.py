@@ -4,6 +4,7 @@ import base64
 import binascii
 import hmac
 import os
+import re
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -61,13 +62,16 @@ app = FastAPI(
 )
 app.include_router(destination_router)
 
+_BUILD_SHA_PATTERN = re.compile(r"^[0-9A-Fa-f]{7,40}$")
+_BUILD_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+
 
 @app.middleware("http")
 async def require_optional_site_access(request: Request, call_next):
     """Protect public deployments without changing the local-development flow."""
 
     expected_password = os.getenv("SITE_ACCESS_PASSWORD", "")
-    if not expected_password or request.url.path in {"/health", "/ready"}:
+    if not expected_password or request.url.path in {"/health", "/ready", "/version"}:
         return await call_next(request)
 
     expected_username = os.getenv("SITE_ACCESS_USERNAME", "flight").strip() or "flight"
@@ -115,6 +119,17 @@ def _service_or_503() -> PredictionService:
 
 def _credential_present(*names: str) -> bool:
     return any(bool(os.getenv(name, "").strip()) for name in names)
+
+
+def _deployment_metadata() -> dict[str, str]:
+    """Expose only allowlisted, syntax-checked deployment identifiers."""
+
+    build_sha = os.getenv("RENDER_GIT_COMMIT", "").strip()
+    branch = os.getenv("RENDER_GIT_BRANCH", "").strip()
+    return {
+        "build_sha": build_sha if _BUILD_SHA_PATTERN.fullmatch(build_sha) else "unknown",
+        "branch": branch if _BUILD_BRANCH_PATTERN.fullmatch(branch) else "unknown",
+    }
 
 
 def _ignav_strict_release_active() -> bool:
@@ -956,6 +971,7 @@ def provider_details_page() -> FileResponse:
 
 @app.get("/health")
 def health() -> dict[str, str | bool]:
+    deployment = _deployment_metadata()
     artifact_exists = (model_dir() / ARTIFACT_FILENAME).exists()
     service: PredictionService | None = None
     if artifact_exists:
@@ -967,6 +983,7 @@ def health() -> dict[str, str | bool]:
                 "model_ready": False,
                 "fare_provider_configured": False,
                 "fare_provider_environment": "disabled",
+                **deployment,
             }
     return {
         "status": "ok" if artifact_exists else "model_not_trained",
@@ -977,6 +994,7 @@ def health() -> dict[str, str | bool]:
         "fare_provider_environment": (
             service.flight_offer_provider.environment if service is not None else "disabled"
         ),
+        **deployment,
     }
 
 
@@ -990,7 +1008,14 @@ def readiness() -> dict[str, str | bool]:
         get_service()
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="model artifact is not loadable") from exc
-    return {"status": "ready", "model_ready": True}
+    return {"status": "ready", "model_ready": True, **_deployment_metadata()}
+
+
+@app.get("/version")
+def version() -> dict[str, str]:
+    """Return a credential-free build identity for deployment verification."""
+
+    return _deployment_metadata()
 
 
 @app.get("/v1/model-info")

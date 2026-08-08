@@ -743,6 +743,22 @@ class _BookingEvidence:
     checked_bags_quantity: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ScrappaBookingDecision:
+    """A strict booking decision with a credential-safe rejection reason."""
+
+    offer: ConfirmedFlightOffer | None
+    rejection_code: str | None
+
+    def __post_init__(self) -> None:
+        if (self.offer is None) == (self.rejection_code is None):
+            raise ValueError("Scrappa booking decision must be accepted or rejected")
+        if self.rejection_code is not None and not _SAFE_EXCEPTION_PATTERN.fullmatch(
+            self.rejection_code
+        ):
+            raise ValueError("Scrappa rejection code is not safe")
+
+
 class _AdapterBase:
     provider_code: str
     provider_name: str
@@ -2112,7 +2128,7 @@ class ScrappaFlightOfferProvider(_AdapterBase):
                     continue
                 try:
                     payload, received_at, http_status = future.result()
-                    offer = _parse_scrappa_booking_confirmation(
+                    decision = _parse_scrappa_booking_decision(
                         payload,
                         candidate,
                         origin,
@@ -2138,17 +2154,17 @@ class ScrappaFlightOfferProvider(_AdapterBase):
                         exception_type="PayloadError",
                     )
                     continue
-                if offer is None:
+                if decision.offer is None:
                     strict_rejections += 1
                     diagnostics.record(
                         stage="validation",
                         http_status=http_status,
-                        exception_type="StrictCandidateRejected",
+                        exception_type=decision.rejection_code or "SchemaUnsupported",
                         search_id=_scrappa_payload_id(payload),
                         observed_at=received_at,
                     )
                 else:
-                    confirmed_by_position[position] = offer
+                    confirmed_by_position[position] = decision.offer
             if stop_for_quota:
                 # Running requests cannot be forcefully interrupted safely; no
                 # new work or controlled retry is issued after the evidence.
@@ -2532,36 +2548,67 @@ def _parse_scrappa_booking_confirmation(
     departure_date: date,
     received_at: datetime,
 ) -> ConfirmedFlightOffer | None:
+    """Compatibility wrapper retained for internal callers and focused tests."""
+
+    return _parse_scrappa_booking_decision(
+        payload,
+        candidate,
+        origin,
+        destination,
+        departure_date,
+        received_at,
+    ).offer
+
+
+def _parse_scrappa_booking_decision(
+    payload: dict[str, Any],
+    candidate: _ScrappaCandidate,
+    origin: str,
+    destination: str,
+    departure_date: date,
+    received_at: datetime,
+) -> _ScrappaBookingDecision:
+    """Normalize both legacy and documented Scrappa booking payload shapes.
+
+    Scrappa's public contract documents top-level array fields and does not
+    promise that request metadata is echoed.  The booking token plus the
+    request-bound route/date/lead flight therefore form the request anchor.
+    Any optional echoed metadata remains fail-closed when it contradicts that
+    anchor.  A response is only accepted when either the booking option or the
+    returned flight details independently reproduce the complete ordered
+    itinerary, in addition to a positive USD price, seller and safe HTTPS GET
+    path.
+    """
+
     metadata = payload.get("booking_metadata")
     details = payload.get("flight_details")
-    if not isinstance(metadata, dict) or not isinstance(details, dict):
-        return None
-    if (
-        _iata(metadata.get("origin")) != origin
-        or _iata(metadata.get("destination")) != destination
-        or str(metadata.get("departure_date", "")) != departure_date.isoformat()
-        or _airline_code(metadata.get("airline")) != candidate.lead_airline_code
-        or str(metadata.get("flight_number", "")).strip().upper()
-        != candidate.lead_flight_number
-    ):
-        return None
-    detail_code = _airline_code(details.get("airline_code"))
-    detail_leg = details.get("leg")
-    if detail_code != candidate.lead_airline_code or not isinstance(detail_leg, dict):
-        return None
-    detail_number = str(detail_leg.get("flight_number", "")).strip().upper()
-    parsed_detail = _split_full_flight_number(detail_number)
-    normalized_detail_number = (
-        parsed_detail[1] if parsed_detail is not None else detail_number
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            return _ScrappaBookingDecision(None, "SchemaUnsupported")
+        if not _scrappa_optional_booking_metadata_matches(
+            metadata,
+            candidate=candidate,
+            origin=origin,
+            destination=destination,
+            departure_date=departure_date,
+        ):
+            return _ScrappaBookingDecision(None, "BookingMetadataMismatch")
+    if not isinstance(details, (dict, list)):
+        return _ScrappaBookingDecision(None, "SchemaUnsupported")
+    details_match, details_airline_name = _scrappa_booking_details_match(
+        details,
+        candidate,
     )
-    if normalized_detail_number != candidate.lead_flight_number:
-        return None
-    total_duration = _positive_duration(details.get("total_duration_minutes"))
-    if total_duration is None or abs(total_duration - candidate.total_duration_minutes) > 5:
-        return None
-    evidence = _scrappa_booking_evidence(payload, candidate)
+    evidence, evidence_rejection = _scrappa_booking_evidence_decision(
+        payload,
+        candidate,
+        details_match=details_match,
+    )
     if evidence is None:
-        return None
+        return _ScrappaBookingDecision(
+            None,
+            evidence_rejection or "SchemaUnsupported",
+        )
     segments = candidate.segments
     if evidence.fare_brand is not None:
         segments = tuple(replace(segment, fare_brand=evidence.fare_brand) for segment in segments)
@@ -2578,11 +2625,10 @@ def _parse_scrappa_booking_confirmation(
             default=str,
         ).encode("utf-8")
     ).hexdigest()
-    return ConfirmedFlightOffer(
+    offer = ConfirmedFlightOffer(
         provider_offer_id=f"scrappa-{digest}",
         validating_airline_code=candidate.lead_airline_code,
-        airline_name=_short_text(details.get("airline_name"), max_length=160)
-        or candidate.airline_name,
+        airline_name=details_airline_name or candidate.airline_name,
         cabin=candidate.cabin,
         total_amount_usd=evidence.amount_usd,
         base_amount_usd=None,
@@ -2603,56 +2649,192 @@ def _parse_scrappa_booking_confirmation(
         provider_name=SCRAPPA_PROVIDER_NAME,
         environment="production",
     )
+    return _ScrappaBookingDecision(offer, None)
+
+
+def _scrappa_optional_booking_metadata_matches(
+    metadata: dict[str, Any],
+    *,
+    candidate: _ScrappaCandidate,
+    origin: str,
+    destination: str,
+    departure_date: date,
+) -> bool:
+    checks = (
+        ("origin", lambda value: _iata(value) == origin),
+        ("destination", lambda value: _iata(value) == destination),
+        ("departure_date", lambda value: str(value) == departure_date.isoformat()),
+        ("airline", lambda value: _airline_code(value) == candidate.lead_airline_code),
+    )
+    if any(key in metadata and not check(metadata.get(key)) for key, check in checks):
+        return False
+    if "flight_number" not in metadata:
+        return True
+    normalized = _normalized_scrappa_flight_identity(
+        metadata.get("flight_number"),
+        metadata.get("airline") or candidate.lead_airline_code,
+    )
+    return normalized == (
+        candidate.lead_airline_code,
+        candidate.lead_flight_number,
+    )
+
+
+def _scrappa_booking_details_match(
+    details: dict[str, Any] | list[Any],
+    candidate: _ScrappaCandidate,
+) -> tuple[bool, str | None]:
+    rows: list[dict[str, Any]] = []
+    containers = [details] if isinstance(details, dict) else list(details)
+    for container in containers:
+        if not isinstance(container, dict):
+            return False, None
+        nested: list[Any] | None = None
+        for key in ("flights", "legs", "segments"):
+            value = container.get(key)
+            if isinstance(value, list):
+                nested = value
+                break
+        if nested is None and isinstance(container.get("leg"), dict):
+            nested = [container["leg"]]
+        if nested is None:
+            rows.append(container)
+            continue
+        for value in nested:
+            if not isinstance(value, dict):
+                return False, None
+            merged = dict(value)
+            for key in ("airline", "airline_code", "airline_name"):
+                if key not in merged and key in container:
+                    merged[key] = container[key]
+            rows.append(merged)
+
+    returned_numbers: list[tuple[str, str]] = []
+    for row in rows:
+        identity = _normalized_scrappa_flight_identity(
+            row.get("flight_number") or row.get("number"),
+            row.get("airline_code") or row.get("airline"),
+        )
+        if identity is None:
+            return False, None
+        returned_numbers.append(identity)
+    expected_numbers = [
+        (segment.marketing_airline_code, segment.flight_number)
+        for segment in candidate.segments
+    ]
+    numbers_match = returned_numbers == expected_numbers
+
+    duration_values: list[int] = []
+    if isinstance(details, dict):
+        duration = _positive_duration(
+            details.get("total_duration_minutes") or details.get("duration_minutes")
+        )
+        if duration is not None:
+            duration_values.append(duration)
+    else:
+        for container in details:
+            if not isinstance(container, dict):
+                continue
+            duration = _positive_duration(container.get("total_duration_minutes"))
+            if duration is not None:
+                duration_values.append(duration)
+    duration_matches = not duration_values or any(
+        abs(value - candidate.total_duration_minutes) <= 5 for value in duration_values
+    )
+    airline_name = next(
+        (
+            value
+            for row in rows
+            if (value := _short_text(row.get("airline_name"), max_length=160))
+            is not None
+        ),
+        None,
+    )
+    return bool(numbers_match and duration_matches), airline_name
+
+
+def _normalized_scrappa_flight_identity(
+    raw_number: Any,
+    raw_airline: Any,
+) -> tuple[str, str] | None:
+    parsed = _split_full_flight_number(raw_number)
+    if parsed is not None:
+        if raw_airline is not None and _airline_code(raw_airline) != parsed[0]:
+            return None
+        return parsed
+    airline = _airline_code(raw_airline)
+    number = _flight_number(raw_number)
+    if airline is None or number is None:
+        return None
+    return airline, number
 
 
 def _scrappa_booking_evidence(
     payload: dict[str, Any],
     candidate: _ScrappaCandidate,
 ) -> _BookingEvidence | None:
+    evidence, _ = _scrappa_booking_evidence_decision(
+        payload,
+        candidate,
+        details_match=False,
+    )
+    return evidence
+
+
+def _scrappa_booking_evidence_decision(
+    payload: dict[str, Any],
+    candidate: _ScrappaCandidate,
+    *,
+    details_match: bool,
+) -> tuple[_BookingEvidence | None, str | None]:
     options = payload.get("fare_options")
-    if not isinstance(options, list):
-        return None
+    if not isinstance(options, list) or not options:
+        return None, "MissingFareOptions"
     expected_numbers = [
         f"{segment.marketing_airline_code}{segment.flight_number}"
         for segment in candidate.segments
     ]
     evidence: list[_BookingEvidence] = []
+    saw_valid_price = False
+    saw_provider = False
+    saw_safe_path = False
+    saw_itinerary_match = False
     for option in options:
         if not isinstance(option, dict) or option.get("is_split_booking") is True:
             continue
-        currency = str(option.get("currency", "")).strip().upper()
-        amount = _finite_amount(
-            option.get("price")
-            if option.get("price") is not None
-            else option.get("total_price")
-        )
-        provider = _short_text(
-            option.get("provider") or option.get("book_with") or option.get("seller"),
-            max_length=160,
-        )
+        amount, currency = _scrappa_option_price(option)
+        valid_price = currency == "USD" and amount is not None and amount > 0
+        saw_valid_price = saw_valid_price or valid_price
+        provider = _scrappa_option_provider(option)
+        saw_provider = saw_provider or provider is not None
         url = _safe_public_https_url(
             option.get("booking_url") or option.get("url") or option.get("deeplink")
         )
         request_data = option.get("booking_request")
         if url is None and isinstance(request_data, dict) and request_data.get("post_data") is None:
             url = _safe_public_https_url(request_data.get("url"))
-        raw_numbers = option.get("flight_numbers")
-        if (
-            currency != "USD"
-            or amount is None
-            or amount <= 0
-            or provider is None
-            or url is None
-            or not isinstance(raw_numbers, list)
+        saw_safe_path = saw_safe_path or url is not None
+        option_itinerary_matches = details_match
+        if "flight_numbers" in option:
+            raw_numbers = option.get("flight_numbers")
+            option_itinerary_matches = False
+            if isinstance(raw_numbers, list) and len(raw_numbers) == len(expected_numbers):
+                normalized_numbers: list[str] = []
+                for value in raw_numbers:
+                    parsed = _normalized_scrappa_flight_identity(value, None)
+                    if parsed is None:
+                        break
+                    normalized_numbers.append(f"{parsed[0]}{parsed[1]}")
+                else:
+                    option_itinerary_matches = normalized_numbers == expected_numbers
+        saw_itinerary_match = saw_itinerary_match or option_itinerary_matches
+        if not (
+            valid_price
+            and amount is not None
+            and provider is not None
+            and url is not None
+            and option_itinerary_matches
         ):
-            continue
-        normalized_numbers: list[str] = []
-        for value in raw_numbers:
-            parsed = _split_full_flight_number(value)
-            if parsed is None:
-                break
-            normalized_numbers.append(f"{parsed[0]}{parsed[1]}")
-        if normalized_numbers != expected_numbers:
             continue
         phrases = (
             [_normalized_phrase(value) for value in option.get("extensions", [])]
@@ -2686,11 +2868,35 @@ def _scrappa_booking_evidence(
                 ),
             )
         )
-    return (
-        min(evidence, key=lambda item: (item.amount_usd, item.booking_provider))
-        if evidence
-        else None
-    )
+    if evidence:
+        return min(evidence, key=lambda item: (item.amount_usd, item.booking_provider)), None
+    if not saw_valid_price:
+        return None, "InvalidFarePrice"
+    if not saw_provider:
+        return None, "MissingBookingProvider"
+    if not saw_safe_path:
+        return None, "UnsafeBookingPath"
+    if not saw_itinerary_match:
+        return None, "ItineraryMismatch"
+    return None, "SchemaUnsupported"
+
+
+def _scrappa_option_price(option: dict[str, Any]) -> tuple[float | None, str]:
+    raw_price = option.get("price")
+    if raw_price is None:
+        raw_price = option.get("total_price")
+    currency = str(option.get("currency", "")).strip().upper()
+    if isinstance(raw_price, dict):
+        currency = str(raw_price.get("currency") or currency).strip().upper()
+        raw_price = raw_price.get("amount") or raw_price.get("value") or raw_price.get("price")
+    return _finite_amount(raw_price), currency
+
+
+def _scrappa_option_provider(option: dict[str, Any]) -> str | None:
+    raw_provider = option.get("provider") or option.get("book_with") or option.get("seller")
+    if isinstance(raw_provider, dict):
+        raw_provider = raw_provider.get("name") or raw_provider.get("display_name")
+    return _short_text(raw_provider, max_length=160)
 
 
 class IgnavQuarantineFlightOfferProvider(_AdapterBase):
@@ -3059,10 +3265,11 @@ class FallbackFlightOfferProvider:
     """Run every strict provider in order and merge verified offers.
 
     Provider/account failures are isolated per source.  A transient source
-    failure receives exactly one whole-provider retry with ``force_refresh``;
-    authentication, quota, and complete no-result responses are terminal for
-    that source and immediately advance the chain.  This keeps failover honest
-    without spending scarce free calls retrying a known quota wall.
+    failure receives at most one whole-provider retry with ``force_refresh``,
+    and only before any candidate-level work has started.  Authentication,
+    quota, complete no-result responses, and partial verification sweeps are
+    terminal for that source and immediately advance the chain.  This keeps
+    failover honest without replaying a scarce multi-candidate booking sweep.
     """
 
     _PASSIVE_STATUSES = {
@@ -3075,11 +3282,29 @@ class FallbackFlightOfferProvider:
         "provider_error",
         "provider_unavailable",
     }
+    _CIRCUIT_COOLDOWNS_SECONDS: dict[SearchStatus, float | None] = {
+        "authentication_failed": None,
+        "rate_limited": 120.0,
+        "budget_exhausted": 3_600.0,
+        "provider_processing": 30.0,
+        "provider_error": 90.0,
+        "provider_unavailable": 90.0,
+    }
 
-    def __init__(self, providers: tuple[Any, ...]) -> None:
+    def __init__(
+        self,
+        providers: tuple[Any, ...],
+        *,
+        circuit_clock: Any = monotonic,
+    ) -> None:
         if not providers or any(not callable(getattr(item, "search", None)) for item in providers):
             raise ValueError("at least one valid fallback provider is required")
+        if not callable(circuit_clock):
+            raise ValueError("provider circuit clock must be callable")
         self.providers = tuple(providers)
+        self._circuit_clock = circuit_clock
+        self._circuit_lock = threading.Lock()
+        self._circuits: dict[str, _ProviderCircuitState] = {}
 
     @property
     def configured(self) -> bool:
@@ -3116,10 +3341,23 @@ class FallbackFlightOfferProvider:
 
         results: list[FlightOfferSearchResult] = []
         for provider in self.providers:
-            first = run_provider(provider, refresh=force_refresh)
-            if first.status in self._CONTROLLED_RETRY_STATUSES:
+            circuit_result = self._open_circuit_result(provider, fetched_at)
+            half_open_probe = (
+                circuit_result is None and self._half_open_probe_inflight(provider)
+            )
+            first = circuit_result
+            if first is None:
+                first = run_provider(provider, refresh=force_refresh)
+            if (
+                first.status in self._CONTROLLED_RETRY_STATUSES
+                and _whole_provider_retry_is_safe(first)
+                and not _result_was_returned_by_circuit(first)
+                and not half_open_probe
+            ):
                 second = run_provider(provider, refresh=True)
                 first = _controlled_provider_retry_result(first, second)
+            if not _result_was_returned_by_circuit(first):
+                self._update_circuit(provider, first)
             results.append(first)
 
         attempted = [
@@ -3132,6 +3370,112 @@ class FallbackFlightOfferProvider:
         if len(attempted) > 1:
             return _aggregate_strict_provider_results(attempted)
         return results[-1]
+
+    def _open_circuit_result(
+        self,
+        provider: Any,
+        observed_at: datetime,
+    ) -> FlightOfferSearchResult | None:
+        provider_code = _strict_provider_identity(provider)[0]
+        if provider_code is None:
+            return None
+        now_tick = float(self._circuit_clock())
+        with self._circuit_lock:
+            state = self._circuits.get(provider_code)
+            if state is None:
+                return None
+            if state.opened_until is not None and now_tick >= state.opened_until:
+                if not state.probe_inflight:
+                    state.probe_inflight = True
+                    return None
+            marker = ProviderDiagnostic(
+                observed_at=_utc(observed_at),
+                stage="validation",
+                http_status=None,
+                exception_type="ProviderCircuitOpen",
+                search_id=None,
+            )
+            return replace(
+                state.last_result,
+                observed_at=_utc(observed_at),
+                calls_used=0,
+                search_calls_used=0,
+                pricing_calls_used=0,
+                cache_hit=True,
+                diagnostics=tuple([*state.last_result.diagnostics[-4:], marker]),
+            )
+
+    def _half_open_probe_inflight(self, provider: Any) -> bool:
+        provider_code = _strict_provider_identity(provider)[0]
+        if provider_code is None:
+            return False
+        with self._circuit_lock:
+            state = self._circuits.get(provider_code)
+            return bool(state is not None and state.probe_inflight)
+
+    def _update_circuit(
+        self,
+        provider: Any,
+        result: FlightOfferSearchResult,
+    ) -> None:
+        provider_code = _strict_provider_identity(provider)[0]
+        if provider_code is None:
+            return
+        cooldown = self._CIRCUIT_COOLDOWNS_SECONDS.get(result.status, ...)
+        with self._circuit_lock:
+            if cooldown is ...:
+                self._circuits.pop(provider_code, None)
+                return
+            opened_until = (
+                None
+                if cooldown is None
+                else float(self._circuit_clock()) + float(cooldown)
+            )
+            self._circuits[provider_code] = _ProviderCircuitState(
+                last_result=result,
+                opened_until=opened_until,
+            )
+
+
+@dataclass(slots=True)
+class _ProviderCircuitState:
+    last_result: FlightOfferSearchResult
+    opened_until: float | None
+    probe_inflight: bool = False
+
+
+def _strict_provider_identity(provider: Any) -> tuple[str | None, str | None]:
+    try:
+        provider_code = getattr(provider, "provider_code", None)
+        provider_name = getattr(provider, "provider_name", None)
+    except Exception:
+        return None, None
+    if _STRICT_PROVIDER_NAMES.get(provider_code) != provider_name:
+        return None, None
+    return provider_code, provider_name
+
+
+def _result_was_returned_by_circuit(result: FlightOfferSearchResult) -> bool:
+    return any(
+        diagnostic.exception_type == "ProviderCircuitOpen"
+        for diagnostic in result.diagnostics
+    )
+
+
+def _whole_provider_retry_is_safe(result: FlightOfferSearchResult) -> bool:
+    """Allow one replay only before a provider exposes or verifies candidates."""
+
+    return not any(
+        (
+            result.eligible_candidate_count,
+            result.verification_attempted_count,
+            result.verified_candidate_count,
+            result.strictly_rejected_candidate_count,
+            result.provider_failed_candidate_count,
+            result.quota_skipped_candidate_count,
+            result.pricing_calls_used,
+        )
+    )
 
 
 def _controlled_provider_retry_result(

@@ -1,0 +1,71 @@
+name: Verify production deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Full commit SHA expected to be live after a Render deploy
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait for Render to serve the expected commit
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+          VERSION_URL: https://flight-forecast-lab.onrender.com/version
+        run: |
+          if ! printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9A-Fa-f]{40}$'; then
+            echo "expected_sha must be a full 40-character hexadecimal commit SHA"
+            exit 2
+          fi
+          EXPECTED_SHA=$(printf '%s' "$EXPECTED_SHA" | tr '[:upper:]' '[:lower:]')
+          deadline=$(( $(date +%s) + 900 ))
+          attempt=0
+          while true; do
+            now=$(date +%s)
+            remaining=$(( deadline - now ))
+            if [ "$remaining" -le 0 ]; then
+              break
+            fi
+            curl_timeout=15
+            if [ "$remaining" -lt "$curl_timeout" ]; then
+              curl_timeout=$remaining
+            fi
+            attempt=$(( attempt + 1 ))
+            if payload=$(curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time "$curl_timeout" \
+              --header 'Cache-Control: no-cache' \
+              --header 'Pragma: no-cache' \
+              "$VERSION_URL"); then
+              actual=$(python -c 'import json,re,sys; value=json.load(sys.stdin).get("build_sha", ""); print(value.lower() if isinstance(value, str) and re.fullmatch(r"[0-9A-Fa-f]{40}", value) else "unknown")' <<<"$payload")
+              if [ "$actual" = "$EXPECTED_SHA" ]; then
+                echo "Production is serving $actual"
+                exit 0
+              fi
+              echo "Attempt $attempt: production reports ${actual:-unknown}"
+            else
+              echo "Attempt $attempt: version endpoint is not ready"
+            fi
+            now=$(date +%s)
+            remaining=$(( deadline - now ))
+            if [ "$remaining" -le 0 ]; then
+              break
+            fi
+            sleep_seconds=20
+            if [ "$remaining" -lt "$sleep_seconds" ]; then
+              sleep_seconds=$remaining
+            fi
+            sleep "$sleep_seconds"
+          done
+          echo "Production did not reach expected commit $EXPECTED_SHA within 15 minutes"
+          exit 1
