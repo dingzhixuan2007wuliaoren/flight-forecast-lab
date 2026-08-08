@@ -3,9 +3,10 @@ services:
     name: flight-forecast-lab
     runtime: docker
     plan: free
+    branch: main
     dockerfilePath: ./Dockerfile
     numInstances: 1
-    autoDeployTrigger: commit
+    autoDeployTrigger: checksPass
     healthCheckPath: /ready
     envVars:
       - key: MODEL_DIR

@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, Thread
 from typing import Any
 
 import pytest
@@ -435,6 +435,99 @@ class _ScrappaClient:
 
     def post(self, *_args: Any, **_kwargs: Any) -> _Response:
         raise AssertionError("provider network must not be called")
+
+
+class _ScrappaBookingShapeClient(_ScrappaClient):
+    """Return controlled booking payload variants without external requests."""
+
+    def __init__(
+        self,
+        *,
+        array_flight_details: bool = False,
+        include_booking_metadata: bool = True,
+        empty_fare_options: bool = False,
+    ) -> None:
+        super().__init__(candidates_per_cabin=1)
+        self.array_flight_details = array_flight_details
+        self.include_booking_metadata = include_booking_metadata
+        self.empty_fare_options = empty_fare_options
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        response = super().get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+        if url != SCRAPPA_BOOKING_DETAILS_URL:
+            return response
+
+        payload = dict(response.payload)
+        if self.array_flight_details:
+            payload["flight_details"] = [payload["flight_details"]]
+        if not self.include_booking_metadata:
+            payload.pop("booking_metadata", None)
+        if self.empty_fare_options:
+            payload["fare_options"] = []
+        payload["price_insights"] = []
+        payload["baggage_info"] = []
+        return _Response(payload)
+
+
+class _ScrappaContradictoryBookingClient(_ScrappaClient):
+    """Inject one contradictory booking-details shape per strict regression."""
+
+    def __init__(self, variant: str) -> None:
+        if variant not in {
+            "extra_unparseable_detail",
+            "contradictory_airline",
+            "scalar_flight_numbers",
+        }:
+            raise ValueError("unsupported Scrappa contradiction variant")
+        super().__init__(candidates_per_cabin=1)
+        self.variant = variant
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        response = super().get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+        if url != SCRAPPA_BOOKING_DETAILS_URL:
+            return response
+
+        payload = dict(response.payload)
+        details = dict(payload["flight_details"])
+        option = dict(payload["fare_options"][0])
+        if self.variant == "extra_unparseable_detail":
+            payload["flight_details"] = [details, {}]
+            option.pop("flight_numbers", None)
+        elif self.variant == "contradictory_airline":
+            leg = dict(details["leg"])
+            leg["flight_number"] = "AC 801"
+            details["leg"] = leg
+            details["airline_code"] = "BA"
+            payload["flight_details"] = details
+            option.pop("flight_numbers", None)
+        else:
+            option["flight_numbers"] = "BA 999"
+        payload["fare_options"] = [option]
+        return _Response(payload)
 
 
 def _searchapi_parameters(cabin: str) -> dict[str, Any]:
@@ -1160,6 +1253,31 @@ class _SequencedFallbackStub(_FallbackStub):
         return result
 
 
+class _CircuitFallbackStub(_SequencedFallbackStub):
+    provider_code = SERPAPI_PROVIDER_CODE
+    provider_name = SERPAPI_PROVIDER_NAME
+
+
+class _BlockingHalfOpenFallbackStub(_CircuitFallbackStub):
+    def __init__(
+        self,
+        name: str,
+        results: tuple[FlightOfferSearchResult, ...],
+        log: list[str],
+    ) -> None:
+        super().__init__(name, results, log)
+        self.probe_started = Event()
+        self.release_probe = Event()
+
+    def search(self, *_args: Any, **kwargs: Any) -> FlightOfferSearchResult:
+        result = super().search(*_args, **kwargs)
+        if self.calls == 3:
+            self.probe_started.set()
+            if not self.release_probe.wait(timeout=2):
+                raise TimeoutError("half-open probe was not released")
+        return result
+
+
 class _RaisingStrictProvider:
     configured = True
     environment = "production"
@@ -1264,6 +1382,21 @@ def _offer_result(
     )
 
 
+def _circuit_failure_result(status: str) -> FlightOfferSearchResult:
+    return FlightOfferSearchResult(
+        offers=(),
+        status=status,
+        observed_at=NOW,
+        environment="production",
+        searched_cabins=(),
+        calls_used=1,
+        cache_hit=False,
+        search_calls_used=1,
+        provider_code=SERPAPI_PROVIDER_CODE,
+        provider_name=SERPAPI_PROVIDER_NAME,
+    )
+
+
 def test_fallback_queries_every_strict_provider_and_aggregates_confirmed_runs() -> None:
     call_log: list[str] = []
     serpapi = _FallbackStub("serpapi", _offer_result(), call_log)
@@ -1363,6 +1496,182 @@ def test_fallback_retries_one_transient_provider_failure_once() -> None:
         diagnostic.exception_type == "ControlledProviderRetry"
         for diagnostic in result.diagnostics
     )
+
+
+def test_fallback_circuit_skips_authentication_failure_on_later_queries() -> None:
+    clock = [0.0]
+    call_log: list[str] = []
+    provider_stub = _CircuitFallbackStub(
+        "serpapi",
+        (_circuit_failure_result("authentication_failed"),),
+        call_log,
+    )
+    provider = FallbackFlightOfferProvider(
+        (provider_stub,),
+        circuit_clock=lambda: clock[0],
+    )
+
+    first = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    clock[0] = 10_000.0
+    skipped = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert first.status == "authentication_failed"
+    assert skipped.status == "authentication_failed"
+    assert skipped.calls_used == 0
+    assert skipped.cache_hit is True
+    assert call_log == ["serpapi:false"]
+    assert any(
+        diagnostic.exception_type == "ProviderCircuitOpen"
+        for diagnostic in skipped.diagnostics
+    )
+
+
+def test_fallback_circuit_skips_transient_provider_error_for_90_seconds() -> None:
+    clock = [0.0]
+    call_log: list[str] = []
+    transient = _circuit_failure_result("provider_error")
+    provider_stub = _CircuitFallbackStub(
+        "serpapi",
+        (transient, transient),
+        call_log,
+    )
+    provider = FallbackFlightOfferProvider(
+        (provider_stub,),
+        circuit_clock=lambda: clock[0],
+    )
+
+    first = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    clock[0] = 89.999
+    skipped = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert first.status == "provider_error"
+    assert skipped.status == "provider_error"
+    assert skipped.calls_used == 0
+    assert skipped.cache_hit is True
+    assert call_log == ["serpapi:false", "serpapi:true"]
+    assert any(
+        diagnostic.exception_type == "ProviderCircuitOpen"
+        for diagnostic in skipped.diagnostics
+    )
+
+
+def test_fallback_circuit_allows_one_half_open_probe_and_closes_on_success() -> None:
+    clock = [0.0]
+    call_log: list[str] = []
+    transient = _circuit_failure_result("provider_error")
+    provider_stub = _BlockingHalfOpenFallbackStub(
+        "serpapi",
+        (transient, transient, _offer_result()),
+        call_log,
+    )
+    provider = FallbackFlightOfferProvider(
+        (provider_stub,),
+        circuit_clock=lambda: clock[0],
+    )
+    provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    clock[0] = 90.0
+    probe_results: list[FlightOfferSearchResult] = []
+    probe_errors: list[BaseException] = []
+
+    def run_probe() -> None:
+        try:
+            probe_results.append(
+                provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            probe_errors.append(exc)
+
+    probe_thread = Thread(target=run_probe)
+    probe_thread.start()
+    assert provider_stub.probe_started.wait(timeout=2)
+
+    concurrent = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    assert provider_stub.calls == 3
+    assert any(
+        diagnostic.exception_type == "ProviderCircuitOpen"
+        for diagnostic in concurrent.diagnostics
+    )
+
+    provider_stub.release_probe.set()
+    probe_thread.join(timeout=2)
+    assert not probe_thread.is_alive()
+    assert probe_errors == []
+    assert len(probe_results) == 1
+    assert probe_results[0].status == "confirmed_offers"
+
+    after_success = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert after_success.status == "confirmed_offers"
+    assert provider_stub.calls == 4
+    assert call_log == [
+        "serpapi:false",
+        "serpapi:true",
+        "serpapi:false",
+        "serpapi:false",
+    ]
+
+
+@pytest.mark.parametrize(
+    (
+        "verification_attempted_count",
+        "provider_failed_candidate_count",
+        "quota_skipped_candidate_count",
+        "coverage_status",
+        "quota_limit",
+    ),
+    (
+        (0, 0, 1, "quota_and_provider_incomplete", "provider_specific"),
+        (1, 1, 0, "provider_incomplete", None),
+    ),
+)
+def test_fallback_does_not_retry_a_provider_after_candidate_work_started(
+    verification_attempted_count: int,
+    provider_failed_candidate_count: int,
+    quota_skipped_candidate_count: int,
+    coverage_status: str,
+    quota_limit: str | None,
+) -> None:
+    call_log: list[str] = []
+    partial = FlightOfferSearchResult(
+        offers=(),
+        status="provider_error",
+        observed_at=NOW,
+        environment="production",
+        searched_cabins=("economy",),
+        calls_used=1 + verification_attempted_count,
+        cache_hit=False,
+        search_calls_used=1,
+        pricing_calls_used=verification_attempted_count,
+        eligible_candidate_count=1,
+        verification_attempted_count=verification_attempted_count,
+        provider_failed_candidate_count=provider_failed_candidate_count,
+        search_failed_cabin_count=(1 if verification_attempted_count == 0 else 0),
+        quota_skipped_candidate_count=quota_skipped_candidate_count,
+        coverage_status=coverage_status,
+        quota_limit=quota_limit,
+        provider_code=SCRAPPA_PROVIDER_CODE,
+        provider_name=SCRAPPA_PROVIDER_NAME,
+    )
+    provider = FallbackFlightOfferProvider(
+        (
+            _SequencedFallbackStub(
+                "scrappa",
+                (
+                    partial,
+                    _offer_result(
+                        provider_code=SCRAPPA_PROVIDER_CODE,
+                        provider_name=SCRAPPA_PROVIDER_NAME,
+                    ),
+                ),
+                call_log,
+            ),
+        )
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "provider_error"
+    assert call_log == ["scrappa:false"]
 
 
 def test_aggregate_failure_notice_explains_bounded_recovery_in_both_languages() -> None:
@@ -1468,6 +1777,122 @@ def test_scrappa_numeric_flight_number_and_zero_search_price_are_verified(
     assert all(offer.total_amount_usd == 510 for offer in result.offers)
     assert all(offer.segments[0].flight_number == "801" for offer in result.offers)
     assert sum(url == SCRAPPA_BOOKING_DETAILS_URL for url, _ in client.calls) == 4
+
+
+def test_scrappa_accepts_official_top_level_booking_arrays(tmp_path: Path) -> None:
+    client = _ScrappaBookingShapeClient(
+        array_flight_details=True,
+        include_booking_metadata=False,
+    )
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.eligible_candidate_count == 4
+    assert result.verification_attempted_count == 4
+    assert result.verified_candidate_count == 4
+    assert len(result.offers) == 4
+    assert all(offer.total_amount_usd == 510 for offer in result.offers)
+    assert all(offer.booking_provider == "Air Canada" for offer in result.offers)
+    assert all(offer.booking_url.startswith("https://") for offer in result.offers)
+    assert all(offer.segments[0].flight_number == "801" for offer in result.offers)
+
+
+def test_scrappa_booking_metadata_is_optional(tmp_path: Path) -> None:
+    client = _ScrappaBookingShapeClient(include_booking_metadata=False)
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.verified_candidate_count == 4
+    assert len(result.offers) == 4
+
+
+def test_scrappa_reports_specific_sanitized_strict_rejection_reason(
+    tmp_path: Path,
+) -> None:
+    client = _ScrappaBookingShapeClient(
+        array_flight_details=True,
+        include_booking_metadata=False,
+        empty_fare_options=True,
+    )
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "no_results"
+    assert result.strictly_rejected_candidate_count == 4
+    assert result.provider_failed_candidate_count == 0
+    assert {item.exception_type for item in result.diagnostics} == {
+        "MissingFareOptions"
+    }
+    assert "StrictCandidateRejected" not in {
+        item.exception_type for item in result.diagnostics
+    }
+
+
+def _assert_scrappa_itinerary_contradiction_is_rejected(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "alternate.sqlite3",
+        client=_ScrappaContradictoryBookingClient(variant),
+        now_provider=lambda: NOW,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "no_results"
+    assert result.offers == ()
+    assert result.strictly_rejected_candidate_count == 4
+    assert result.provider_failed_candidate_count == 0
+    assert {item.exception_type for item in result.diagnostics} == {
+        "ItineraryMismatch"
+    }
+
+
+def test_scrappa_rejects_an_extra_unparseable_booking_detail(tmp_path: Path) -> None:
+    _assert_scrappa_itinerary_contradiction_is_rejected(
+        tmp_path,
+        "extra_unparseable_detail",
+    )
+
+
+def test_scrappa_rejects_a_full_flight_number_with_a_conflicting_airline(
+    tmp_path: Path,
+) -> None:
+    _assert_scrappa_itinerary_contradiction_is_rejected(
+        tmp_path,
+        "contradictory_airline",
+    )
+
+
+def test_scrappa_rejects_scalar_contradictory_option_flight_numbers(
+    tmp_path: Path,
+) -> None:
+    _assert_scrappa_itinerary_contradiction_is_rejected(
+        tmp_path,
+        "scalar_flight_numbers",
+    )
 
 
 def test_scrappa_accepts_documented_minimal_search_metadata() -> None:
