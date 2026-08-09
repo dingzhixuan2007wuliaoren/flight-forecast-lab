@@ -1741,6 +1741,85 @@ def test_non_active_account_is_distinct_and_stops_before_search(
     assert [item.exception_type for item in result.diagnostics] == ["AccountInactive"]
 
 
+def test_inactive_account_at_monthly_limit_is_verified_but_budget_exhausted(
+    tmp_path: Path,
+) -> None:
+    client = _Client(
+        account_state="Inactive",
+        account_usage=250,
+        provider_monthly_limit=250,
+    )
+    provider = _provider(tmp_path, client)
+
+    result = provider.search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert provider.credential_preflight_status.state == "verified"
+    assert provider.credential_preflight_status.http_status == 200
+    assert provider.credential_preflight_status.exception_type is None
+    assert result.status == "budget_exhausted"
+    assert result.offers == ()
+    assert result.calls_used == 0
+    assert result.search_calls_used == 0
+    assert result.pricing_calls_used == 0
+    assert result.search_monthly_used == 250
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+def test_inactive_account_below_monthly_limit_remains_authentication_failed(
+    tmp_path: Path,
+) -> None:
+    client = _Client(
+        account_state="Inactive",
+        account_usage=249,
+        provider_monthly_limit=250,
+    )
+    provider = _provider(tmp_path, client)
+
+    result = provider.search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert provider.credential_preflight_status.state == "inactive"
+    assert provider.credential_preflight_status.http_status == 200
+    assert provider.credential_preflight_status.exception_type == "AccountInactive"
+    assert result.status == "authentication_failed"
+    assert result.offers == ()
+    assert result.calls_used == 0
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+    assert [item.exception_type for item in result.diagnostics] == ["AccountInactive"]
+
+
+@pytest.mark.parametrize("account_state", ["Suspended", "Disabled"])
+def test_other_non_active_states_stay_blocked_even_at_monthly_limit(
+    tmp_path: Path,
+    account_state: str,
+) -> None:
+    client = _Client(
+        account_state=account_state,
+        account_usage=250,
+        provider_monthly_limit=250,
+    )
+    provider = _provider(tmp_path, client)
+
+    result = provider.search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert provider.credential_preflight_status.state == "inactive"
+    assert result.status == "authentication_failed"
+    assert result.calls_used == 0
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+    assert [item.exception_type for item in result.diagnostics] == ["AccountInactive"]
+
+
 @pytest.mark.parametrize("account_state", [None, ""])
 def test_missing_account_status_is_payload_failure_and_stops_before_search(
     tmp_path: Path,

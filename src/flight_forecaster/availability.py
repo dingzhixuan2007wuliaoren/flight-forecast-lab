@@ -1842,7 +1842,29 @@ class SerpApiFlightOfferProvider:
             )
             raise _AccountPayloadError("provider account status is missing or invalid")
         account_status = raw_account_status.strip().lower()
-        if account_status != "active":
+        monthly_usage = _optional_nonnegative_int(payload.get("this_month_usage"))
+        hourly_usage = _optional_nonnegative_int(payload.get("this_hour_searches"))
+        provider_monthly_limit = _optional_positive_int(payload.get("searches_per_month"))
+        provider_hourly_limit = _optional_positive_int(
+            payload.get("account_rate_limit_per_hour")
+        )
+        renewal_date = _plan_renewal_date(
+            payload.get("plan_renewal_date"),
+            received_at=received_at,
+        )
+        # SerpApi reports ``account_status=Inactive`` when a free plan has used
+        # all monthly searches, even though the subscription itself remains
+        # active.  Treat that exact, quota-backed state as an exhausted budget
+        # rather than a credential failure.  Suspended/disabled accounts and
+        # inactive responses without complete exhaustion evidence still fail
+        # closed as authentication errors.
+        monthly_quota_exhausted = (
+            account_status == "inactive"
+            and monthly_usage is not None
+            and provider_monthly_limit is not None
+            and monthly_usage >= provider_monthly_limit
+        )
+        if account_status != "active" and not monthly_quota_exhausted:
             self._set_credential_preflight_status(
                 "inactive",
                 checked_at=received_at,
@@ -1858,14 +1880,6 @@ class SerpApiFlightOfferProvider:
                 search_id=None,
             )
             raise _AccountInactiveError("provider account is not active")
-        monthly_usage = _optional_nonnegative_int(payload.get("this_month_usage"))
-        hourly_usage = _optional_nonnegative_int(payload.get("this_hour_searches"))
-        provider_monthly_limit = _optional_positive_int(payload.get("searches_per_month"))
-        provider_hourly_limit = _optional_positive_int(payload.get("account_rate_limit_per_hour"))
-        renewal_date = _plan_renewal_date(
-            payload.get("plan_renewal_date"),
-            received_at=received_at,
-        )
         if (
             monthly_usage is None
             or hourly_usage is None
