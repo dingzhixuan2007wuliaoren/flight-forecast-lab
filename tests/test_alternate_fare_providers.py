@@ -4,8 +4,9 @@ import json
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
-from threading import Barrier, Event, Thread
+from threading import Barrier, Event, Lock, Thread
 from typing import Any
 
 import pytest
@@ -25,6 +26,7 @@ from flight_forecaster.alternate_fare_providers import (
     _parse_ignav_segments,
     _parse_scrappa_segments,
     _parse_searchapi_segments,
+    _response_retry_after_seconds,
     _scrappa_search_parameters_match,
     _scrappa_transient_booking_error_envelope,
 )
@@ -492,6 +494,7 @@ class _ScrappaClient:
         first_booking_status: int | None = None,
         first_booking_status_tokens: set[str] | None = None,
         first_booking_retry_after: float | None = None,
+        first_booking_retry_after_header: str | None = None,
         booking_failure_attempts: int = 1,
         first_booking_transport_error: bool = False,
     ) -> None:
@@ -523,6 +526,7 @@ class _ScrappaClient:
             else None
         )
         self.first_booking_retry_after = first_booking_retry_after
+        self.first_booking_retry_after_header = first_booking_retry_after_header
         self.booking_failure_attempts = booking_failure_attempts
         self.first_booking_transport_error = first_booking_transport_error
         self.booking_attempts: dict[str, int] = {}
@@ -618,10 +622,13 @@ class _ScrappaClient:
             }
             if self.first_booking_retry_after is not None:
                 error_payload["retry_after"] = self.first_booking_retry_after
+            response_headers = {"x-request-id": search_id}
+            if self.first_booking_retry_after_header is not None:
+                response_headers["Retry-After"] = self.first_booking_retry_after_header
             return _Response(
                 error_payload,
                 self.first_booking_status,
-                headers={"x-request-id": search_id},
+                headers=response_headers,
             )
         if (
             self.booking_error_envelope
@@ -672,6 +679,52 @@ class _ScrappaClient:
 
     def post(self, *_args: Any, **_kwargs: Any) -> _Response:
         raise AssertionError("provider network must not be called")
+
+
+class _BlockingScrappaClient(_ScrappaClient):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.release_booking_requests = Event()
+        self.three_booking_requests_started = Event()
+        self._booking_lock = Lock()
+        self._active_booking_requests = 0
+        self.peak_booking_requests = 0
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _Response:
+        if url != SCRAPPA_BOOKING_DETAILS_URL:
+            return super().get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+        with self._booking_lock:
+            self._active_booking_requests += 1
+            self.peak_booking_requests = max(
+                self.peak_booking_requests,
+                self._active_booking_requests,
+            )
+            if self._active_booking_requests == 3:
+                self.three_booking_requests_started.set()
+        try:
+            if not self.release_booking_requests.wait(timeout=5):
+                raise TimeoutError("test did not release Scrappa booking requests")
+            return super().get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+        finally:
+            with self._booking_lock:
+                self._active_booking_requests -= 1
 
 
 class _ScrappaBookingShapeClient(_ScrappaClient):
@@ -1723,7 +1776,7 @@ def test_ignav_honors_retry_after_within_the_synchronous_wait_limit(
         (500, False, "provider_error"),
         (401, True, "authentication_failed"),
         (402, True, "budget_exhausted"),
-        (403, True, "authentication_failed"),
+        (403, True, "provider_error"),
         (429, True, "rate_limited"),
     ),
 )
@@ -1756,6 +1809,89 @@ def test_ignav_fallback_never_replays_terminal_http_statuses(
     assert result.status == expected_status
     assert result.search_calls_used == 4
     assert client.search_attempts["economy"] == 1
+    assert "ControlledProviderRetry" not in {
+        item.exception_type for item in result.diagnostics
+    }
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_status", "expected_exception_type"),
+    (
+        ("invalid_api_key", "authentication_failed", "AuthenticationError"),
+        ("permission_denied", "authentication_failed", "AuthenticationError"),
+        ("provider_failure", "provider_error", "TerminalProviderError"),
+    ),
+)
+def test_ignav_403_requires_an_explicit_authentication_error_code(
+    tmp_path: Path,
+    error_code: str,
+    expected_status: str,
+    expected_exception_type: str,
+) -> None:
+    client = _ConfigurableIgnavClient(
+        first_search_status=403,
+        first_search_error_code=error_code,
+    )
+    provider = IgnavQuarantineFlightOfferProvider(
+        "ignav-test-key",
+        usage_path=tmp_path / f"ignav-403-{error_code}.sqlite3",
+        release_verified=True,
+        free_account_attested=True,
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = FallbackFlightOfferProvider((provider,)).search(
+        "YYZ",
+        "LHR",
+        DEPARTURE_DATE,
+        fetched_at=NOW,
+    )
+
+    assert result.status == expected_status
+    assert client.search_attempts["economy"] == 1
+    assert expected_exception_type in {
+        item.exception_type for item in result.diagnostics
+    }
+    assert "ControlledCabinRetry" not in {
+        item.exception_type for item in result.diagnostics
+    }
+    assert "ControlledProviderRetry" not in {
+        item.exception_type for item in result.diagnostics
+    }
+
+
+def test_ignav_http_200_error_envelope_is_terminal_provider_error(
+    tmp_path: Path,
+) -> None:
+    client = _ConfigurableIgnavClient(
+        first_search_status=200,
+        first_search_error_code="provider_failure",
+    )
+    provider = IgnavQuarantineFlightOfferProvider(
+        "ignav-test-key",
+        usage_path=tmp_path / "ignav-200-error-envelope.sqlite3",
+        release_verified=True,
+        free_account_attested=True,
+        client=client,
+        now_provider=lambda: NOW,
+    )
+
+    result = FallbackFlightOfferProvider((provider,)).search(
+        "YYZ",
+        "LHR",
+        DEPARTURE_DATE,
+        fetched_at=NOW,
+    )
+
+    assert result.status == "provider_error"
+    assert client.search_attempts["economy"] == 1
+    assert "TerminalProviderError" in {
+        item.exception_type for item in result.diagnostics
+    }
+    assert "ControlledCabinRetry" not in {
+        item.exception_type for item in result.diagnostics
+    }
     assert "ControlledProviderRetry" not in {
         item.exception_type for item in result.diagnostics
     }
@@ -2018,6 +2154,14 @@ class _CircuitFallbackStub(_SequencedFallbackStub):
 
 class _RecoverableAuthenticationCircuitStub(_CircuitFallbackStub):
     authentication_recheck_seconds = 300.0
+
+
+class _RecoverableIgnavAuthenticationCircuitStub(_SequencedFallbackStub):
+    provider_code = IGNAV_VERIFIED_PROVIDER_CODE
+    provider_name = IGNAV_VERIFIED_PROVIDER_NAME
+    authentication_recheck_seconds = (
+        IgnavQuarantineFlightOfferProvider.authentication_recheck_seconds
+    )
 
 
 class _BlockingHalfOpenFallbackStub(_CircuitFallbackStub):
@@ -2317,6 +2461,38 @@ def test_fallback_authentication_circuit_uses_account_only_recovery_window() -> 
     assert call_log == ["serpapi:false", "serpapi:false"]
 
 
+def test_ignav_authentication_circuit_half_opens_on_a_new_query_after_five_minutes(
+) -> None:
+    clock = [0.0]
+    call_log: list[str] = []
+    provider_stub = _RecoverableIgnavAuthenticationCircuitStub(
+        "ignav",
+        (
+            _circuit_failure_result("authentication_failed"),
+            _offer_result(),
+        ),
+        call_log,
+    )
+    provider = FallbackFlightOfferProvider(
+        (provider_stub,),
+        circuit_clock=lambda: clock[0],
+    )
+
+    first = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    clock[0] = 299.999
+    skipped = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+    clock[0] = 300.0
+    recovered = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert IgnavQuarantineFlightOfferProvider.authentication_recheck_seconds == 300.0
+    assert first.status == "authentication_failed"
+    assert skipped.status == "authentication_failed"
+    assert skipped.calls_used == 0
+    assert skipped.cache_hit is True
+    assert recovered.status == "confirmed_offers"
+    assert call_log == ["ignav:false", "ignav:false"]
+
+
 def test_fallback_circuit_skips_transient_provider_error_for_90_seconds() -> None:
     clock = [0.0]
     call_log: list[str] = []
@@ -2545,6 +2721,56 @@ def test_scrappa_verifies_every_candidate_without_a_six_offer_cap(tmp_path: Path
     assert sum(url == SCRAPPA_ONE_WAY_URL for url, _ in client.calls) == 4
     assert sum(url == SCRAPPA_BOOKING_DETAILS_URL for url, _ in client.calls) == 8
     assert all(offer.total_amount_usd == 510 for offer in result.offers)
+
+
+def test_scrappa_bounds_booking_concurrency_while_verifying_all_candidates(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingScrappaClient(
+        candidate_counts_by_cabin={
+            "economy": 7,
+            "premium_economy": 7,
+            "business": 7,
+            "first": 6,
+        }
+    )
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "scrappa-concurrency.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+    )
+    results: list[FlightOfferSearchResult] = []
+    errors: list[BaseException] = []
+
+    def run_search() -> None:
+        try:
+            results.append(
+                provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports the cause
+            errors.append(exc)
+
+    worker = Thread(target=run_search)
+    worker.start()
+    try:
+        assert client.three_booking_requests_started.wait(timeout=2)
+        assert client.peak_booking_requests == 3
+    finally:
+        client.release_booking_requests.set()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    result = results[0]
+    assert result.status == "confirmed_offers"
+    assert result.eligible_candidate_count == 27
+    assert result.verification_attempted_count == 27
+    assert result.verified_candidate_count == 27
+    assert result.quota_skipped_candidate_count == 0
+    assert client.peak_booking_requests == 3
+    assert sum(url == SCRAPPA_BOOKING_DETAILS_URL for url, _ in client.calls) == 27
 
 
 @pytest.mark.parametrize(
@@ -2886,6 +3112,56 @@ def test_scrappa_honors_retry_after_within_the_synchronous_wait_limit(
     provider = ScrappaFlightOfferProvider(
         "scrappa-test-key",
         usage_path=tmp_path / "scrappa-short-retry-after.sqlite3",
+        client=client,
+        now_provider=lambda: NOW,
+        retry_sleep_provider=sleep_delays.append,
+        retry_jitter_provider=lambda: 0.0,
+    )
+
+    result = provider.search("YYZ", "LHR", DEPARTURE_DATE, fetched_at=NOW)
+
+    assert result.status == "confirmed_offers"
+    assert result.pricing_calls_used == 2
+    assert sleep_delays == [pytest.approx(2.0)]
+
+
+def test_retry_after_header_accepts_http_date_and_safely_ignores_invalid_values() -> None:
+    assert _response_retry_after_seconds(
+        _Response(
+            {},
+            503,
+            headers={"Retry-After": format_datetime(NOW + timedelta(seconds=2), usegmt=True)},
+        ),
+        observed_at=NOW,
+    ) == pytest.approx(2.0)
+    assert _response_retry_after_seconds(
+        _Response(
+            {},
+            503,
+            headers={"Retry-After": format_datetime(NOW + timedelta(days=7), usegmt=True)},
+        ),
+        observed_at=NOW,
+    ) == pytest.approx(86_400.0)
+    assert _response_retry_after_seconds(
+        _Response({}, 503, headers={"Retry-After": "not-an-http-date"}),
+        observed_at=NOW,
+    ) is None
+
+
+def test_scrappa_honors_http_date_retry_after_without_real_sleep(tmp_path: Path) -> None:
+    sleep_delays: list[float] = []
+    client = _ScrappaClient(
+        candidates_per_cabin=1,
+        candidate_cabins={"economy"},
+        first_booking_status=503,
+        first_booking_retry_after_header=format_datetime(
+            NOW + timedelta(seconds=2),
+            usegmt=True,
+        ),
+    )
+    provider = ScrappaFlightOfferProvider(
+        "scrappa-test-key",
+        usage_path=tmp_path / "scrappa-http-date-retry-after.sqlite3",
         client=client,
         now_provider=lambda: NOW,
         retry_sleep_provider=sleep_delays.append,

@@ -516,12 +516,19 @@ class RuntimeProviderStatusItem(BaseModel):
                 raise ValueError("missing credential state cannot be configured")
         elif not self.configured:
             raise ValueError("configured credential state requires provider configuration")
-        if self.credential_state in {"invalid", "forbidden", "inactive"} and (
-            self.status != "authentication_failed" or self.can_supply_strict_offers
-        ):
-            raise ValueError(
-                "definitive credential failure must disable current strict offers"
+        if self.credential_state in {"invalid", "forbidden", "inactive"}:
+            inactive_at_confirmed_quota_wall = (
+                self.credential_state == "inactive"
+                and self.status == "quota_exhausted"
+                and self.quota_status == "exhausted"
             )
+            if (
+                self.status != "authentication_failed"
+                and not inactive_at_confirmed_quota_wall
+            ) or self.can_supply_strict_offers:
+                raise ValueError(
+                    "definitive credential failure must disable current strict offers"
+                )
         if self.credential_state in {"missing", "plausible"}:
             if any(
                 value is not None
