@@ -22,6 +22,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Any
@@ -110,6 +111,21 @@ _IGNAV_RETRYABLE_ERROR_CODES: dict[int, frozenset[str]] = {
     424: frozenset({"unable_to_complete_request"}),
     503: frozenset({"billing_period_unavailable"}),
 }
+_IGNAV_AUTHENTICATION_ERROR_CODES = frozenset(
+    {
+        "access_denied",
+        "api_key_invalid",
+        "api_key_missing",
+        "authentication_failed",
+        "credential_invalid",
+        "forbidden",
+        "invalid_api_key",
+        "invalid_credentials",
+        "missing_api_key",
+        "permission_denied",
+        "unauthorized",
+    }
+)
 _IGNAV_RETRY_BASE_DELAY_SECONDS = 1.0
 _IGNAV_RETRY_MAX_DELAY_SECONDS = 5.0
 _MAX_PROVIDER_RETRY_AFTER_SECONDS = 86_400.0
@@ -901,7 +917,7 @@ class _AdapterBase:
         status = _status_code(response)
         search_id = _response_search_id(response)
         retry_after_seconds = (
-            _response_retry_after_seconds(response)
+            _response_retry_after_seconds(response, observed_at=received_at)
             if status < 200 or status >= 300
             else None
         )
@@ -3200,6 +3216,10 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
     provider_code = IGNAV_QUARANTINE_PROVIDER_CODE
     provider_name = IGNAV_QUARANTINE_PROVIDER_NAME
     ledger_provider_code = IGNAV_QUARANTINE_PROVIDER_CODE
+    # Authentication failures stay fail-closed, but a later user query may
+    # perform one half-open probe after this interval.  The fallback circuit
+    # prevents concurrent queries from duplicating that probe.
+    authentication_recheck_seconds = 300.0
 
     def __init__(
         self,
@@ -3811,13 +3831,42 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
         status = _status_code(response)
         search_id = _response_search_id(response)
         retry_after_seconds = (
-            _response_retry_after_seconds(response)
+            _response_retry_after_seconds(response, observed_at=received_at)
             if status < 200 or status >= 300
             else None
         )
-        if status in {401, 403}:
+        try:
+            raw_payload = _safe_response_json(response)
+        except Exception as exc:
+            raw_payload = None
+            payload_error: Exception | None = exc
+        else:
+            payload_error = None
+        error_code = _ignav_error_code(raw_payload)
+        has_error_envelope = _ignav_has_error_envelope(raw_payload)
+
+        if status == 401:
             status_error: _AdapterError | None = _AuthenticationError(
                 "Ignav authentication failed",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
+            )
+        elif status == 403 and error_code in _IGNAV_AUTHENTICATION_ERROR_CODES:
+            status_error = _AuthenticationError(
+                "Ignav authentication failed",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
+            )
+        elif status == 403:
+            # A generic CDN/WAF 403 or an undocumented provider envelope is
+            # not proof that the configured credential is invalid.  Keep it
+            # terminal for this query so fallback never replays it.
+            status_error = _TerminalProviderError(
+                "Ignav returned an unclassified forbidden response",
                 http_status=status,
                 search_id=search_id,
                 request_attempts=1,
@@ -3851,9 +3900,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             )
             raise status_error
 
-        try:
-            raw_payload = _safe_response_json(response)
-        except Exception as exc:
+        if payload_error is not None:
             if status < 200 or status >= 300:
                 diagnostics.record(
                     stage=stage,
@@ -3868,7 +3915,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                     search_id=search_id,
                     request_attempts=1,
                     retry_after_seconds=retry_after_seconds,
-                ) from exc
+                ) from payload_error
             diagnostics.record(
                 stage=stage,
                 http_status=status,
@@ -3881,10 +3928,9 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 http_status=status,
                 search_id=search_id,
                 request_attempts=1,
-            ) from exc
+            ) from payload_error
 
         if status < 200 or status >= 300:
-            error_code = _ignav_error_code(raw_payload)
             if error_code in _IGNAV_RETRYABLE_ERROR_CODES.get(status, ()):
                 error: _AdapterError = _IgnavProviderError(
                     "Ignav request failed",
@@ -3914,6 +3960,21 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 observed_at=received_at,
             )
             raise error
+
+        if has_error_envelope:
+            diagnostics.record(
+                stage=stage,
+                http_status=status,
+                exception_type="TerminalProviderError",
+                search_id=search_id,
+                observed_at=received_at,
+            )
+            raise _TerminalProviderError(
+                "Ignav returned an error envelope with a successful HTTP status",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+            )
 
         if not isinstance(raw_payload, dict):
             diagnostics.record(
@@ -4148,10 +4209,10 @@ class FallbackFlightOfferProvider:
                 raw_recheck = None
             recheck = _finite_amount(raw_recheck)
             if recheck is not None and 30.0 <= recheck <= 3_600.0:
-                # SerpApi's adapter always runs its free Account API before it
-                # can reserve or submit a paid/search request.  Providers that
-                # cannot make that guarantee expose no interval and remain
-                # open until their process/configuration changes.
+                # Opt-in adapters may use one bounded, new-query half-open
+                # probe after this interval.  Their own quota wall still runs
+                # before network I/O; providers without a safe recovery probe
+                # expose no interval and stay open until configuration changes.
                 cooldown = recheck
         with self._circuit_lock:
             if cooldown is ...:
@@ -4501,15 +4562,23 @@ def _payload_retry_after_seconds(payload: Any) -> float | None:
     return _safe_retry_after_seconds(payload.get("retry_after"))
 
 
-def _response_retry_after_seconds(response: Any) -> float | None:
-    """Read only a bounded numeric retry delay; never retain the error body."""
+def _response_retry_after_seconds(
+    response: Any,
+    *,
+    observed_at: datetime,
+) -> float | None:
+    """Read a bounded Retry-After delay without retaining the error body."""
 
     headers = getattr(response, "headers", None)
     if headers is not None and hasattr(headers, "get"):
         try:
-            header_delay = _safe_retry_after_seconds(
-                headers.get("Retry-After") or headers.get("retry-after")
-            )
+            raw_header = headers.get("Retry-After") or headers.get("retry-after")
+            header_delay = _safe_retry_after_seconds(raw_header)
+            if header_delay is None and isinstance(raw_header, str):
+                retry_at = parsedate_to_datetime(raw_header)
+                if retry_at.tzinfo is not None:
+                    seconds = (retry_at.astimezone(UTC) - _utc(observed_at)).total_seconds()
+                    header_delay = _safe_retry_after_seconds(max(0.0, seconds))
         except Exception:
             header_delay = None
         if header_delay is not None:
@@ -4542,6 +4611,13 @@ def _ignav_error_code(payload: Any) -> str | None:
         return None
     code = raw_code.strip().casefold()
     return code if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) else None
+
+
+def _ignav_has_error_envelope(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    detail = payload.get("error")
+    return isinstance(detail, dict) and bool(detail)
 
 
 def _ignav_exception_type(error_code: str | None) -> str:

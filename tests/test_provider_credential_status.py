@@ -76,6 +76,22 @@ def _provider(**overrides: Any) -> RuntimeProviderStatusItem:
             "transient": False,
         },
         {
+            "credential_state": "inactive",
+            "status": "quota_exhausted",
+            "quota_status": "exhausted",
+            "quota_used": 250,
+            "quota_limit": 250,
+            "quota_remaining": 0,
+            "quota_data_basis": "provider_and_local_ledger",
+            "quota_observed_at": CHECKED_AT,
+            "quota_unit": "billing_period_requests",
+            "can_supply_strict_offers": False,
+            "checked_at": CHECKED_AT,
+            "http_status": 200,
+            "exception_type": "AccountInactive",
+            "transient": False,
+        },
+        {
             "credential_state": "unknown",
             "checked_at": CHECKED_AT,
             "http_status": 503,
@@ -206,8 +222,11 @@ def test_provider_page_renders_only_sanitized_bilingual_credential_status() -> N
         "Transient preflight failure; this alone does not fail service readiness",
         'normalized(provider&&provider.status)==="quota_exhausted"',
         'normalized(provider&&provider.quota_status)==="exhausted"',
+        'code==="serpapi_google_flights"&&status==="authentication_failed"',
+        'statusKey==="quota_exhausted"&&normalized(provider.credential_state)==="inactive"',
     ):
         assert fragment in page
+    assert "comparisonSnapshot=cached;render(cached)" not in page
     for forbidden in (
         "provider.api_key",
         "provider.token",

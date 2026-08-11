@@ -53,3 +53,17 @@ def test_provider_status_snapshot_writer_and_reader_use_the_same_version() -> No
     assert f'snapshotKey="{snapshot_key}"' in PROVIDERS_PAGE
     assert 'legacySnapshotKey="flight-forecast-provider-status-v1"' in PROVIDERS_PAGE
     assert "sessionStorage.removeItem(legacySnapshotKey)" in PROVIDERS_PAGE
+
+
+def test_provider_page_waits_for_live_status_before_rendering_comparison_snapshot() -> None:
+    assert "comparisonSnapshot=cached;render(cached)" not in PROVIDERS_PAGE
+    assert 'if(cached){comparisonSnapshot=cached;setState("loading"' in PROVIDERS_PAGE
+
+
+def test_provider_page_never_lets_cached_serpapi_auth_override_live_state() -> None:
+    assert (
+        'code==="serpapi_google_flights"&&status==="authentication_failed"'
+        in PROVIDERS_PAGE
+    )
+    assert 'normalized(provider&&provider.status)==="quota_exhausted"' in PROVIDERS_PAGE
+    assert 'normalized(provider&&provider.quota_status)==="exhausted"' in PROVIDERS_PAGE

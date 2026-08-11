@@ -583,11 +583,20 @@ def _runtime_provider_status(
             if snapshot.available
             else "unavailable"
         )
+        exhausted = False
         if configured and not quarantined and snapshot.available:
             exhausted = snapshot.remaining == 0
             quota_status = "exhausted" if exhausted else "available"
             status = "quota_exhausted" if exhausted else "quota_available"
-        if credential_blocked:
+        # SerpApi can report AccountInactive when a free plan reaches its
+        # official zero balance.  A measured exhausted quota is the more
+        # specific state in that case; do not let the older/general inactive
+        # credential label replace it.  Invalid and forbidden credentials still
+        # take priority because an old quota ledger cannot authenticate a key.
+        inactive_due_to_exhausted_quota = (
+            exhausted and credential_state == "inactive"
+        )
+        if credential_blocked and not inactive_due_to_exhausted_quota:
             status = "authentication_failed"
         if notice is None and quarantined:
             notice = {
@@ -1043,7 +1052,13 @@ def _runtime_provider_status(
                 }
                 else "billing_period_requests"
             )
-        if provider.credential_state in {"invalid", "forbidden", "inactive"}:
+        inactive_due_to_exhausted_quota = (
+            exhausted and provider.credential_state == "inactive"
+        )
+        if (
+            provider.credential_state in {"invalid", "forbidden", "inactive"}
+            and not inactive_due_to_exhausted_quota
+        ):
             update["status"] = "authentication_failed"
             update["can_supply_strict_offers"] = False
         providers[provider_index] = RuntimeProviderStatusItem.model_validate(

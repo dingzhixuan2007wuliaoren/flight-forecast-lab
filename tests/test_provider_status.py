@@ -435,6 +435,121 @@ def test_verified_exhausted_serpapi_quota_overrides_stale_authentication_snapsho
     assert serpapi.can_supply_strict_offers is True
 
 
+def test_confirmed_exhausted_serpapi_quota_overrides_stale_inactive_preflight(
+    monkeypatch, tmp_path
+) -> None:
+    now = datetime.now(UTC)
+    runtime_dir = tmp_path / "artifacts" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "artifacts" / "demo"))
+    monkeypatch.setenv("SERPAPI_API_KEY", "configured-but-never-returned")
+    monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "serpapi")
+    monkeypatch.setattr(
+        "flight_forecaster.api._serpapi_credential_status_fields",
+        lambda: {
+            "credential_state": "inactive",
+            "checked_at": now,
+            "http_status": 200,
+            "exception_type": "AccountInactive",
+            "transient": False,
+        },
+    )
+    with sqlite3.connect(runtime_dir / "serpapi-usage.sqlite3") as connection:
+        connection.execute(
+            """
+            CREATE TABLE serpapi_quota_usage (
+                scope TEXT NOT NULL, period_key TEXT NOT NULL, calls INTEGER NOT NULL,
+                PRIMARY KEY(scope, period_key)
+            ) WITHOUT ROWID
+            """
+        )
+        connection.execute(
+            "INSERT INTO serpapi_quota_usage VALUES ('billing_cycle', ?, 250)",
+            (f"renewal:{(now + timedelta(days=30)).date().isoformat()}",),
+        )
+    stale_metadata = SimpleNamespace(
+        provider_code="serpapi_google_flights",
+        status="authentication_failed",
+        coverage_status="provider_incomplete",
+        monthly_calls_used=250,
+        monthly_call_limit=250,
+        quota_unit="billing_period_requests",
+        quota_limit="monthly",
+    )
+
+    providers = {
+        item.code: item for item in _runtime_provider_status(stale_metadata).providers
+    }
+    serpapi = providers["serpapi_google_flights"]
+
+    assert serpapi.credential_state == "inactive"
+    assert (serpapi.status, serpapi.quota_status) == (
+        "quota_exhausted",
+        "exhausted",
+    )
+    assert (serpapi.quota_used, serpapi.quota_limit, serpapi.quota_remaining) == (
+        250,
+        250,
+        0,
+    )
+    assert serpapi.can_supply_strict_offers is False
+
+
+def test_inactive_serpapi_without_quota_evidence_remains_authentication_failed(
+    monkeypatch,
+) -> None:
+    now = datetime.now(UTC)
+    monkeypatch.setenv("SERPAPI_API_KEY", "configured-but-never-returned")
+    monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "serpapi")
+    monkeypatch.setattr(
+        "flight_forecaster.api._serpapi_credential_status_fields",
+        lambda: {
+            "credential_state": "inactive",
+            "checked_at": now,
+            "http_status": 200,
+            "exception_type": "AccountInactive",
+            "transient": False,
+        },
+    )
+
+    providers = {item.code: item for item in _runtime_provider_status().providers}
+    serpapi = providers["serpapi_google_flights"]
+
+    assert serpapi.status == "authentication_failed"
+    assert serpapi.quota_status == "unknown"
+    assert serpapi.can_supply_strict_offers is False
+
+
+@pytest.mark.parametrize(
+    "credential_fields",
+    (
+        {"credential_state": "plausible", "transient": False},
+        {
+            "credential_state": "unknown",
+            "checked_at": datetime(2026, 8, 11, 12, tzinfo=UTC),
+            "http_status": 503,
+            "exception_type": "TransientProviderHttpError",
+            "transient": True,
+        },
+    ),
+)
+def test_pending_or_unknown_serpapi_preflight_is_not_authentication_failure(
+    monkeypatch, credential_fields
+) -> None:
+    monkeypatch.setenv("SERPAPI_API_KEY", "configured-but-never-returned")
+    monkeypatch.setenv("FLIGHT_OFFER_PROVIDER", "serpapi")
+    monkeypatch.setattr(
+        "flight_forecaster.api._serpapi_credential_status_fields",
+        lambda: credential_fields,
+    )
+
+    providers = {item.code: item for item in _runtime_provider_status().providers}
+    serpapi = providers["serpapi_google_flights"]
+
+    assert serpapi.status != "authentication_failed"
+    assert serpapi.can_supply_strict_offers is True
+
+
 def test_searchapi_runtime_usage_keeps_lifetime_quota_unit(monkeypatch) -> None:
     monkeypatch.setenv("SEARCHAPI_API_KEY", "configured-but-never-returned")
     metadata = SimpleNamespace(
