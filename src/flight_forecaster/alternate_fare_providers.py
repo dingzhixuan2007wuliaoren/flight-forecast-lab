@@ -92,12 +92,27 @@ IGNAV_MAX_ITINERARIES_PER_CABIN = 1_000
 # Concurrency guard only; all eligible candidates covered by the real account
 # quota are queued through this bounded worker pool.
 MAX_ALTERNATE_BOOKING_WORKERS = 6
+_SCRAPPA_MAX_BOOKING_WORKERS = 3
 _SCRAPPA_RETRYABLE_BOOKING_STATUSES = frozenset({429, 500, 502, 503})
-_SCRAPPA_BOOKING_RETRY_BASE_DELAY_SECONDS = 0.1
-_SCRAPPA_BOOKING_RETRY_MAX_DELAY_SECONDS = 0.5
-_IGNAV_RETRYABLE_STATUSES = frozenset({424, 503})
-_IGNAV_RETRY_BASE_DELAY_SECONDS = 0.1
-_IGNAV_RETRY_MAX_DELAY_SECONDS = 0.5
+_SCRAPPA_BOOKING_RETRY_BASE_DELAY_SECONDS = 0.75
+_SCRAPPA_BOOKING_RETRY_MAX_DELAY_SECONDS = 3.0
+_SCRAPPA_TRANSIENT_BOOKING_STAGE_REASON_PAIRS = frozenset(
+    {
+        ("booking_request_exhausted", "cookie_session_unavailable"),
+        ("mobile_proxy_unavailable", "proxy_unavailable"),
+        ("upstream_request", "network_timeout"),
+    }
+)
+_SCRAPPA_TRANSIENT_BOOKING_REASONS = frozenset(
+    {"cookie_session_unavailable", "network_timeout", "proxy_unavailable"}
+)
+_IGNAV_RETRYABLE_ERROR_CODES: dict[int, frozenset[str]] = {
+    424: frozenset({"unable_to_complete_request"}),
+    503: frozenset({"billing_period_unavailable"}),
+}
+_IGNAV_RETRY_BASE_DELAY_SECONDS = 1.0
+_IGNAV_RETRY_MAX_DELAY_SECONDS = 5.0
+_MAX_PROVIDER_RETRY_AFTER_SECONDS = 86_400.0
 
 _CABINS: tuple[Cabin, ...] = (
     "economy",
@@ -150,6 +165,7 @@ class _AdapterError(RuntimeError):
         search_id: str | None = None,
         request_attempts: int = 0,
         retry_quota_limited: bool = False,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
         self.http_status = (
@@ -168,6 +184,12 @@ class _AdapterError(RuntimeError):
             else 0
         )
         self.retry_quota_limited = bool(retry_quota_limited)
+        parsed_retry_after = _finite_amount(retry_after_seconds)
+        self.retry_after_seconds = (
+            parsed_retry_after
+            if parsed_retry_after is not None and parsed_retry_after >= 0
+            else None
+        )
 
 
 class _AuthenticationError(_AdapterError):
@@ -188,6 +210,12 @@ class _BudgetError(_AdapterError):
 class _ProviderError(_AdapterError):
     status: SearchStatus = "provider_error"
     exception_type = "ProviderError"
+
+
+class _TerminalProviderError(_ProviderError):
+    """A provider response that must not trigger a whole-provider replay."""
+
+    exception_type = "TerminalProviderError"
 
 
 class _PayloadError(_AdapterError):
@@ -793,6 +821,12 @@ class _ScrappaBookingDecision:
             raise ValueError("Scrappa rejection code is not safe")
 
 
+class _ScrappaTransientBookingError(_ProviderError):
+    """A credential-safe Scrappa error envelope that may succeed once retried."""
+
+    exception_type = "TransientProviderError"
+
+
 class _AdapterBase:
     provider_code: str
     provider_name: str
@@ -866,12 +900,18 @@ class _AdapterBase:
         received_at = self._provider_now()
         status = _status_code(response)
         search_id = _response_search_id(response)
+        retry_after_seconds = (
+            _response_retry_after_seconds(response)
+            if status < 200 or status >= 300
+            else None
+        )
         if status in {401, 403}:
             error: _AdapterError = _AuthenticationError(
                 "provider authentication failed",
                 http_status=status,
                 search_id=search_id,
                 request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
             )
         elif status == 429:
             error = _RateLimitError(
@@ -879,6 +919,7 @@ class _AdapterBase:
                 http_status=status,
                 search_id=search_id,
                 request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
             )
         elif status == 402:
             error = _BudgetError(
@@ -886,6 +927,7 @@ class _AdapterBase:
                 http_status=status,
                 search_id=search_id,
                 request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
             )
         elif status < 200 or status >= 300:
             error = _ProviderError(
@@ -893,6 +935,7 @@ class _AdapterBase:
                 http_status=status,
                 search_id=search_id,
                 request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
             )
         else:
             error = None  # type: ignore[assignment]
@@ -2195,7 +2238,10 @@ class ScrappaFlightOfferProvider(_AdapterBase):
         retry_quota_limited = False
         booking_statuses: list[SearchStatus] = []
         with ThreadPoolExecutor(
-            max_workers=min(MAX_ALTERNATE_BOOKING_WORKERS, len(candidates)),
+            # Scrappa's booking-details endpoint uses a mobile-proxy upstream.
+            # A smaller provider-specific pool avoids creating a retry storm
+            # while still evaluating every quota-covered candidate.
+            max_workers=min(_SCRAPPA_MAX_BOOKING_WORKERS, len(candidates)),
             thread_name_prefix="scrappa-booking",
         ) as pool:
             futures = {
@@ -2397,6 +2443,17 @@ class ScrappaFlightOfferProvider(_AdapterBase):
             exc.request_attempts = max(1, exc.request_attempts)
             if not self._booking_error_is_retryable(exc):
                 raise
+            if _retry_after_exceeds_sync_limit(
+                exc,
+                _SCRAPPA_BOOKING_RETRY_MAX_DELAY_SECONDS,
+            ):
+                diagnostics.record(
+                    stage="booking_options",
+                    http_status=exc.http_status,
+                    exception_type="RetryAfterDeferred",
+                    search_id=exc.search_id,
+                )
+                raise
             reserved_retry = self._ledger.reserve(
                 self.ledger_provider_code,
                 1,
@@ -2418,7 +2475,7 @@ class ScrappaFlightOfferProvider(_AdapterBase):
                 exception_type="ControlledCandidateRetry",
                 search_id=exc.search_id,
             )
-            self._retry_sleep_provider(self._booking_retry_delay(0))
+            self._retry_sleep_provider(self._booking_retry_delay(0, exc))
             try:
                 payload, received_at, http_status = self._booking_details_once(
                     candidate,
@@ -2466,33 +2523,41 @@ class ScrappaFlightOfferProvider(_AdapterBase):
             },
         )
         if _scrappa_error_envelope(payload):
+            transient = _scrappa_transient_booking_error_envelope(payload)
+            error_type = (
+                _ScrappaTransientBookingError if transient else _ProviderError
+            )
             diagnostics.record(
                 stage="booking_options",
                 http_status=http_status,
-                exception_type="ProviderError",
+                exception_type=error_type.exception_type,
                 search_id=_scrappa_payload_id(payload),
                 observed_at=received_at,
             )
-            raise _ProviderError(
+            raise error_type(
                 "Scrappa returned a booking error envelope",
                 http_status=http_status,
                 search_id=_scrappa_payload_id(payload),
                 request_attempts=1,
+                retry_after_seconds=_payload_retry_after_seconds(payload),
             )
         return payload, received_at, http_status
 
     @staticmethod
     def _booking_error_is_retryable(exc: _AdapterError) -> bool:
-        return isinstance(exc, _TransportError) or (
+        return isinstance(exc, (_TransportError, _ScrappaTransientBookingError)) or (
             exc.http_status in _SCRAPPA_RETRYABLE_BOOKING_STATUSES
         )
 
-    def _booking_retry_delay(self, retry_index: int) -> float:
+    def _booking_retry_delay(self, retry_index: int, exc: _AdapterError) -> float:
         jitter = _finite_amount(self._retry_jitter_provider())
         bounded_jitter = max(0.0, min(jitter or 0.0, 1.0))
         exponential = self._retry_base_delay_seconds * (2 ** max(0, retry_index))
         return min(
-            exponential + (self._retry_base_delay_seconds * bounded_jitter),
+            max(
+                exponential + (self._retry_base_delay_seconds * bounded_jitter),
+                exc.retry_after_seconds or 0.0,
+            ),
             _SCRAPPA_BOOKING_RETRY_MAX_DELAY_SECONDS,
         )
 
@@ -2502,6 +2567,18 @@ def _scrappa_error_envelope(payload: dict[str, Any]) -> bool:
         return True
     error = payload.get("error")
     return isinstance(error, (str, dict, list)) and bool(error)
+
+
+def _scrappa_transient_booking_error_envelope(payload: dict[str, Any]) -> bool:
+    """Recognize only Scrappa's explicitly identified transient upstream envelope."""
+
+    service = str(payload.get("service") or "").strip().lower()
+    failed_stage = str(payload.get("failed_stage") or "").strip().lower()
+    reason = str(payload.get("reason") or "").strip().lower()
+    return service == "google_flights_booking_details" and (
+        reason in _SCRAPPA_TRANSIENT_BOOKING_REASONS
+        or (failed_stage, reason) in _SCRAPPA_TRANSIENT_BOOKING_STAGE_REASON_PAIRS
+    )
 
 
 def _scrappa_payload_id(payload: Any) -> str | None:
@@ -3087,6 +3164,29 @@ def _scrappa_option_provider(option: dict[str, Any]) -> str | None:
     return _short_text(raw_provider, max_length=160)
 
 
+class _IgnavProviderError(_ProviderError):
+    """Sanitized Ignav error metadata used only for retry decisions."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_error_code: str | None,
+        retry_after_seconds: float | None,
+        http_status: int | None = None,
+        search_id: str | None = None,
+        request_attempts: int = 0,
+    ) -> None:
+        super().__init__(
+            message,
+            http_status=http_status,
+            search_id=search_id,
+            request_attempts=request_attempts,
+            retry_after_seconds=retry_after_seconds,
+        )
+        self.provider_error_code = provider_error_code
+
+
 class IgnavQuarantineFlightOfferProvider(_AdapterBase):
     """Opt-in Ignav adapter protected by a non-renewing free-call wall.
 
@@ -3482,6 +3582,17 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             exc.request_attempts = max(1, exc.request_attempts)
             if not self._ignav_error_is_retryable(exc):
                 raise
+            if _retry_after_exceeds_sync_limit(
+                exc,
+                _IGNAV_RETRY_MAX_DELAY_SECONDS,
+            ):
+                diagnostics.record(
+                    stage="cabin_search",
+                    http_status=exc.http_status,
+                    exception_type="RetryAfterDeferred",
+                    search_id=exc.search_id,
+                )
+                raise
             reserved_retry = self._ledger.reserve(
                 self.ledger_provider_code,
                 1,
@@ -3506,7 +3617,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 exception_type="ControlledCabinRetry",
                 search_id=exc.search_id,
             )
-            self._retry_sleep_provider(self._retry_delay(0))
+            self._retry_sleep_provider(self._retry_delay(0, exc))
             try:
                 payload = self._search_cabin_once(
                     origin,
@@ -3534,7 +3645,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
         cabin: Cabin,
         diagnostics: _Diagnostics,
     ) -> dict[str, Any]:
-        payload, received_at, http_status = self._request_json(
+        payload, received_at, http_status = self._request_ignav_json(
             "POST",
             IGNAV_ONE_WAY_URL,
             stage="cabin_search",
@@ -3585,6 +3696,17 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             exc.request_attempts = max(1, exc.request_attempts)
             if not self._ignav_error_is_retryable(exc):
                 raise
+            if _retry_after_exceeds_sync_limit(
+                exc,
+                _IGNAV_RETRY_MAX_DELAY_SECONDS,
+            ):
+                diagnostics.record(
+                    stage="booking_options",
+                    http_status=exc.http_status,
+                    exception_type="RetryAfterDeferred",
+                    search_id=exc.search_id,
+                )
+                raise
             reserved_retry = self._ledger.reserve(
                 self.ledger_provider_code,
                 1,
@@ -3609,7 +3731,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
                 exception_type="ControlledCandidateRetry",
                 search_id=exc.search_id,
             )
-            self._retry_sleep_provider(self._retry_delay(0))
+            self._retry_sleep_provider(self._retry_delay(0, exc))
             try:
                 payload, received_at, http_status = self._booking_links_once(
                     candidate,
@@ -3631,7 +3753,7 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
         candidate: _IgnavCandidate,
         diagnostics: _Diagnostics,
     ) -> tuple[dict[str, Any], datetime, int]:
-        return self._request_json(
+        return self._request_ignav_json(
             "POST",
             IGNAV_BOOKING_LINKS_URL,
             stage="booking_options",
@@ -3648,8 +3770,166 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
     @staticmethod
     def _ignav_error_is_retryable(exc: _AdapterError) -> bool:
         return isinstance(exc, _TransportError) or (
-            exc.http_status in _IGNAV_RETRYABLE_STATUSES
+            isinstance(exc, _IgnavProviderError)
+            and exc.provider_error_code
+            in _IGNAV_RETRYABLE_ERROR_CODES.get(exc.http_status or 0, ())
         )
+
+    def _request_ignav_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        stage: str,
+        diagnostics: _Diagnostics,
+        body: dict[str, Any],
+        headers: dict[str, str],
+    ) -> tuple[dict[str, Any], datetime, int]:
+        """Call Ignav while retaining only retry-safe, non-sensitive error metadata."""
+
+        if method != "POST":
+            raise ValueError("Ignav only supports POST for fare operations")
+        try:
+            response = self._client.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=self._timeout_seconds,
+            )
+        except Exception as exc:
+            diagnostics.record(
+                stage=stage,
+                http_status=None,
+                exception_type="TransportError",
+            )
+            raise _TransportError(
+                "Ignav transport failed",
+                request_attempts=1,
+            ) from exc
+
+        received_at = self._provider_now()
+        status = _status_code(response)
+        search_id = _response_search_id(response)
+        retry_after_seconds = (
+            _response_retry_after_seconds(response)
+            if status < 200 or status >= 300
+            else None
+        )
+        if status in {401, 403}:
+            status_error: _AdapterError | None = _AuthenticationError(
+                "Ignav authentication failed",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
+            )
+        elif status == 402:
+            status_error = _BudgetError(
+                "Ignav free allowance is exhausted",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
+            )
+        elif status == 429:
+            status_error = _RateLimitError(
+                "Ignav monthly spending limit is reached",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+                retry_after_seconds=retry_after_seconds,
+            )
+        else:
+            status_error = None
+        if status_error is not None:
+            diagnostics.record(
+                stage=stage,
+                http_status=status,
+                exception_type=status_error.exception_type,
+                search_id=search_id,
+                observed_at=received_at,
+            )
+            raise status_error
+
+        try:
+            raw_payload = _safe_response_json(response)
+        except Exception as exc:
+            if status < 200 or status >= 300:
+                diagnostics.record(
+                    stage=stage,
+                    http_status=status,
+                    exception_type="TerminalProviderError",
+                    search_id=search_id,
+                    observed_at=received_at,
+                )
+                raise _TerminalProviderError(
+                    "Ignav error response is not safe JSON",
+                    http_status=status,
+                    search_id=search_id,
+                    request_attempts=1,
+                    retry_after_seconds=retry_after_seconds,
+                ) from exc
+            diagnostics.record(
+                stage=stage,
+                http_status=status,
+                exception_type="PayloadError",
+                search_id=search_id,
+                observed_at=received_at,
+            )
+            raise _PayloadError(
+                "Ignav response is not safe JSON",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+            ) from exc
+
+        if status < 200 or status >= 300:
+            error_code = _ignav_error_code(raw_payload)
+            if error_code in _IGNAV_RETRYABLE_ERROR_CODES.get(status, ()):
+                error: _AdapterError = _IgnavProviderError(
+                    "Ignav request failed",
+                    provider_error_code=error_code,
+                    retry_after_seconds=retry_after_seconds,
+                    http_status=status,
+                    search_id=search_id,
+                    request_attempts=1,
+                )
+            else:
+                error = _TerminalProviderError(
+                    "Ignav returned a terminal provider error",
+                    http_status=status,
+                    search_id=search_id,
+                    request_attempts=1,
+                    retry_after_seconds=retry_after_seconds,
+                )
+            diagnostics.record(
+                stage=stage,
+                http_status=status,
+                exception_type=(
+                    _ignav_exception_type(error_code)
+                    if isinstance(error, _IgnavProviderError)
+                    else error.exception_type
+                ),
+                search_id=search_id,
+                observed_at=received_at,
+            )
+            raise error
+
+        if not isinstance(raw_payload, dict):
+            diagnostics.record(
+                stage=stage,
+                http_status=status,
+                exception_type="PayloadError",
+                search_id=search_id,
+                observed_at=received_at,
+            )
+            raise _PayloadError(
+                "Ignav payload must be an object",
+                http_status=status,
+                search_id=search_id,
+                request_attempts=1,
+            )
+        return raw_payload, received_at, status
 
     @staticmethod
     def _search_unavailable_error(
@@ -3681,12 +3961,21 @@ class IgnavQuarantineFlightOfferProvider(_AdapterBase):
             retry_quota_limited=retry_quota_limited,
         )
 
-    def _retry_delay(self, retry_index: int) -> float:
+    def _retry_delay(self, retry_index: int, exc: _AdapterError) -> float:
         jitter = _finite_amount(self._retry_jitter_provider())
         bounded_jitter = max(0.0, min(jitter or 0.0, 1.0))
         exponential = self._retry_base_delay_seconds * (2 ** max(0, retry_index))
+        provider_delay = (
+            exc.retry_after_seconds
+            if isinstance(exc, _IgnavProviderError)
+            and exc.retry_after_seconds is not None
+            else 0.0
+        )
         return min(
-            exponential + (self._retry_base_delay_seconds * bounded_jitter),
+            max(
+                exponential + (self._retry_base_delay_seconds * bounded_jitter),
+                provider_delay,
+            ),
             _IGNAV_RETRY_MAX_DELAY_SECONDS,
         )
 
@@ -3919,6 +4208,11 @@ def _whole_provider_retry_is_safe(result: FlightOfferSearchResult) -> bool:
             result.provider_failed_candidate_count,
             result.quota_skipped_candidate_count,
             result.pricing_calls_used,
+            any(
+                diagnostic.exception_type
+                in {"RetryAfterDeferred", "TerminalProviderError"}
+                for diagnostic in result.diagnostics
+            ),
         )
     )
 
@@ -4194,6 +4488,69 @@ def _ignav_payload_id(payload: Any) -> str | None:
     return None
 
 
+def _safe_retry_after_seconds(value: Any) -> float | None:
+    parsed = _finite_amount(value)
+    if parsed is None or parsed < 0:
+        return None
+    return min(parsed, _MAX_PROVIDER_RETRY_AFTER_SECONDS)
+
+
+def _payload_retry_after_seconds(payload: Any) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    return _safe_retry_after_seconds(payload.get("retry_after"))
+
+
+def _response_retry_after_seconds(response: Any) -> float | None:
+    """Read only a bounded numeric retry delay; never retain the error body."""
+
+    headers = getattr(response, "headers", None)
+    if headers is not None and hasattr(headers, "get"):
+        try:
+            header_delay = _safe_retry_after_seconds(
+                headers.get("Retry-After") or headers.get("retry-after")
+            )
+        except Exception:
+            header_delay = None
+        if header_delay is not None:
+            return header_delay
+    try:
+        payload = _safe_response_json(response)
+    except Exception:
+        return None
+    return _payload_retry_after_seconds(payload)
+
+
+def _retry_after_exceeds_sync_limit(
+    exc: _AdapterError,
+    sync_limit_seconds: float,
+) -> bool:
+    return bool(
+        exc.retry_after_seconds is not None
+        and exc.retry_after_seconds > sync_limit_seconds
+    )
+
+
+def _ignav_error_code(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    detail = payload.get("error")
+    if not isinstance(detail, dict):
+        return None
+    raw_code = detail.get("code")
+    if not isinstance(raw_code, str):
+        return None
+    code = raw_code.strip().casefold()
+    return code if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) else None
+
+
+def _ignav_exception_type(error_code: str | None) -> str:
+    return {
+        "unable_to_complete_request": "IgnavUpstreamUnavailable",
+        "billing_period_unavailable": "IgnavBillingPeriodUnavailable",
+    }.get(error_code, "ProviderError")
+
+
 def _ignav_search_parameters_match(
     payload: dict[str, Any],
     *,
@@ -4222,7 +4579,12 @@ def _select_ignav_candidates(
     seen_ids: dict[str, tuple[Any, ...]] = {}
     conflicting_ids: set[str] = set()
     for cabin in _CABINS:
-        rows = payloads.get(cabin, {}).get("itineraries")
+        cabin_payload = payloads.get(cabin)
+        if cabin_payload is None:
+            # Transport/provider failures are already counted by the caller;
+            # absence is not itself a malformed successful payload.
+            continue
+        rows = cabin_payload.get("itineraries")
         if not isinstance(rows, list):
             invalid_rows += 1
             continue

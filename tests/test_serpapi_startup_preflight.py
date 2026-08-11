@@ -56,15 +56,29 @@ def test_enabled_startup_preflight_is_free_sanitized_and_runs_once(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    preflight_thread_completed = Event()
+    run_preflight = api_module._run_strict_provider_credential_preflight
+
+    def run_preflight_and_signal(service: _FakePredictionService) -> None:
+        try:
+            run_preflight(service)
+        finally:
+            preflight_thread_completed.set()
+
     monkeypatch.setenv("SERPAPI_CREDENTIAL_PREFLIGHT_ENABLED", "1")
     monkeypatch.setenv("SERPAPI_API_KEY", "must-never-appear-in-logs")
     monkeypatch.setattr(api_module, "PredictionService", _FakePredictionService)
+    monkeypatch.setattr(
+        api_module,
+        "_run_strict_provider_credential_preflight",
+        run_preflight_and_signal,
+    )
 
     with caplog.at_level(logging.INFO, logger="flight_forecaster.api"):
         first = api_module.get_service()
         second = api_module.get_service()
+        assert preflight_thread_completed.wait(timeout=1)
 
-    assert _FakePredictionService.preflight_completed.wait(timeout=1)
     assert first is second
     assert first.preflight_calls == 1
     assert "state=invalid" in caplog.text

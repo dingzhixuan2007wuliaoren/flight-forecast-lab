@@ -204,6 +204,8 @@ def test_provider_page_renders_only_sanitized_bilingual_credential_status() -> N
         "Credential verified for free",
         "暂时性预检故障；不会单独使服务就绪检查失败",
         "Transient preflight failure; this alone does not fail service readiness",
+        'normalized(provider&&provider.status)==="quota_exhausted"',
+        'normalized(provider&&provider.quota_status)==="exhausted"',
     ):
         assert fragment in page
     for forbidden in (
