@@ -1356,7 +1356,22 @@ class SerpApiFlightOfferProvider:
         diagnostics = _DiagnosticCollector(self._ledger)
         with self._operation_lock:
             try:
-                self._account_quota(diagnostics)
+                account = self._account_quota(diagnostics)
+                # The Account API is free and authoritative for the current
+                # balance.  Synchronize its sanitized counters without
+                # reserving or submitting a search so the read-only provider
+                # status page can immediately distinguish exhausted quota from
+                # an authentication failure after process startup.
+                self._ledger.synchronize_and_reserve(
+                    account.billing_cycle_key,
+                    account.hour_bucket_key,
+                    calls=0,
+                    monthly_limit=account.monthly_limit,
+                    hourly_limit=account.hourly_limit,
+                    provider_monthly_usage=account.monthly_used,
+                    provider_hourly_usage=account.hourly_used,
+                    require_all=True,
+                )
             except _ProviderError:
                 # Every expected account failure updates the sanitized state at
                 # the point where its HTTP/payload evidence is available.
@@ -1843,7 +1858,21 @@ class SerpApiFlightOfferProvider:
             raise _AccountPayloadError("provider account status is missing or invalid")
         account_status = raw_account_status.strip().lower()
         monthly_usage = _optional_nonnegative_int(payload.get("this_month_usage"))
-        hourly_usage = _optional_nonnegative_int(payload.get("this_hour_searches"))
+        plan_searches_left = _optional_nonnegative_int(
+            payload.get("plan_searches_left")
+        )
+        total_searches_left = _optional_nonnegative_int(
+            payload.get("total_searches_left")
+        )
+        # SerpApi's Account API publishes the rolling hourly counter as
+        # ``last_hour_searches``.  Older captured fixtures and deployments used
+        # ``this_hour_searches``; retain that alias only as a compatibility
+        # fallback so an otherwise authoritative quota response is not rejected.
+        hourly_usage = _optional_nonnegative_int(payload.get("last_hour_searches"))
+        if hourly_usage is None:
+            hourly_usage = _optional_nonnegative_int(
+                payload.get("this_hour_searches")
+            )
         provider_monthly_limit = _optional_positive_int(payload.get("searches_per_month"))
         provider_hourly_limit = _optional_positive_int(
             payload.get("account_rate_limit_per_hour")
@@ -1852,17 +1881,34 @@ class SerpApiFlightOfferProvider:
             payload.get("plan_renewal_date"),
             received_at=received_at,
         )
-        # SerpApi reports ``account_status=Inactive`` when a free plan has used
-        # all monthly searches, even though the subscription itself remains
-        # active.  Treat that exact, quota-backed state as an exhausted budget
-        # rather than a credential failure.  Suspended/disabled accounts and
-        # inactive responses without complete exhaustion evidence still fail
-        # closed as authentication errors.
-        monthly_quota_exhausted = (
-            account_status == "inactive"
-            and monthly_usage is not None
+        # SerpApi may report ``account_status`` as either Active or Inactive at
+        # the point a free plan reaches zero.  Both official remaining-balance
+        # fields at zero are authoritative exhaustion evidence for those two
+        # states.  Suspended/disabled accounts and inactive responses without
+        # complete exhaustion evidence still fail closed as authentication
+        # errors.
+        remaining_balance_is_positive = any(
+            value is not None and value > 0
+            for value in (plan_searches_left, total_searches_left)
+        )
+        official_zero_balance = (
+            plan_searches_left == 0 and total_searches_left == 0
+        )
+        usage_reached_limit = (
+            monthly_usage is not None
             and provider_monthly_limit is not None
             and monthly_usage >= provider_monthly_limit
+        )
+        monthly_quota_exhausted = (
+            provider_monthly_limit is not None
+            and not remaining_balance_is_positive
+            and (
+                (
+                    account_status in {"active", "inactive"}
+                    and official_zero_balance
+                )
+                or (account_status == "inactive" and usage_reached_limit)
+            )
         )
         if account_status != "active" and not monthly_quota_exhausted:
             self._set_credential_preflight_status(
@@ -1880,6 +1926,14 @@ class SerpApiFlightOfferProvider:
                 search_id=None,
             )
             raise _AccountInactiveError("provider account is not active")
+        if monthly_quota_exhausted and (
+            monthly_usage is None or monthly_usage < provider_monthly_limit
+        ):
+            # A zero value in both official remaining-balance fields is direct
+            # exhaustion evidence even if the usage counter is absent or lags.
+            # Use the provider limit only as a conservative local stop; never
+            # send a search to discover the balance.
+            monthly_usage = provider_monthly_limit
         if (
             monthly_usage is None
             or hourly_usage is None

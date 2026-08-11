@@ -1001,9 +1001,11 @@ def test_env_factory_shares_searchapi_hotel_and_flight_lifetime_ledger(
     searchapi = provider.providers[1]
     client = _SearchApiClient(_searchapi_payload())
     searchapi._client = client
+    check_in = datetime.now(UTC).date() + timedelta(days=30)
+    check_out = check_in + timedelta(days=2)
 
     with pytest.raises(HotelPriceError) as error_info:
-        _search(provider)
+        _search(provider, check_in=check_in, check_out=check_out)
 
     searchapi_run = next(
         run

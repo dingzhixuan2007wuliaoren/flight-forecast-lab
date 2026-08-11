@@ -31,6 +31,7 @@ from flight_forecaster.availability import (
     _parse_google_segments,
     _RateLimitError,
     flight_offer_provider_from_env,
+    read_serpapi_quota_snapshot,
 )
 
 _FETCHED_AT = datetime(2026, 7, 15, 12, tzinfo=UTC)
@@ -240,10 +241,13 @@ class _Client:
         invalid: str | None = None,
         account_status: int = 200,
         search_status: int = 200,
-        account_usage: int = 0,
+        account_usage: Any = 0,
         hourly_usage: int = 0,
         hourly_limit: int = 50,
+        hourly_usage_field: str = "last_hour_searches",
         provider_monthly_limit: int = 250,
+        plan_searches_left: Any = None,
+        total_searches_left: Any = None,
         account_state: Any = "Active",
         plan_renewal_date: Any = "2026-08-01",
         search_created_at: str = _PROVIDER_CREATED_AT,
@@ -257,7 +261,10 @@ class _Client:
         self.account_usage = account_usage
         self.hourly_usage = hourly_usage
         self.hourly_limit = hourly_limit
+        self.hourly_usage_field = hourly_usage_field
         self.provider_monthly_limit = provider_monthly_limit
+        self.plan_searches_left = plan_searches_left
+        self.total_searches_left = total_searches_left
         self.account_state = account_state
         self.plan_renewal_date = plan_renewal_date
         self.search_created_at = search_created_at
@@ -279,8 +286,10 @@ class _Client:
                     "account_status": self.account_state,
                     "plan_renewal_date": self.plan_renewal_date,
                     "searches_per_month": self.provider_monthly_limit,
+                    "plan_searches_left": self.plan_searches_left,
+                    "total_searches_left": self.total_searches_left,
                     "this_month_usage": self.account_usage,
-                    "this_hour_searches": self.hourly_usage,
+                    self.hourly_usage_field: self.hourly_usage,
                     "account_rate_limit_per_hour": self.hourly_limit,
                 }
             )
@@ -1769,6 +1778,134 @@ def test_inactive_account_at_monthly_limit_is_verified_but_budget_exhausted(
     assert client.booking_calls == []
 
 
+@pytest.mark.parametrize("reported_usage", [None, "unavailable", 249])
+def test_inactive_account_with_official_zero_balance_is_budget_exhausted(
+    tmp_path: Path,
+    reported_usage: Any,
+) -> None:
+    client = _Client(
+        account_state="Inactive",
+        account_usage=reported_usage,
+        provider_monthly_limit=250,
+        plan_searches_left=0,
+        total_searches_left=0,
+    )
+    provider = _provider(tmp_path, client)
+
+    result = provider.search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert provider.credential_preflight_status.state == "verified"
+    assert provider.credential_preflight_status.exception_type is None
+    assert result.status == "budget_exhausted"
+    assert result.search_monthly_used == 250
+    assert result.calls_used == 0
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+@pytest.mark.parametrize("reported_usage", [None, "unavailable", 249])
+def test_active_account_with_official_zero_balance_is_budget_exhausted(
+    tmp_path: Path,
+    reported_usage: Any,
+) -> None:
+    client = _Client(
+        account_state="Active",
+        account_usage=reported_usage,
+        provider_monthly_limit=250,
+        plan_searches_left=0,
+        total_searches_left=0,
+    )
+    provider = _provider(tmp_path, client)
+
+    result = provider.search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert provider.credential_preflight_status.state == "verified"
+    assert provider.credential_preflight_status.exception_type is None
+    assert result.status == "budget_exhausted"
+    assert result.search_monthly_used == 250
+    assert result.calls_used == 0
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+def test_account_quota_accepts_legacy_this_hour_searches_alias(
+    tmp_path: Path,
+) -> None:
+    client = _Client(hourly_usage_field="this_hour_searches")
+    provider = _provider(tmp_path, client)
+
+    result = provider.search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert provider.credential_preflight_status.state == "verified"
+    assert result.status == "confirmed_offers"
+    assert len(client.account_calls) == 1
+    assert client.search_calls
+    assert client.booking_calls
+
+
+@pytest.mark.parametrize("account_state", ["Active", "Inactive"])
+def test_free_preflight_persists_official_zero_balance_for_provider_status(
+    tmp_path: Path,
+    account_state: str,
+) -> None:
+    client = _Client(
+        account_state=account_state,
+        account_usage=None,
+        provider_monthly_limit=250,
+        plan_searches_left=0,
+        total_searches_left=0,
+    )
+    provider = _provider(tmp_path, client)
+
+    status = provider.preflight_credentials()
+    snapshot = read_serpapi_quota_snapshot(
+        tmp_path / "private" / "usage.sqlite3",
+        hard_limit=250,
+        now=_FETCHED_AT,
+    )
+
+    assert status.state == "verified"
+    assert status.exception_type is None
+    assert snapshot.available is True
+    assert (snapshot.used, snapshot.limit, snapshot.remaining) == (250, 250, 0)
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
+def test_inactive_account_with_positive_official_balance_stays_authentication_failed(
+    tmp_path: Path,
+) -> None:
+    client = _Client(
+        account_state="Inactive",
+        account_usage=250,
+        provider_monthly_limit=250,
+        plan_searches_left=0,
+        total_searches_left=1,
+    )
+    provider = _provider(tmp_path, client)
+
+    result = provider.search(
+        "YYZ", "LHR", date(2026, 8, 20), fetched_at=_FETCHED_AT
+    )
+
+    assert provider.credential_preflight_status.state == "inactive"
+    assert provider.credential_preflight_status.exception_type == "AccountInactive"
+    assert result.status == "authentication_failed"
+    assert result.calls_used == 0
+    assert len(client.account_calls) == 1
+    assert client.search_calls == []
+    assert client.booking_calls == []
+
+
 def test_inactive_account_below_monthly_limit_remains_authentication_failed(
     tmp_path: Path,
 ) -> None:
@@ -1804,6 +1941,8 @@ def test_other_non_active_states_stay_blocked_even_at_monthly_limit(
         account_state=account_state,
         account_usage=250,
         provider_monthly_limit=250,
+        plan_searches_left=0,
+        total_searches_left=0,
     )
     provider = _provider(tmp_path, client)
 
