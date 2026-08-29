@@ -35,6 +35,24 @@ def test_main_page_loads_tracking_from_the_lowest_strictly_verified_offer() -> N
     assert "price_curve" in INDEX_PAGE
 
 
+def test_tracking_points_show_bilingual_date_and_price_tooltips() -> None:
+    assert 'class: "tracking-tooltip"' in INDEX_PAGE
+    assert 'role: "tooltip"' in INDEX_PAGE
+    assert 'class: "tracking-hit-point", tabindex: 0' in INDEX_PAGE
+    assert 'hitPoint.addEventListener("pointerenter"' in INDEX_PAGE
+    assert 'hitPoint.addEventListener("pointerleave"' in INDEX_PAGE
+    assert 'hitPoint.addEventListener("focus"' in INDEX_PAGE
+    assert 'hitPoint.addEventListener("blur"' in INDEX_PAGE
+    assert 'formatDate(point.time, false)' in INDEX_PAGE
+    assert 'formatCurrency(point.price, "USD", 2)' in INDEX_PAGE
+    assert 'forecast.slice(1).forEach' in INDEX_PAGE
+    assert '"trackingHistoryPoint"' in INDEX_PAGE
+    assert '"trackingCurrentPoint"' in INDEX_PAGE
+    assert '"trackingForecastPoint"' in INDEX_PAGE
+    assert "将鼠标移到或聚焦数据点可查看日期和价格" in INDEX_PAGE
+    assert "Hover over or focus a data point to view its date and price" in INDEX_PAGE
+
+
 def test_main_page_keeps_provider_chain_diagnostics_in_empty_state() -> None:
     assert "data.fare_search_metadata.notice" in INDEX_PAGE
     assert "body += \" \" + metadataNotice" in INDEX_PAGE
