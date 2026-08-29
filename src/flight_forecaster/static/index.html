@@ -681,6 +681,36 @@
     }
     .tracking-point { fill: #fff; stroke: var(--blue-600); stroke-width: 2; }
     .tracking-current-point { fill: var(--blue-600); stroke: #fff; stroke-width: 3; }
+    .tracking-forecast-point { fill: var(--blue-100); stroke: var(--blue-600); stroke-width: 1.5; }
+    .tracking-hit-point {
+      fill: transparent;
+      stroke: transparent;
+      pointer-events: all;
+      cursor: help;
+    }
+    .tracking-point-group:hover .tracking-point,
+    .tracking-point-group:focus-within .tracking-point,
+    .tracking-point-group:hover .tracking-forecast-point,
+    .tracking-point-group:focus-within .tracking-forecast-point {
+      fill: var(--blue-50);
+      stroke: var(--navy-900);
+      stroke-width: 3;
+    }
+    .tracking-point-group:hover .tracking-current-point,
+    .tracking-point-group:focus-within .tracking-current-point {
+      stroke: var(--navy-900);
+      stroke-width: 4;
+    }
+    .tracking-hit-point:focus { outline: none; }
+    .tracking-tooltip { pointer-events: none; }
+    .tracking-tooltip rect {
+      fill: var(--navy-950);
+      stroke: #fff;
+      stroke-width: 1;
+      filter: drop-shadow(0 3px 6px rgba(8, 21, 38, 0.22));
+    }
+    .tracking-tooltip-label { fill: var(--blue-100); font-size: 9px; font-weight: 760; }
+    .tracking-tooltip-price { fill: #fff; font-size: 12px; font-weight: 850; }
     .tracking-average { stroke: var(--navy-800); stroke-width: 1; }
 
     .tracking-legend {
@@ -2133,8 +2163,11 @@
           trackingAverage: "平均",
           trackingDeparture: "出发",
           trackingCurrentMarker: "当前",
+          trackingHistoryPoint: "历史价格",
+          trackingCurrentPoint: "当前已验证价格",
+          trackingForecastPoint: "预测价格",
           trackingChartTitle: "历史市场价格与未来模型预测",
-          trackingChartDescription: "实线为可用的来源市场历史，圆点为当前最低已验证报价，虚线为直到出发的模型预测。",
+          trackingChartDescription: "实线为可用的来源市场历史，圆点为当前最低已验证报价，虚线为直到出发的模型预测。将鼠标移到或聚焦数据点可查看日期和价格。",
           contextTitle: "预测上下文",
           contextHint: "每张卡片都显示数据状态、来源和观测时间。",
           weather: "实时 / 预测航空天气",
@@ -2407,8 +2440,11 @@
           trackingAverage: "Avg",
           trackingDeparture: "Departure",
           trackingCurrentMarker: "Current",
+          trackingHistoryPoint: "Historical price",
+          trackingCurrentPoint: "Current verified price",
+          trackingForecastPoint: "Forecast price",
           trackingChartTitle: "Historical market prices and future model forecast",
-          trackingChartDescription: "The solid line is available source market history, the dot is the current lowest verified fare, and the dotted line is the model forecast until departure.",
+          trackingChartDescription: "The solid line is available source market history, the dot is the current lowest verified fare, and the dotted line is the model forecast until departure. Hover over or focus a data point to view its date and price.",
           contextTitle: "Forecast context",
           contextHint: "Every card shows its data status, source, and observation time.",
           weather: "Live / forecast aviation weather",
@@ -3136,6 +3172,78 @@
         svg.replaceChildren();
         svg.appendChild(svgElement("title", { id: "tracking-chart-title" }, t("trackingChartTitle")));
         svg.appendChild(svgElement("desc", { id: "tracking-chart-description" }, t("trackingChartDescription")));
+        var tooltipWidth = 210;
+        var tooltipHeight = 48;
+        var tooltip = svgElement("g", {
+          class: "tracking-tooltip",
+          role: "tooltip",
+          visibility: "hidden",
+          "aria-hidden": "true"
+        });
+        var tooltipBox = svgElement("rect", {
+          x: 0, y: 0, width: tooltipWidth, height: tooltipHeight, rx: 7, ry: 7
+        });
+        var tooltipLabel = svgElement("text", {
+          x: 10, y: 18, class: "tracking-tooltip-label"
+        });
+        var tooltipPrice = svgElement("text", {
+          x: 10, y: 36, class: "tracking-tooltip-price"
+        });
+        tooltip.appendChild(tooltipBox);
+        tooltip.appendChild(tooltipLabel);
+        tooltip.appendChild(tooltipPrice);
+        function trackingPointText(point, kindKey) {
+          return t(kindKey) + " · " + formatDate(point.time, false) + " · " +
+            formatCurrency(point.price, "USD", 2);
+        }
+        function showTrackingTooltip(point, kindKey) {
+          tooltipLabel.textContent = t(kindKey) + " · " + formatDate(point.time, false);
+          tooltipPrice.textContent = formatCurrency(point.price, "USD", 2);
+          var pointX = x(point);
+          var pointY = y(point);
+          var tooltipX = pointX + 11;
+          if (tooltipX + tooltipWidth > 895) tooltipX = pointX - tooltipWidth - 11;
+          tooltipX = Math.max(5, tooltipX);
+          var tooltipY = pointY - tooltipHeight - 11;
+          if (tooltipY < 5) tooltipY = pointY + 11;
+          tooltipY = Math.min(280 - tooltipHeight - 5, tooltipY);
+          tooltip.setAttribute("transform", "translate(" + tooltipX.toFixed(2) + " " + tooltipY.toFixed(2) + ")");
+          tooltip.setAttribute("visibility", "visible");
+          tooltip.setAttribute("aria-hidden", "false");
+        }
+        function hideTrackingTooltip() {
+          tooltip.setAttribute("visibility", "hidden");
+          tooltip.setAttribute("aria-hidden", "true");
+        }
+        function appendTrackingPoint(point, className, radius, kindKey) {
+          var group = svgElement("g", { class: "tracking-point-group" });
+          var visualPoint = svgElement("circle", {
+            cx: x(point), cy: y(point), r: radius, class: className,
+            "aria-hidden": "true"
+          });
+          var hitPoint = svgElement("circle", {
+            cx: x(point), cy: y(point), r: Math.max(9, radius + 3),
+            class: "tracking-hit-point", tabindex: 0, focusable: "true",
+            "aria-label": trackingPointText(point, kindKey)
+          });
+          hitPoint.addEventListener("pointerenter", function () {
+            showTrackingTooltip(point, kindKey);
+          });
+          hitPoint.addEventListener("pointerleave", hideTrackingTooltip);
+          hitPoint.addEventListener("focus", function () {
+            showTrackingTooltip(point, kindKey);
+          });
+          hitPoint.addEventListener("blur", hideTrackingTooltip);
+          hitPoint.addEventListener("keydown", function (event) {
+            if (event.key === "Escape") {
+              hideTrackingTooltip();
+              hitPoint.blur();
+            }
+          });
+          group.appendChild(visualPoint);
+          group.appendChild(hitPoint);
+          svg.appendChild(group);
+        }
         [top, (top + bottom) / 2, bottom].forEach(function (gridY) {
           svg.appendChild(svgElement("line", {
             x1: left, y1: gridY, x2: right, y2: gridY, class: "tracking-grid"
@@ -3166,19 +3274,12 @@
           }));
         }
         history.forEach(function (point) {
-          var circle = svgElement("circle", {
-            cx: x(point), cy: y(point), r: 3.5, class: "tracking-point"
-          });
-          circle.appendChild(svgElement("title", {}, formatDate(point.time, false) + " · " +
-            formatCurrency(point.price, "USD", 2)));
-          svg.appendChild(circle);
+          appendTrackingPoint(point, "tracking-point", 3.5, "trackingHistoryPoint");
         });
-        var currentPoint = svgElement("circle", {
-          cx: x(current), cy: y(current), r: 7, class: "tracking-current-point"
+        appendTrackingPoint(current, "tracking-current-point", 7, "trackingCurrentPoint");
+        forecast.slice(1).forEach(function (point) {
+          appendTrackingPoint(point, "tracking-forecast-point", 3.5, "trackingForecastPoint");
         });
-        currentPoint.appendChild(svgElement("title", {}, t("trackingCurrentMarker") + " · " +
-          formatCurrency(current.price, "USD", 2)));
-        svg.appendChild(currentPoint);
         svg.appendChild(svgElement("text", {
           x: Math.max(left, Math.min(right - 65, x(current) - 26)),
           y: Math.max(top + 12, y(current) - 13),
@@ -3190,6 +3291,7 @@
         svg.appendChild(svgElement("text", {
           x: right - 42, y: 257, class: "tracking-axis"
         }, t("trackingDeparture")));
+        svg.appendChild(tooltip);
         return {
           history: history,
           current: current,
