@@ -35,6 +35,15 @@ def test_optional_site_basic_auth(monkeypatch) -> None:
     assert client.get("/", auth=("flight", "test-only-password")).status_code == 200
 
 
+def test_site_is_public_without_access_password(monkeypatch) -> None:
+    monkeypatch.delenv("SITE_ACCESS_PASSWORD", raising=False)
+    client = TestClient(app)
+
+    assert client.get("/").status_code == 200
+    assert client.get("/version").status_code == 200
+    assert client.post("/v1/predict/on-time", json={}).status_code == 422
+
+
 def test_structured_api_responses_are_never_cached(
     monkeypatch: pytest.MonkeyPatch,
     trained_model_dir: Path,

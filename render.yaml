@@ -19,10 +19,6 @@ services:
         value: "250"
       - key: SERPAPI_CREDENTIAL_PREFLIGHT_ENABLED
         value: "1"
-      - key: SITE_ACCESS_USERNAME
-        value: flight
-      - key: SITE_ACCESS_PASSWORD
-        sync: false
       - key: SERPAPI_API_KEY
         sync: false
       - key: SEARCHAPI_API_KEY
