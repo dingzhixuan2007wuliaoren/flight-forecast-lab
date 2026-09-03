@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -54,8 +55,59 @@ ROUTES = (
     ("JFK", "IST", 8_040, 585, 670),
 )
 
+# Stable metadata for every airport used by the deterministic demo generator.
+# Real training adapters should supply their own versioned country and timezone
+# fields; feature construction uses this table only as a backwards-compatible
+# fallback for the built-in demo routes.
+ROUTE_AIRPORT_METADATA: dict[str, tuple[str, str]] = {
+    "AKL": ("NZ", "Pacific/Auckland"),
+    "ATL": ("US", "America/New_York"),
+    "BOG": ("CO", "America/Bogota"),
+    "BOS": ("US", "America/New_York"),
+    "CAI": ("EG", "Africa/Cairo"),
+    "CDG": ("FR", "Europe/Paris"),
+    "DEL": ("IN", "Asia/Kolkata"),
+    "DEN": ("US", "America/Denver"),
+    "DFW": ("US", "America/Chicago"),
+    "DOH": ("QA", "Asia/Qatar"),
+    "DXB": ("AE", "Asia/Dubai"),
+    "FRA": ("DE", "Europe/Berlin"),
+    "GRU": ("BR", "America/Sao_Paulo"),
+    "HND": ("JP", "Asia/Tokyo"),
+    "IST": ("TR", "Europe/Istanbul"),
+    "JED": ("SA", "Asia/Riyadh"),
+    "JFK": ("US", "America/New_York"),
+    "JNB": ("ZA", "Africa/Johannesburg"),
+    "LAS": ("US", "America/Los_Angeles"),
+    "LAX": ("US", "America/Los_Angeles"),
+    "LHR": ("GB", "Europe/London"),
+    "LIM": ("PE", "America/Lima"),
+    "MAD": ("ES", "Europe/Madrid"),
+    "MEX": ("MX", "America/Mexico_City"),
+    "MIA": ("US", "America/New_York"),
+    "NRT": ("JP", "Asia/Tokyo"),
+    "ORD": ("US", "America/Chicago"),
+    "SCL": ("CL", "America/Santiago"),
+    "SEA": ("US", "America/Los_Angeles"),
+    "SFO": ("US", "America/Los_Angeles"),
+    "SIN": ("SG", "Asia/Singapore"),
+    "SYD": ("AU", "Australia/Sydney"),
+    "YVR": ("CA", "America/Vancouver"),
+    "YYZ": ("CA", "America/Toronto"),
+}
+AIRPORT_COUNTRY_BY_IATA = {
+    code: metadata[0] for code, metadata in ROUTE_AIRPORT_METADATA.items()
+}
+AIRPORT_TIMEZONE_BY_IATA = {
+    code: metadata[1] for code, metadata in ROUTE_AIRPORT_METADATA.items()
+}
+_ROUTE_AIRPORT_CODES = {code for route in ROUTES for code in route[:2]}
+if _ROUTE_AIRPORT_CODES != ROUTE_AIRPORT_METADATA.keys():  # pragma: no cover - invariant
+    raise RuntimeError("demo route airport metadata is incomplete or contains unused entries")
+
 _AIRLINE_PROFILES = comparison_airlines()
 AIRLINES = np.array([profile.code for profile in _AIRLINE_PROFILES])
+AIRLINE_SERVICE_MODEL = {profile.code: profile.service_model for profile in _AIRLINE_PROFILES}
 _SERVICE_PRICE = {"low_cost": 0.82, "hybrid": 0.93, "full_service": 1.04}
 _SERVICE_DISRUPTION = {"low_cost": 0.12, "hybrid": 0.04, "full_service": -0.05}
 
@@ -93,6 +145,31 @@ def _sample_routes(rng: np.random.Generator, rows: int) -> list[tuple[str, str, 
     return [ROUTES[index] for index in indices]
 
 
+def _local_departure_timestamps(
+    routes: list[tuple[str, str, int, int, int]],
+    local_dates: list[date],
+    local_hours: np.ndarray,
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray]:
+    """Create UTC instants from unambiguous origin-local demo clock times."""
+
+    local_values: list[pd.Timestamp] = []
+    for route, local_date, local_hour in zip(routes, local_dates, local_hours, strict=True):
+        timezone_name = AIRPORT_TIMEZONE_BY_IATA[route[0]]
+        local_value = (
+            pd.Timestamp(local_date)
+            .replace(hour=int(local_hour))
+            .tz_localize(timezone_name, ambiguous="raise", nonexistent="raise")
+        )
+        local_values.append(local_value)
+    utc_values = pd.DatetimeIndex([value.tz_convert("UTC") for value in local_values])
+    return (
+        utc_values,
+        np.asarray([value.month for value in local_values], dtype=int),
+        np.asarray([value.weekday() for value in local_values], dtype=int),
+        np.asarray([value.hour for value in local_values], dtype=int),
+    )
+
+
 def generate_demo_price_data(rows: int = 6_000, seed: int = 42) -> pd.DataFrame:
     """Create deterministic fare observations with realistic, learnable relationships."""
     if rows < 500:
@@ -106,15 +183,26 @@ def generate_demo_price_data(rows: int = 6_000, seed: int = 42) -> pd.DataFrame:
         + pd.to_timedelta(observed_day, unit="D")
         + pd.to_timedelta(observed_hour, unit="h")
     )
-    lead_days = np.clip(rng.gamma(shape=2.8, scale=18.0, size=rows).astype(int) + 2, 2, 180)
-    departure_hour = rng.choice([6, 8, 10, 13, 16, 18, 21], size=rows)
-    departure_time = (
-        quote_time.normalize()
-        + pd.to_timedelta(lead_days, unit="D")
-        + pd.to_timedelta(departure_hour, unit="h")
+    requested_lead_days = np.clip(
+        rng.gamma(shape=2.8, scale=18.0, size=rows).astype(int) + 2,
+        2,
+        180,
     )
+    departure_hour = rng.choice([6, 8, 10, 13, 16, 18, 21], size=rows)
+    local_departure_dates = [
+        pd.Timestamp(quote).tz_convert(AIRPORT_TIMEZONE_BY_IATA[route[0]]).date()
+        + timedelta(days=int(lead))
+        for quote, route, lead in zip(quote_time, routes, requested_lead_days, strict=True)
+    ]
+    departure_time, month, weekday, local_hour = _local_departure_timestamps(
+        routes,
+        local_departure_dates,
+        departure_hour,
+    )
+    lead_days = (departure_time - quote_time).total_seconds() / 86_400.0
 
     airline = rng.choice(AIRLINES, size=rows, p=AIRLINE_PROBABILITIES)
+    carrier_service_model = np.asarray([AIRLINE_SERVICE_MODEL[value] for value in airline])
     cabin = rng.choice(CABINS, size=rows, p=[0.82, 0.09, 0.075, 0.015])
     stops = rng.choice([0, 1, 2], size=rows, p=[0.72, 0.25, 0.03])
     news_disruption = np.clip(
@@ -122,9 +210,6 @@ def generate_demo_price_data(rows: int = 6_000, seed: int = 42) -> pd.DataFrame:
         0,
         1,
     )
-    month = departure_time.month.to_numpy()
-    weekday = departure_time.weekday.to_numpy()
-
     base_fare = np.array([route[4] for route in routes], dtype=float)
     distance_km = np.array([route[2] for route in routes], dtype=float)
     duration_minutes = np.array([route[3] for route in routes], dtype=float)
@@ -156,12 +241,18 @@ def generate_demo_price_data(rows: int = 6_000, seed: int = 42) -> pd.DataFrame:
             "departure_time": departure_time,
             "origin": [route[0] for route in routes],
             "destination": [route[1] for route in routes],
+            "origin_country": [AIRPORT_COUNTRY_BY_IATA[route[0]] for route in routes],
+            "destination_country": [AIRPORT_COUNTRY_BY_IATA[route[1]] for route in routes],
             "airline": airline,
+            "carrier_service_model": carrier_service_model,
             "cabin": cabin,
             "stops": stops,
             "duration_minutes": np.round(duration_minutes).astype(int),
             "distance_km": distance_km,
             "news_disruption_index": np.round(news_disruption, 4),
+            "departure_local_month": month,
+            "departure_local_weekday": weekday,
+            "departure_local_hour": local_hour,
             "price_usd": np.round(price, 2),
         }
     )
@@ -175,21 +266,22 @@ def generate_demo_ontime_data(rows: int = 8_000, seed: int = 43) -> pd.DataFrame
     routes = _sample_routes(rng, rows)
     scheduled_day = rng.integers(0, 1_000, size=rows)
     scheduled_hour = rng.choice([5, 6, 8, 10, 13, 16, 18, 20, 22], size=rows)
-    scheduled = (
-        pd.Timestamp("2023-01-01", tz="UTC")
-        + pd.to_timedelta(scheduled_day, unit="D")
-        + pd.to_timedelta(scheduled_hour, unit="h")
+    local_scheduled_dates = [
+        date(2023, 1, 1) + timedelta(days=int(day)) for day in scheduled_day
+    ]
+    scheduled, month, weekday, local_hour = _local_departure_timestamps(
+        routes,
+        local_scheduled_dates,
+        scheduled_hour,
     )
     airline = rng.choice(AIRLINES, size=rows, p=AIRLINE_PROBABILITIES)
+    carrier_service_model = np.asarray([AIRLINE_SERVICE_MODEL[value] for value in airline])
     news_disruption = np.clip(
         rng.beta(0.8, 8.0, size=rows) + (rng.random(rows) < 0.025) * rng.uniform(0.4, 0.9, rows),
         0,
         1,
     )
     distance_km = np.array([route[2] for route in routes], dtype=float)
-    month = scheduled.month.to_numpy()
-    weekday = scheduled.weekday.to_numpy()
-
     winter = np.isin(month, [1, 2, 12]).astype(float)
     weather = np.clip(rng.beta(1.6, 5.5, size=rows) + winter * rng.uniform(0.0, 0.25, rows), 0, 1)
     airport_base = {
@@ -207,7 +299,7 @@ def generate_demo_ontime_data(rows: int = 8_000, seed: int = 43) -> pd.DataFrame
     }
     origin_congestion = np.array([airport_base.get(route[0], 0.56) for route in routes])
     origin_congestion = np.clip(origin_congestion + rng.normal(0, 0.09, rows), 0, 1)
-    peak = np.isin(scheduled_hour, [6, 8, 16, 18, 20]).astype(float)
+    peak = np.isin(local_hour, [6, 8, 16, 18, 20]).astype(float)
     weekend = np.isin(weekday, [5, 6]).astype(float)
     carrier_effect = np.array([AIRLINE_DISRUPTION_EFFECT[value] for value in airline])
 
@@ -240,11 +332,17 @@ def generate_demo_ontime_data(rows: int = 8_000, seed: int = 43) -> pd.DataFrame
             "scheduled_departure": scheduled,
             "origin": [route[0] for route in routes],
             "destination": [route[1] for route in routes],
+            "origin_country": [AIRPORT_COUNTRY_BY_IATA[route[0]] for route in routes],
+            "destination_country": [AIRPORT_COUNTRY_BY_IATA[route[1]] for route in routes],
             "airline": airline,
+            "carrier_service_model": carrier_service_model,
             "distance_km": distance_km,
             "weather_severity_forecast": np.round(weather, 4),
             "origin_congestion_index": np.round(origin_congestion, 4),
             "news_disruption_index": np.round(news_disruption, 4),
+            "departure_local_month": month,
+            "departure_local_weekday": weekday,
+            "departure_local_hour": local_hour,
             "cancelled": cancelled.astype(int),
             "arrival_delay_minutes": np.round(arrival_delay, 1),
             "on_time": on_time,

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import os
-from datetime import UTC, date, datetime
+from dataclasses import asdict
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -20,6 +22,10 @@ from flight_forecaster.destination_guide import (
     DestinationValidationError,
     build_destination_guide_service,
     validate_transit_departure_at,
+)
+from flight_forecaster.hotel_model import (
+    load_hotel_price_model,
+    predict_hotel_price,
 )
 from flight_forecaster.hotel_prices import (
     HotelPriceError,
@@ -102,8 +108,46 @@ class HotelPriceDetailRequest(HotelPricesRequest):
         return self
 
 
+class HotelModelPriceRequest(_RequestModel):
+    """Prediction-time hotel attributes; no provider price is a model feature."""
+
+    destination: str = Field(pattern=r"^[A-Za-z]{3}$")
+    check_in: date
+    check_out: date
+    adults: int = Field(default=1, ge=1, le=8)
+    property_type: Literal["hotel", "hostel", "guest_house", "motel", "apartment"] = (
+        "hotel"
+    )
+    hotel_class: float | None = Field(default=None, ge=1, le=5, allow_inf_nan=False)
+    rating: float | None = Field(default=None, ge=0, le=5, allow_inf_nan=False)
+    review_count: int | None = Field(default=None, ge=0, le=100_000_000)
+    distance_from_city_center_km: float | None = Field(
+        default=None, ge=0, le=2_000, allow_inf_nan=False
+    )
+    distance_from_airport_km: float | None = Field(
+        default=None, ge=0, le=2_000, allow_inf_nan=False
+    )
+    amenity_count: int | None = Field(default=None, ge=0, le=200)
+    free_cancellation: bool | None = None
+    current_nightly_price_anchor_usd: float | None = Field(
+        default=None, gt=0, le=100_000, allow_inf_nan=False
+    )
+    language: Literal["zh-cn", "en"] = "zh-cn"
+
+    @model_validator(mode="after")
+    def validate_stay(self) -> HotelModelPriceRequest:
+        nights = (self.check_out - self.check_in).days
+        if not 1 <= nights <= 30:
+            raise ValueError("hotel stay must contain 1 to 30 nights")
+        return self
+
+
 def _runtime_dir() -> Path:
     return Path(os.getenv("MODEL_DIR", "artifacts/demo")).parent / "runtime"
+
+
+def _model_dir() -> Path:
+    return Path(os.getenv("MODEL_DIR", "artifacts/demo"))
 
 
 @lru_cache(maxsize=1)
@@ -118,6 +162,15 @@ def get_destination_guide_service() -> DestinationGuideService:
 @lru_cache(maxsize=1)
 def get_hotel_price_provider() -> StrictHotelPriceProviderPool:
     return hotel_price_provider_from_env(_runtime_dir() / "serpapi-usage.sqlite3")
+
+
+@lru_cache(maxsize=4)
+def _load_hotel_model_cached(model_dir_value: str) -> dict[str, object]:
+    return load_hotel_price_model(model_dir_value)
+
+
+def get_hotel_model_bundle() -> dict[str, object]:
+    return _load_hotel_model_cached(str(_model_dir().resolve()))
 
 
 def _language(value: Language) -> Literal["zh-cn", "en"]:
@@ -221,6 +274,51 @@ def _hotel_stay_hours(
         label = "退房" if language == "zh-cn" else "Check-out"
         parts.append(f"{label} {offer.check_out_time}")
     return " · ".join(parts) or None
+
+
+def _hotel_quote_times(now: datetime, check_in: date, *, point_count: int = 9) -> list[datetime]:
+    lead_days = (check_in - now.date()).days
+    if lead_days < 0:
+        raise ValueError("check_in cannot be before the current date")
+    if lead_days > 370:
+        raise ValueError("check_in must be within 370 days")
+    if lead_days == 0:
+        return [now]
+    offsets = {
+        round(index * lead_days / (point_count - 1))
+        for index in range(point_count)
+    }
+    return [now + timedelta(days=offset) for offset in sorted(offsets)]
+
+
+def _anchor_hotel_prediction(
+    prediction: dict[str, object],
+    *,
+    log_offset: float,
+) -> dict[str, object]:
+    """Rebase a model path to a separately verified price without making it a feature."""
+
+    anchored = dict(prediction)
+
+    def adjust(name: str) -> float:
+        raw = float(prediction[name])
+        return round(max(0.0, math.expm1(math.log1p(raw) + log_offset)), 2)
+
+    point = adjust("estimated_nightly_price_usd")
+    low = adjust("interval_80_low_usd")
+    high = adjust("interval_80_high_usd")
+    nights = int(prediction["stay_nights"])
+    anchored.update(
+        {
+            "estimated_nightly_price_usd": point,
+            "interval_80_low_usd": low,
+            "interval_80_high_usd": high,
+            "estimated_stay_total_usd": round(point * nights, 2),
+            "interval_80_total_low_usd": round(low * nights, 2),
+            "interval_80_total_high_usd": round(high * nights, 2),
+        }
+    )
+    return anchored
 
 
 def _destination_error(exc: Exception) -> HTTPException:
@@ -451,6 +549,130 @@ def destination_hotel_prices(request: HotelPricesRequest) -> dict[str, object]:
             run.as_safe_dict() for run in result.provider_runs
         ],
         "quota_warning": warning,
+    }
+
+
+@router.post("/v1/predict/hotel-price")
+def predict_destination_hotel_price(
+    request: HotelModelPriceRequest,
+) -> dict[str, object]:
+    """Return a local model estimate without querying or consuming provider quota."""
+
+    try:
+        bundle = get_hotel_model_bundle()
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise HTTPException(status_code=503, detail="hotel model artifact is not ready") from exc
+
+    now = datetime.now(UTC)
+    row = request.model_dump(
+        exclude={"current_nightly_price_anchor_usd", "language"}
+    )
+    optional_factor_names = (
+        "hotel_class",
+        "rating",
+        "review_count",
+        "distance_from_city_center_km",
+        "distance_from_airport_km",
+        "amenity_count",
+        "free_cancellation",
+    )
+    try:
+        quote_times = _hotel_quote_times(now, request.check_in)
+        raw_points = [
+            asdict(predict_hotel_price(bundle, row, quote_time=quote_time))
+            for quote_time in quote_times
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    log_offset = 0.0
+    anchor = None
+    if request.current_nightly_price_anchor_usd is not None:
+        raw_current = float(raw_points[0]["estimated_nightly_price_usd"])
+        log_offset = math.log1p(request.current_nightly_price_anchor_usd) - math.log1p(
+            raw_current
+        )
+        anchor = {
+            "status": "caller_supplied_price_anchor",
+            "current_nightly_price_anchor_usd": request.current_nightly_price_anchor_usd,
+            "method": "constant log1p offset applied to the future model path",
+            "evidence_policy": (
+                "the caller must separately establish that this is a current price for "
+                "the same property, dates, occupancy, currency, and price basis"
+            ),
+        }
+
+    points: list[dict[str, object]] = []
+    for quote_time, raw in zip(quote_times, raw_points, strict=True):
+        point = (
+            _anchor_hotel_prediction(raw, log_offset=log_offset)
+            if anchor is not None
+            else raw
+        )
+        point["prediction_as_of"] = quote_time.isoformat()
+        points.append(point)
+
+    metadata = bundle.get("metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    destination_coverage = metadata.get("destination_coverage", {})
+    destination_coverage = (
+        destination_coverage if isinstance(destination_coverage, dict) else {}
+    )
+    known_destinations = {
+        str(value).upper()
+        for value in destination_coverage.get("known_destination_codes", [])
+        if isinstance(value, str)
+    }
+    destination = request.destination.upper()
+    data_mode = str(metadata.get("data_mode", "unknown"))
+    selected_feature_set = str(bundle.get("selected_feature_set", "unknown"))
+    provided_factors = [
+        name for name in optional_factor_names if getattr(request, name) is not None
+    ]
+    missing_factors = [name for name in optional_factor_names if name not in provided_factors]
+    warnings = [str(points[0]["warning_en"] if request.language == "en" else points[0]["warning"])]
+    if destination not in known_destinations:
+        warnings.append(
+            "目的地未出现在训练样本中，结果属于样本外估算。"
+            if request.language != "en"
+            else "The destination was unseen in training, so this is an out-of-sample estimate."
+        )
+    if missing_factors and selected_feature_set == "enriched":
+        warnings.append(
+            "部分酒店属性缺失并由训练集统计量填补，结果不是完整酒店画像。"
+            if request.language != "en"
+            else "Some property attributes were missing and imputed from training data."
+        )
+    if anchor is not None:
+        warnings.append(
+            "调用方价格只用于锚定整条预测路径；服务端不会自行把它认定为真实报价，且锚定后的区间不再具有原始经验覆盖保证。"
+            if request.language != "en"
+            else (
+                "The caller-supplied price only anchors the forecast path; the server does "
+                "not independently verify it, and the adjusted interval no longer carries "
+                "the original empirical coverage guarantee."
+            )
+        )
+    return {
+        "status": "model_estimate",
+        "currency": "USD",
+        "observed_at": now.isoformat(),
+        "current_estimate": points[0],
+        "check_in_estimate": points[-1],
+        "forecast_points": points,
+        "anchor": anchor,
+        "selected_feature_set": selected_feature_set,
+        "selected_features": metadata.get("selected_features", []),
+        "provided_optional_factors": provided_factors,
+        "missing_optional_factors": missing_factors,
+        "destination_coverage": (
+            "known" if destination in known_destinations else "unseen"
+        ),
+        "data_mode": data_mode,
+        "synthetic_demo": bool(metadata.get("synthetic_demo", False)),
+        "external_provider_called": False,
+        "provider_quota_consumed": False,
+        "warnings": warnings,
     }
 
 

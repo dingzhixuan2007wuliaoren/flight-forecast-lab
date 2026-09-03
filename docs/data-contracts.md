@@ -25,7 +25,7 @@
 | `destination` | string | 是 | 到达机场，3 位字母或数字；不得与起点相同 |
 | `airline` | string | 是 | 2–3 位字母或数字；营销/票务口径在训练与推理间必须一致 |
 | `cabin` | string | 否 | `economy`、`premium_economy`、`business` 或 `first`；默认 `economy` |
-| `stops` | integer | 否 | 经停/转机次数，范围 0–3；默认 0 |
+| `stops` | integer | 否 | 经停/转机次数，范围 0–7；默认 0，与最多八段严格行程上限一致 |
 | `departure_time` | datetime | 是 | 计划起飞时刻，必须带时区、晚于服务接收时刻且不超过其后 370 天；`quote_time` 已从公开请求删除 |
 
 服务根据 `origin`、`destination` 和 `stops` 自动生成 `distance_km` 与 `duration_minutes`，常规请求不得手工覆盖。训练表仍须包含真实或经过验证的距离与时长，并在上述字段基础上增加：
@@ -36,6 +36,9 @@
 | `duration_minutes` | integer | 训练特征；计划总行程时长，`30 < value <= 1800` |
 | `distance_km` | number | 训练特征；行程或市场距离，`50 < value <= 20000` |
 | `news_disruption_index` | number | 报价时刻可获得的近期航线新闻风险快照，范围 `[0, 1]`；不得使用事后新闻 |
+| `origin_country` / `destination_country` | string / null | 可选的版本化 ISO 国家码；缺失时服务可从机场目录派生，无法解析则保持未知 |
+| `route_scope` | string | 从上述国家码派生的 `domestic`、`international` 或 `unknown`；当前只作为候选消融因素，不由公开请求直接指定 |
+| `carrier_service_model` | string | 版本化航司目录提供的 `full_service`、`hybrid`、`low_cost` 或 `unknown`；当前只作为候选消融因素 |
 | `sample_weight` | number / null | 可选，例如 O&D 的旅客数；必须为正且不得导致重复加权 |
 | `source` | string | 数据来源，如 `synthetic`、`bts_db1b`、`bts_db1c` |
 | `source_record_id` | string / null | 可追溯但不进入模型的源记录键 |
@@ -56,6 +59,40 @@
 服务保证 `interval_80_low_usd <= estimated_price_usd <= interval_80_high_usd`，且下界不小于 0。
 
 区间针对单次未来价格观测，不应解释为“80% 概率价格一定落在此范围”的无条件保证；其覆盖依赖部署分布与校准分布的一致性。
+
+机票训练会在相同训练行上比较 legacy、仅 `route_scope`、仅 `carrier_service_model` 与两者合并四个候选。候选选择只看时间上更晚的 selection 段；先在每个报价日期内求 MAE，再对日期等权平均。新增候选必须同时达到预注册的 US$0.50 MAE 改善、至少五个独立报价日期块，以及按日期整块重采样并对三个候选做 Bonferroni 校正的配对 bootstrap 下界大于零，才启用新增因素。系统先筛选每个候选，再从全部合格者中选 selection MAE 最低者。再用后一段 conformal calibration 计算区间，最终 test 只报告一次，形成 `train -> selection -> conformal calibration -> test`，不得用 test 反向选择因素；同一时间戳的报价快照不会跨段拆分。
+
+## 酒店价格预测 API
+
+端点：`POST /v1/predict/hotel-price`
+
+该端点加载独立的 `hotel_model_bundle.joblib`，不会调用 SerpApi、SearchAPI 或其他外部酒店供应商，也不会预留或消耗供应商额度。它返回模型估算而非实时、可订或最终结账价格。
+
+### 请求字段
+
+| 字段 | 类型 | 必填 | 约束与语义 |
+| --- | --- | --- | --- |
+| `destination` | string | 是 | 三位目的地机场代码；服务会转为大写 |
+| `check_in` / `check_out` | date | 是 | 住宿必须为 1–30 晚；入住日不得早于服务 UTC 当前日期且不超过其后 370 天 |
+| `adults` | integer | 否 | 1–8，默认 1 |
+| `property_type` | string | 否 | 仅允许 `hotel`、`hostel`、`guest_house`、`motel`、`apartment`，默认 `hotel`；未知或其他类型以 422 拒绝，不自动映射为 `unknown` |
+| `hotel_class` | number / null | 否 | 1–5 星；缺失保持 null，不伪装为零星 |
+| `rating` | number / null | 否 | 0–5 的同一物业 as-of 评分快照 |
+| `review_count` | integer / null | 否 | 非负；模型内部使用 `log1p`，必须与评分来自同一时点物业身份 |
+| `distance_from_city_center_km` | number / null | 否 | 非负的物业至版本化城市中心距离 |
+| `distance_from_airport_km` | number / null | 否 | 非负的物业至目的地机场距离 |
+| `amenity_count` | integer / null | 否 | 0–200；规范化、去重且当时可见的设施数量 |
+| `free_cancellation` | boolean / null | 否 | 与物业价格证据同一时点的状态；null 与 false 必须区分 |
+| `current_nightly_price_anchor_usd` | number / null | 否 | 大于 0 且不超过 US$100,000 的调用方锚点；仅在原始预测后锚定展示曲线，绝不进入模型特征，也不因存在而被服务称为已验证 |
+| `language` | string | 否 | `zh-cn` 或 `en`，默认 `zh-cn`，只影响提示语言 |
+
+### 输出语义
+
+响应 `status=model_estimate`，并返回 `current_estimate`、`check_in_estimate` 与最多九项 `forecast_points`。每个点包含每晚点估计、每晚 80% 区间、住宿总额点估计/区间、晚数、入住提前期、因素集合、数据模式和用途警告。顶层还返回 `selected_features`、已提供/缺失的可选因素、目的地是否见于训练、`synthetic_demo`、`external_provider_called=false` 和 `provider_quota_consumed=false`。
+
+若请求提供锚点，`anchor.status=caller_supplied_price_anchor`，服务在原始预测完成后对所有点施加同一个 `log1p` 偏移。服务不把任意客户端输入自行称为“已验证”；当前酒店详情页只有在严格酒店报价成功后才会传入该字段。该值不是模型特征，不改变训练产物；锚定路径仍不是可订报价，调整后区间也不再具有原始经验覆盖保证。未提供时 `anchor=null`。
+
+训练 CSV 的最低酒店字段为 `quote_time`（带时区）、`destination`、`check_in`、`check_out`、`adults`、上述五类之一的 `property_type` 和正数目标 `nightly_price_usd`。可选 enriched 字段与请求同名；当前真实每晚/总价、房源 ID、供应商令牌、预订 URL 和入住后结果都不得进入特征。训练按 `train -> selection -> conformal calibration -> test` 的时间顺序，在 selection 比较 core/enriched，在后一段以 `log1p` 绝对残差校准 80% 区间。
 
 ## 准点预测 API
 
@@ -241,8 +278,9 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 
 | 方法与路径 | 用途 |
 | --- | --- |
-| `GET /health` | 进程与模型加载健康状态；不代表模型仍然准确 |
-| `GET /v1/model-info` | 模型版本、训练来源、时间和可用任务信息 |
+| `GET /health` | 分别返回 `model_ready` 与 `hotel_model_ready`；`status=ok` 只表示两个受信任本地产物都可加载，不代表模型仍然准确 |
+| `GET /ready` | 航班或酒店任一产物缺失、schema 不匹配或不可加载时返回 503；成功时两个 ready 字段均为 true |
+| `GET /v1/model-info` | 航班与独立酒店模型的版本、训练来源、时间、因素集合和指标；酒店缺失时明确 `hotel_price_model.status=not_ready` |
 | `POST /v1/compare` | 用三个输入处理四舱搜索实际返回的全部合格候选；SerpApi、SearchAPI 与显式发布后的 Ignav 仅受各自真实额度和供应商响应限制，返回已严格验证 offer、partial / quota-limited 覆盖信息及三类排序；不表示全球全量 |
 | `GET /details/offer` | 每个比较 offer 的中英双语航班/模型行程详情页面 |
 | `POST /v1/offer-detail` | 按 `offer_id` 返回再次通过购票选项验证的 provider schedule；无法验证时返回结构化失败 |
@@ -254,6 +292,7 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 | `POST /v1/destination/place-detail` | 返回 OSM 地点详情、道路图路线，以及 Transitous 或配额受控 SerpApi Google Maps Directions 回退返回的完整公共交通行程；两者均无真实结果时返回明确不可用状态 |
 | `POST /v1/destination/hotel-prices` | 用户显式触发严格 Google Hotels 住宿报价搜索；SerpApi 失败时顺序回退到已配置的 SearchAPI.io，并返回脱敏 `provider_runs`。只有所有已配置来源成功完成且均为空时才返回 `no_results` |
 | `POST /v1/destination/hotel-price-detail` | 用 `hotel_id` 或 OSM `place_id` 二选一严格确认同一家酒店，并返回真实房型价格、跨平台评分/评价与机场交通 |
+| `POST /v1/predict/hotel-price` | 只读独立本地酒店模型，不调用外部 provider；返回明确标注的合成/真实数据模式、预测路径和可选事后锚定元数据 |
 
 健康响应不得暴露本地绝对路径、密钥或原始训练记录。所有 provider 凭据都不得进入浏览器/前端、仓库或应用日志；服务端只把凭据发送给对应的 HTTPS provider，完整外部请求 URL 不得记录。模型信息应能让调用方识别是否误用了 `synthetic` 演示模型。
 
@@ -265,6 +304,7 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 - 起飞月份、星期、小时和周末标志；
 - 由出发机场 IANA 时区得到的本地月份、星期和小时；训练表可显式提供 `departure_local_month`、`departure_local_weekday`、`departure_local_hour`，服务推理时会自动生成；
 - 标准化航线键（方向性是否保留需由任务声明）；
+- 由版本化起终点国家码得到 `route_scope=domestic|international|unknown`，以及由版本化航司目录得到 `carrier_service_model=full_service|hybrid|low_cost|unknown`；它们只有通过当前时间选择段门槛才进入部署模型；
 - 根据机场坐标或版本化航线表推算距离/时长，并保留来源标记；
 - 在预测时刻获取天气预报、机场运行和近七日新闻；新闻优先使用 15 分钟航线缓存，失败时只允许使用不超过 6 小时且标为 `historical` 的旧缓存，否则中性回退；
 - `news_disruption_index` 同时进入票价与准点模型；票价模型不使用天气；机场运行信号进入准点模型，天气仅在状态为 `live` 或 `forecast` 时进入含天气准点模型，其他状态通过 `weather_feature_status=ignored` 切换到无天气模型；
@@ -285,6 +325,7 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 - 同一 `source_record_id` 出现冲突目标；
 - 源表连接后行数异常膨胀；
 - 使用实际到达、实际天气或延误原因作为未来预测输入。
+- 酒店 `property_type` 不在五类固定枚举内，或把当前房价、总价、供应商胜出来源、房源令牌/URL、最终入住率和入住后评价作为酒店特征。
 
 适配器应输出质量报告：输入行数、接收行数、各拒绝原因数量、缺失率、重复率、标签比例和时间范围。
 
@@ -296,6 +337,6 @@ GDELT DOC 查询无需密钥，使用近七日窗口与 `DateDesc`；DOC 失败�
 - 改变单位、枚举、标签或必填字段：不兼容的大版本；
 - 适配器必须拒绝未知的大版本，而不是猜测转换。
 
-当前演示模型使用 `schema_version = 3`；该版本保留服务端自动解析天气与机场运行的接口，并增加无天气准点模型与 `weather_feature_status`，确保不适用的 proxy/历史天气不会被静默当作准点预测输入。
+当前航班演示产物使用 `artifact_schema_version = 4`：它保留服务端自动解析天气与机场运行的接口、无天气准点模型与 `weather_feature_status`，并加入可审计的机票因素候选选择元数据。独立酒店产物固定为 `hotel_model_schema_version = 1`，文件名为 `hotel_model_bundle.joblib`；加载器对未知 schema fail closed。`train-demo` 会同时生成两个产物，`train-csv --hotel-price-csv ...` 可在同一目录生成自定义酒店产物，`predict-hotel-price` CLI 使用该独立产物且不允许调用方覆盖 `quote_time`。
 
 API 客户端应以 `/v1/` 为稳定主版本边界，并读取 `/v1/model-info` 判断模型来源与版本。批量推理时还应保存请求模式版本、模型版本和预测时间，以便复现。

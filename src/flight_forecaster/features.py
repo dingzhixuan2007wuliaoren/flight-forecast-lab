@@ -3,8 +3,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-PRICE_CATEGORICAL_FEATURES = ["origin", "destination", "route", "airline", "cabin"]
-PRICE_NUMERIC_FEATURES = [
+from flight_forecaster.catalog import get_airline_profile
+from flight_forecaster.data import AIRPORT_COUNTRY_BY_IATA
+
+LEGACY_PRICE_CATEGORICAL_FEATURES = [
+    "origin",
+    "destination",
+    "route",
+    "airline",
+    "cabin",
+]
+LEGACY_PRICE_NUMERIC_FEATURES = [
     "stops",
     "duration_minutes",
     "distance_km",
@@ -18,6 +27,11 @@ PRICE_NUMERIC_FEATURES = [
     "departure_hour_cos",
     "is_weekend",
 ]
+PRICE_CATEGORICAL_FEATURES = LEGACY_PRICE_CATEGORICAL_FEATURES + [
+    "route_scope",
+    "carrier_service_model",
+]
+PRICE_NUMERIC_FEATURES = list(LEGACY_PRICE_NUMERIC_FEATURES)
 PRICE_FEATURES = PRICE_CATEGORICAL_FEATURES + PRICE_NUMERIC_FEATURES
 
 ONTIME_CATEGORICAL_FEATURES = ["origin", "destination", "route", "airline"]
@@ -55,6 +69,46 @@ def _codes(frame: pd.DataFrame) -> pd.DataFrame:
         result[column] = result[column].astype(str).str.strip().str.upper()
     result["route"] = result["origin"] + "-" + result["destination"]
     return result
+
+
+def _country_codes(frame: pd.DataFrame, column: str, airport_column: str) -> pd.Series:
+    fallback = frame[airport_column].map(AIRPORT_COUNTRY_BY_IATA).astype("string")
+    if column not in frame:
+        return fallback
+    supplied = frame[column].astype("string").str.strip().str.upper()
+    valid = supplied.str.fullmatch(r"[A-Z]{2}", na=False)
+    return supplied.where(valid, fallback)
+
+
+def _route_scope(frame: pd.DataFrame) -> pd.Series:
+    origin_country = _country_codes(frame, "origin_country", "origin")
+    destination_country = _country_codes(frame, "destination_country", "destination")
+    known = origin_country.notna() & destination_country.notna()
+    same_country = origin_country.eq(destination_country).fillna(False).to_numpy(dtype=bool)
+    values = np.where(same_country, "domestic", "international")
+    return pd.Series(values, index=frame.index).where(known, "unknown")
+
+
+def _catalog_service_model(airline: object) -> str:
+    profile = get_airline_profile(str(airline))
+    return profile.service_model if profile is not None else "unknown"
+
+
+def _carrier_service_model(frame: pd.DataFrame) -> pd.Series:
+    fallback = frame["airline"].map(_catalog_service_model)
+    if "carrier_service_model" not in frame:
+        return fallback
+    supplied = (
+        frame["carrier_service_model"]
+        .astype("string")
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[-\s]+", "_", regex=True)
+    )
+    missing = supplied.isna() | supplied.eq("")
+    allowed = supplied.isin({"full_service", "hybrid", "low_cost", "unknown"})
+    normalized = supplied.where(allowed, "unknown")
+    return normalized.where(~missing, fallback)
 
 
 def _local_time_parts(
@@ -98,6 +152,8 @@ def build_price_features(frame: pd.DataFrame) -> pd.DataFrame:
     result = _codes(frame)
     if "news_disruption_index" not in result:
         result["news_disruption_index"] = 0.0
+    result["route_scope"] = _route_scope(result)
+    result["carrier_service_model"] = _carrier_service_model(result)
     quote_time = pd.to_datetime(result["quote_time"], utc=True, errors="raise")
     departure_time = pd.to_datetime(result["departure_time"], utc=True, errors="raise")
     lead_days = (departure_time - quote_time).dt.total_seconds() / 86_400.0

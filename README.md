@@ -1,12 +1,12 @@
 # Flight Forecast Lab / 全球航班预测实验室
 
-Flight Forecast Lab 是一个可复现的双任务机器学习项目，用于比较未来行程的**模型票价**与**准点概率**。主页只要求输入出发机场、到达机场和出发日期；距离、飞行时长、天气、机场运行压力和近期新闻均由系统自动解析。
+Flight Forecast Lab 是一个可复现的多任务机器学习项目，用于比较未来行程的**模型票价**与**准点概率**，并为目的地住宿提供独立的**酒店价格模型估算**。主页只要求输入出发机场、到达机场和出发日期；距离、飞行时长、天气、机场运行压力和近期新闻均由系统自动解析。
 
-Flight Forecast Lab is a reproducible dual-task project with one fare model and two on-time variants for comparing **estimated fares** and **on-time probabilities**. The dashboard only asks for origin, destination, and departure date; distance, duration, weather, airport operations, and recent news are resolved automatically.
+Flight Forecast Lab is a reproducible multi-task project with an airfare model, two on-time variants, and an independent hotel-price model. The dashboard compares **estimated fares** and **on-time probabilities**, while destination hotel pages can request a separately labelled local model estimate. Distance, duration, weather, airport operations, and recent news are resolved automatically.
 
-> 重要：默认票价预测与准点率模型使用确定性的合成演示数据训练。配置受支持的严格报价源（SerpApi、SearchAPI.io，或完成双开关显式发布后的 Ignav）后，主价格可显示经购票选项二次验证的来源结果报价；该结果可能使用 provider 缓存。模型估价、价格曲线和准点率仍不是经过全球真实数据验证的生产预测。
+> 重要：默认机票、酒店价格预测与准点率模型都使用确定性的合成演示数据训练。配置受支持的严格报价源（SerpApi、SearchAPI.io，或完成双开关显式发布后的 Ignav）后，主价格可显示经购票选项二次验证的来源结果报价；该结果可能使用 provider 缓存。所有模型估价、价格曲线和准点率仍不是经过全球真实数据验证的生产预测。
 >
-> Important: the default fare and on-time models use deterministic synthetic demo data. With a supported strict fare source configured (SerpApi, SearchAPI.io, or Ignav only after its two explicit release switches), the primary price can be a provider-result fare that also passed booking-option verification; that result may use provider caching. The model estimate, price curve, and on-time probability remain unvalidated demo predictions.
+> Important: the default airfare, hotel-price, and on-time models use deterministic synthetic demo data. With a supported strict fare source configured (SerpApi, SearchAPI.io, or Ignav only after its two explicit release switches), the primary price can be a provider-result fare that also passed booking-option verification; that result may use provider caching. Every model estimate, forecast curve, and on-time probability remains an unvalidated demo prediction.
 
 ## 功能 / Features
 
@@ -19,6 +19,8 @@ Flight Forecast Lab is a reproducible dual-task project with one fare model and 
 - 无需密钥的 Open-Meteo 当前天气/小时预报与 NOAA METAR/TAF 航空气象；美国机场使用 FAA NAS Status 当前运行事件，其他机场可使用 AirLabs 航班样本或 ADSB.lol 飞机密度代理；新闻来自无需密钥的 GDELT。
 - 天气和新闻卡片以及每个严格确认报价均可进入独立的中英双语详情页；offer 详情含真实返回航段、转机等待时间与逐日价格模型预测曲线，天气和新闻页支持手动刷新，并分别每 10 分钟、15 分钟自动刷新。
 - 外部服务超时、无数据或额度不足时，界面会明确标记回退或截断。票价模型不使用天气；准点率仅在天气状态为 `live` 或 `forecast` 时使用含天气模型，其他状态自动切换为无天气模型并显示“本次准点预测已忽略天气变量”。
+- 机票训练同时评估 legacy、仅 `route_scope`、仅 `carrier_service_model` 和两者合并四个候选；只有时间上更晚的选择段达到预注册的实际改善与配对 bootstrap 门槛时才启用新增因素，测试段不参与选择。
+- 独立酒店模型使用入住提前期、住宿晚数、周末晚占比、目的地和五类规范化住宿类型；增强候选可加入星级、评分/评论量、距市中心/机场、设施数与免费取消状态。它保存在单独的 `hotel_model_bundle.joblib`，不会把当前真实房价当作输入特征。
 - FastAPI、OpenAPI 文档、CLI 训练入口、时间切分评估和自动测试。
 
 The UI always labels external context as `live`, `forecast`, `proxy`, `historical`, or `neutral`. Missing policy information remains `unknown`; the service never converts “unknown” into “not included.”
@@ -62,7 +64,7 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-训练并启动：
+训练并启动（一次命令会生成航班产物与独立的 `hotel_model_bundle.joblib`）：
 
 ```powershell
 python -m flight_forecaster train-demo --output artifacts/demo
@@ -74,6 +76,8 @@ python -m flight_forecaster serve --model-dir artifacts/demo
 - 双语页面 / bilingual dashboard: <http://127.0.0.1:8000/>
 - API 文档 / API docs: <http://127.0.0.1:8000/docs>
 - 健康检查 / health: <http://127.0.0.1:8000/health>
+
+`/health` 与 `/ready` 都分别返回 `model_ready` 和 `hotel_model_ready`；`/ready` 只有在两个受信任的本地产物都可加载时才成功。
 
 先在主页完成一次比较，再点击天气、新闻卡片或任一 offer 的“查看详情 / View details”。详情链接在当前标签页打开并可复制分享；返回主页时，浏览器会话中的表单、排序和最近一次比较结果会恢复。
 
@@ -288,6 +292,35 @@ Tax inclusion is unknown.
 
 天气严重度、出发机场拥堵、距离和飞行时长均不再由调用方提交。
 
+独立酒店价格模型：`POST /v1/predict/hotel-price`
+
+```json
+{
+  "destination": "LHR",
+  "check_in": "2026-09-15",
+  "check_out": "2026-09-18",
+  "adults": 2,
+  "property_type": "hotel",
+  "hotel_class": 4,
+  "rating": 4.4,
+  "review_count": 850,
+  "distance_from_city_center_km": 2.1,
+  "distance_from_airport_km": 24.0,
+  "amenity_count": 12,
+  "free_cancellation": true
+}
+```
+
+该端点只加载本地 `hotel_model_bundle.joblib`，不会调用外部酒店供应商或消耗额度。`property_type` 只接受 `hotel`、`hostel`、`guest_house`、`motel` 和 `apartment`；其他值以 422 拒绝，绝不自动猜成 `unknown`。响应含当前估算、入住时估算、最多九个预测点、每晚/整段住宿 80% 区间、实际使用的因素和缺失因素。可选的 `current_nightly_price_anchor_usd` 只是 `caller_supplied_price_anchor`：它仅在原始模型预测完成后，用一个固定 `log1p` 偏移锚定整条展示曲线，不进入模型特征，且服务不会因调用方传入这个数字就声称它已经验证。酒店详情页只有在严格酒店报价成功后才传入该锚点。锚定后的区间不再声称具有原始经验覆盖保证。CLI 使用相同的未锚定本地模型：
+
+```powershell
+python -m flight_forecaster predict-hotel-price `
+  --input path/to/hotel_price_request.json `
+  --model-dir artifacts/demo
+```
+
+The hotel endpoint is local and quota-free. It accepts only the five property types above, returns a clearly labelled model path, and never treats the optional caller-supplied price anchor as a feature or proof of verification. That value can only rebase the already-produced path for display; the hotel page supplies it only after a strict quote succeeds, and it does not turn the projection into a live or bookable quote.
+
 ## 详情页面与接口 / Detail pages and APIs
 
 详情页面由主页生成带查询参数的可分享链接，并在当前标签页打开：
@@ -348,6 +381,10 @@ The base place list consumes no hotel-quote allowance. An explicit Check real de
 
 The detail page renders only returned room names, nightly/total and pre-tax amounts, guests, beds, breakfast, cancellation deadlines, inclusions, seller, and safe booking links. It also separates provider-returned Google, Tripadvisor, Trip.com, or other platform ratings, counts, one review excerpt, and the original-review link. Evidence is merged only after hotel name, coordinates, and provider property identity prove the same property. API keys, property tokens, SerpApi internal links, and raw errors never enter the sanitized one-hour cache, frontend, or logs. Missing room/platform fields remain unavailable; tax treatment and final inventory must still be confirmed at checkout.
 
+酒店详情页还会调用无需额度的本地 `POST /v1/predict/hotel-price`，把模型估算与上面的严格真实价格区域分开显示。当前演示酒店模型的 core 因素是目的地、五类物业类型、成人数、入住提前期、晚数、周末晚占比和入住日历；enriched 候选再加入星级、评分、`log1p` 评论量、距市中心/机场、设施数、免费取消状态及其“是否已知”指示。训练只在更晚的选择段选择 core/enriched，随后用另一段校准 80% 区间，最终测试保持不可见。默认数据仍是合成演示数据，模型不预测税费、库存、退款条款或最终结账金额，也不会替代严格酒店查询。
+
+The hotel detail page also calls the quota-free local prediction endpoint and keeps its output separate from strict provider evidence. The default hotel artifact is synthetic, selects core versus enriched factors on a later chronological segment, calibrates its interval on a separate segment, and evaluates once on the final holdout. It does not predict taxes, inventory, refund terms, or checkout totals and never substitutes for the strict hotel search.
+
 ## 新闻如何进入预测 / How news affects predictions
 
 系统通过无需 API 密钥的 GDELT DOC 2.0 查询最近 7 天内与起点、终点及航空中断词相关的文章，并使用 `DateDesc` 按 GDELT 最新观察时间排序。DOC 请求失败时会尝试 GDELT 官方 GAL RSS：该 RSS 每分钟更新，保留最近约 15 分钟的文章。相同航线的成功结果缓存 15 分钟；实时来源暂时失败时可返回不超过 6 小时、明确标为 `historical` 且降低模型影响的旧缓存；没有可用缓存才返回值 0、状态 `neutral`，且绝不虚构标题。
@@ -371,10 +408,13 @@ python -m ruff check src tests
 python -m flight_forecaster train-csv `
   --price-csv data/processed/price.csv `
   --ontime-csv data/processed/on_time.csv `
+  --hotel-price-csv data/processed/hotel_price.csv `
   --output artifacts/custom
 ```
 
-详细字段见 [数据契约](docs/data-contracts.md)，真实训练来源见 [数据来源](docs/data-sources.md)，评估边界见 [模型卡](MODEL_CARD.md)。
+`--hotel-price-csv` 是可选项；提供时会在同一输出目录写入独立的 `hotel_model_bundle.joblib`。部署健康检查要求酒店产物存在，因此用于服务的正式模型目录应同时构建航班与酒店产物。机票和酒店价格模型都按 `train -> selection -> conformal calibration -> test` 的时间顺序训练：候选因素只看 selection，80% 区间只看后续 calibration，最终 test 只报告一次。准点模型仍使用时间顺序的 70/15/15 切分，不把测试段用于训练或选择。
+
+详细字段见 [数据契约](docs/data-contracts.md)，因素的采用/暂缓/拒绝理由和当前候选消融结果见 [价格预测因素审计](docs/price-factor-audit.md)，真实训练来源见 [数据来源](docs/data-sources.md)，评估边界见 [模型卡](MODEL_CARD.md)。
 
 ## 关键限制 / Key limitations
 

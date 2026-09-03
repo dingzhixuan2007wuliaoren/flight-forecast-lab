@@ -3,6 +3,11 @@ from pathlib import Path
 import pytest
 
 from flight_forecaster.data import generate_demo_ontime_data, generate_demo_price_data
+from flight_forecaster.hotel_model import (
+    generate_demo_hotel_price_data,
+    save_hotel_price_model,
+    train_hotel_price_model,
+)
 from flight_forecaster.training import train_models
 
 
@@ -61,4 +66,10 @@ def trained_model_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
         data_mode="pytest_synthetic",
         random_state=42,
     )
+    hotel_bundle = train_hotel_price_model(
+        generate_demo_hotel_price_data(rows=1_500, seed=44),
+        data_mode="synthetic_pytest",
+        random_state=44,
+    )
+    save_hotel_price_model(hotel_bundle, output)
     return output

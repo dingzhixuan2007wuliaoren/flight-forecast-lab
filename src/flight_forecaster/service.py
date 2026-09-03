@@ -142,6 +142,7 @@ class _GenericAirlineProfile:
     student_status: str = "unknown"
     change_status: str = "unknown"
     refund_status: str = "unknown"
+    service_model: str = "unknown"
     student_age_limit_zh: str = "未知；请向航司核实。"
     student_age_limit_en: str = "Unknown; verify with the airline."
     student_verification_zh: str = "未知；请向航司核实。"
@@ -384,7 +385,12 @@ class PredictionService:
         return timezone, timezone_name
 
     @staticmethod
-    def _departure_at_origin(value: datetime, airport: Airport) -> tuple[datetime, str]:
+    def _departure_at_origin(
+        value: datetime,
+        airport: Airport,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[datetime, str]:
         timezone, timezone_name = PredictionService._airport_timezone(airport)
 
         if value.tzinfo is None or value.utcoffset() is None:
@@ -403,7 +409,9 @@ class PredictionService:
         else:
             departure = value.astimezone(timezone)
 
-        now = datetime.now(UTC)
+        now = now or datetime.now(UTC)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise RouteLookupError("prediction reference time must include a timezone offset")
         departure_utc = departure.astimezone(UTC)
         if departure_utc <= now:
             raise RouteLookupError("计划出发时间必须晚于当前时间 / departure must be in the future")
@@ -1267,6 +1275,13 @@ class PredictionService:
                     "distance_km": route.distance_km,
                     "duration_minutes": route.duration_minutes,
                     "news_disruption_index": news_disruption_index,
+                    "origin_country": route.origin.country,
+                    "destination_country": route.destination.country,
+                    "carrier_service_model": (
+                        get_airline_profile(airline).service_model
+                        if get_airline_profile(airline) is not None
+                        else "unknown"
+                    ),
                     **_local_time_features(departure_time),
                 }
             ]
@@ -1362,9 +1377,13 @@ class PredictionService:
         return "high"
 
     def predict_price(self, request: PriceRequest) -> PricePrediction:
-        quote_time = datetime.now(UTC)
+        quote_time = self._now_provider()
         route = self._route(request.origin, request.destination, request.stops)
-        departure_time, _ = self._departure_at_origin(request.departure_time, route.origin)
+        departure_time, _ = self._departure_at_origin(
+            request.departure_time,
+            route.origin,
+            now=quote_time,
+        )
         context = self._context(route, departure_time)
         estimate, low, high, lead_days = self._price_values(
             origin=request.origin,
@@ -1756,6 +1775,9 @@ class PredictionService:
                 "distance_km": scenario.distance_km,
                 "duration_minutes": scenario.duration_minutes,
                 "news_disruption_index": context.news.value,
+                "origin_country": route.origin.country,
+                "destination_country": route.destination.country,
+                "carrier_service_model": scenario.profile.service_model,
                 **_local_time_features(scenario.departure_time),
             }
             for scenario in scenarios
@@ -2161,6 +2183,13 @@ class PredictionService:
                     "distance_km": curve_distance_km,
                     "duration_minutes": offer.duration_minutes,
                     "news_disruption_index": comparison.context.news.value,
+                    "origin_country": route.origin.country,
+                    "destination_country": route.destination.country,
+                    "carrier_service_model": (
+                        get_airline_profile(offer.airline_code).service_model
+                        if get_airline_profile(offer.airline_code) is not None
+                        else "unknown"
+                    ),
                     **_local_time_features(departure),
                 }
                 for quote_time in quote_times

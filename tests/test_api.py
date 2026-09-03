@@ -116,11 +116,13 @@ def test_health_and_predictions(monkeypatch, trained_model_dir: Path) -> None:
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json()["model_ready"] is True
+    assert health.json()["hotel_model_ready"] is True
     ready = client.get("/ready")
     assert ready.status_code == 200
     assert ready.json() == {
         "status": "ready",
         "model_ready": True,
+        "hotel_model_ready": True,
         "build_sha": "unknown",
         "branch": "unknown",
     }
@@ -263,6 +265,7 @@ def test_health_and_ready_expose_only_sanitized_render_build_metadata(
     assert health.json() == {
         "status": "ok",
         "model_ready": True,
+        "hotel_model_ready": True,
         "fare_provider_configured": False,
         "fare_provider_environment": "disabled",
         "build_sha": build_sha,
@@ -272,6 +275,7 @@ def test_health_and_ready_expose_only_sanitized_render_build_metadata(
     assert ready.json() == {
         "status": "ready",
         "model_ready": True,
+        "hotel_model_ready": True,
         "build_sha": build_sha,
         "branch": branch,
     }

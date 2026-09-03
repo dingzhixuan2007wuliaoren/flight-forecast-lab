@@ -21,14 +21,46 @@ from flight_forecaster.schemas import (
     PriceRequest,
 )
 from flight_forecaster.service import PredictionService
-from flight_forecaster.training import ARTIFACT_FILENAME
+from flight_forecaster.training import ARTIFACT_FILENAME, _paired_absolute_error_delta
+
+
+def test_factor_bootstrap_uses_equal_weight_per_quote_date() -> None:
+    evidence = _paired_absolute_error_delta(
+        np.zeros(4),
+        np.array([2.0, 2.0, 2.0, 0.0]),
+        np.ones(4),
+        random_state=42,
+        groups=np.array(["2026-01-01"] * 3 + ["2026-01-02"]),
+    )
+
+    assert evidence["mean_mae_improvement_usd"] == pytest.approx(0.0)
+    assert evidence["bootstrap_unit"] == "quote_date_equal_weighted"
+    assert evidence["independent_block_count"] == 2
 
 
 def test_training_writes_versioned_artifacts_and_beats_baselines(
     trained_model_dir: Path,
 ) -> None:
     bundle = joblib.load(trained_model_dir / ARTIFACT_FILENAME)
-    assert bundle["artifact_schema_version"] == 3
+    assert bundle["artifact_schema_version"] == 4
+    assert bundle["price_feature_variant"] in {
+        "legacy",
+        "route_scope",
+        "carrier_service_model",
+        "enriched",
+    }
+    factor_selection = bundle["metrics"]["price"]["factor_selection"]
+    assert factor_selection["selection_window"].startswith("chronological first half")
+    assert factor_selection["interval_window"].startswith("chronological second half")
+    assert factor_selection["multiple_comparison_method"].startswith("Bonferroni")
+    assert factor_selection["per_candidate_confidence_level"] == pytest.approx(
+        1 - 0.05 / 3
+    )
+    assert set(factor_selection["candidate_eligibility"]) == {
+        "route_scope",
+        "carrier_service_model",
+        "enriched",
+    }
     assert "ontime_model_without_weather" in bundle
     assert bundle["metrics"]["price"]["mae_usd"] < bundle["metrics"]["price"]["baseline_mae_usd"]
     assert (

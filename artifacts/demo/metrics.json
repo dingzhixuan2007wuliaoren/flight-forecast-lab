@@ -1,24 +1,105 @@
 {
   "on_time": {
     "accuracy_at_0_5": 0.6041666666666666,
-    "baseline_brier_score": 0.24279281462585034,
-    "brier_score": 0.2345079826746966,
-    "log_loss": 0.662232856360249,
-    "roc_auc": 0.6132485004186212
+    "baseline_brier_score": 0.24289936224489797,
+    "brier_score": 0.23465548707328585,
+    "log_loss": 0.6625308849597402,
+    "roc_auc": 0.6131298803639229
   },
   "on_time_without_weather": {
-    "accuracy_at_0_5": 0.5733333333333334,
-    "baseline_brier_score": 0.24279281462585034,
-    "brier_score": 0.24396582606226333,
-    "log_loss": 0.6817441263593365,
-    "roc_auc": 0.5483421454049157
+    "accuracy_at_0_5": 0.5933333333333334,
+    "baseline_brier_score": 0.24289936224489797,
+    "brier_score": 0.24326431608372664,
+    "log_loss": 0.6801334723343473,
+    "roc_auc": 0.5422637724765383
   },
   "price": {
-    "baseline_mae_usd": 366.62531111111116,
-    "interval_80_empirical_coverage": 0.8122222222222222,
-    "interval_80_mean_width_usd": 220.357301275895,
-    "mae_usd": 73.98616857573963,
-    "r2": 0.9553350770603634,
-    "rmse_usd": 119.5363575849455
+    "baseline_mae_usd": 365.88186666666667,
+    "factor_selection": {
+      "candidate_eligibility": {
+        "carrier_service_model": {
+          "eligible": false,
+          "has_enough_independent_blocks": true,
+          "improvement_over_legacy_usd": -0.38289973931044585,
+          "meets_practical_threshold": false,
+          "meets_uncertainty_threshold": false
+        },
+        "enriched": {
+          "eligible": false,
+          "has_enough_independent_blocks": true,
+          "improvement_over_legacy_usd": 0.401433010644098,
+          "meets_practical_threshold": false,
+          "meets_uncertainty_threshold": false
+        },
+        "route_scope": {
+          "eligible": false,
+          "has_enough_independent_blocks": true,
+          "improvement_over_legacy_usd": -0.5850145500060506,
+          "meets_practical_threshold": false,
+          "meets_uncertainty_threshold": false
+        }
+      },
+      "candidate_selection_evidence": {
+        "carrier_service_model": {
+          "bootstrap_confidence_level": 0.9833333333333333,
+          "bootstrap_high_usd": 1.7272577175632842,
+          "bootstrap_low_usd": -2.6008883947789547,
+          "bootstrap_unit": "quote_date_equal_weighted",
+          "independent_block_count": 77,
+          "mean_mae_improvement_usd": -0.3828997393104572
+        },
+        "enriched": {
+          "bootstrap_confidence_level": 0.9833333333333333,
+          "bootstrap_high_usd": 2.645052522731784,
+          "bootstrap_low_usd": -1.7567474322658037,
+          "bootstrap_unit": "quote_date_equal_weighted",
+          "independent_block_count": 77,
+          "mean_mae_improvement_usd": 0.4014330106440918
+        },
+        "route_scope": {
+          "bootstrap_confidence_level": 0.9833333333333333,
+          "bootstrap_high_usd": 0.5149991193380072,
+          "bootstrap_low_usd": -1.7125499160752373,
+          "bootstrap_unit": "quote_date_equal_weighted",
+          "independent_block_count": 77,
+          "mean_mae_improvement_usd": -0.5850145500060662
+        }
+      },
+      "candidate_selection_mae_usd": {
+        "carrier_service_model": 74.56595197515487,
+        "enriched": 73.78161922520033,
+        "legacy": 74.18305223584443,
+        "route_scope": 74.76806678585048
+      },
+      "enriched_calibration_mae_usd": 73.78161922520033,
+      "enriched_factors": [
+        "route_scope",
+        "carrier_service_model"
+      ],
+      "familywise_confidence_level": 0.95,
+      "interval_window": "chronological second half of calibration",
+      "legacy_calibration_mae_usd": 74.18305223584443,
+      "minimum_independent_quote_date_blocks": 5,
+      "multiple_comparison_method": "Bonferroni-adjusted paired block bootstrap",
+      "paired_test_delta": {
+        "bootstrap_confidence_level": 0.95,
+        "bootstrap_high_usd": 0.0,
+        "bootstrap_low_usd": 0.0,
+        "bootstrap_unit": "quote_date_equal_weighted",
+        "independent_block_count": 159,
+        "mean_mae_improvement_usd": 0.0
+      },
+      "per_candidate_confidence_level": 0.9833333333333333,
+      "pre_registered_minimum_improvement_usd": 0.5,
+      "selected_factors": [],
+      "selected_variant": "legacy",
+      "selection_window": "chronological first half of calibration",
+      "synthetic_validation_only": true
+    },
+    "interval_80_empirical_coverage": 0.7977777777777778,
+    "interval_80_mean_width_usd": 211.9777208062078,
+    "mae_usd": 73.03748299774463,
+    "r2": 0.9547791008214721,
+    "rmse_usd": 119.88829184596797
   }
 }

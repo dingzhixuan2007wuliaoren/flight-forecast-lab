@@ -25,7 +25,13 @@ from flight_forecaster.alternate_fare_providers import (
 )
 from flight_forecaster.availability import read_serpapi_quota_snapshot
 from flight_forecaster.destination_guide import DESTINATION_SOURCE_REGISTRY
-from flight_forecaster.destination_routes import router as destination_router
+from flight_forecaster.destination_routes import (
+    get_hotel_model_bundle,
+)
+from flight_forecaster.destination_routes import (
+    router as destination_router,
+)
+from flight_forecaster.hotel_model import HOTEL_ARTIFACT_FILENAME
 from flight_forecaster.quota_status import QuotaLedgerSnapshot
 from flight_forecaster.route_info import RouteLookupError
 from flight_forecaster.schemas import (
@@ -1102,6 +1108,14 @@ def provider_details_page() -> FileResponse:
 def health() -> dict[str, str | bool]:
     deployment = _deployment_metadata()
     artifact_exists = (model_dir() / ARTIFACT_FILENAME).exists()
+    hotel_artifact_exists = (model_dir() / HOTEL_ARTIFACT_FILENAME).exists()
+    hotel_model_ready = False
+    if hotel_artifact_exists:
+        try:
+            get_hotel_model_bundle()
+            hotel_model_ready = True
+        except (FileNotFoundError, ValueError, OSError):
+            hotel_model_ready = False
     service: PredictionService | None = None
     if artifact_exists:
         try:
@@ -1110,13 +1124,15 @@ def health() -> dict[str, str | bool]:
             return {
                 "status": "model_not_ready",
                 "model_ready": False,
+                "hotel_model_ready": hotel_model_ready,
                 "fare_provider_configured": False,
                 "fare_provider_environment": "disabled",
                 **deployment,
             }
     return {
-        "status": "ok" if artifact_exists else "model_not_trained",
+        "status": "ok" if artifact_exists and hotel_model_ready else "model_not_trained",
         "model_ready": artifact_exists,
+        "hotel_model_ready": hotel_model_ready,
         "fare_provider_configured": bool(
             service is not None and service.flight_offer_provider.configured
         ),
@@ -1133,11 +1149,19 @@ def readiness() -> dict[str, str | bool]:
 
     if not (model_dir() / ARTIFACT_FILENAME).exists():
         raise HTTPException(status_code=503, detail="model artifact is missing")
+    if not (model_dir() / HOTEL_ARTIFACT_FILENAME).exists():
+        raise HTTPException(status_code=503, detail="hotel model artifact is missing")
     try:
         get_service()
+        get_hotel_model_bundle()
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="model artifact is not loadable") from exc
-    return {"status": "ready", "model_ready": True, **_deployment_metadata()}
+    return {
+        "status": "ready",
+        "model_ready": True,
+        "hotel_model_ready": True,
+        **_deployment_metadata(),
+    }
 
 
 @app.get("/version")
@@ -1149,7 +1173,24 @@ def version() -> dict[str, str]:
 
 @app.get("/v1/model-info")
 def model_info() -> dict:
-    return _service_or_503().model_info()
+    payload = _service_or_503().model_info()
+    try:
+        hotel_bundle = get_hotel_model_bundle()
+    except (FileNotFoundError, ValueError, OSError):
+        payload["hotel_price_model"] = {"status": "not_ready"}
+    else:
+        hotel_metadata = hotel_bundle.get("metadata", {})
+        payload["hotel_price_model"] = {
+            "status": "ready",
+            "model_version": hotel_metadata.get("model_version"),
+            "data_mode": hotel_metadata.get("data_mode"),
+            "synthetic_demo": hotel_metadata.get("synthetic_demo"),
+            "selected_feature_set": hotel_bundle.get("selected_feature_set"),
+            "selected_features": hotel_metadata.get("selected_features", []),
+            "metrics": hotel_bundle.get("metrics", {}),
+            "target_definition": hotel_metadata.get("target_definition"),
+        }
+    return payload
 
 
 @app.get("/v1/provider-status", response_model=RuntimeProviderStatusResponse)

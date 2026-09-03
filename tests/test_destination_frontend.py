@@ -129,6 +129,20 @@ def test_place_detail_is_source_safe_and_renders_airport_routes() -> None:
 
     assert 'fetchJson("/v1/destination/place-detail"' in detail
     assert 'fetchJson("/v1/destination/hotel-price-detail"' in detail
+    assert 'id="hotel-model-panel"' in detail
+    assert 'id="hotel-model-button"' in detail
+    assert 'fetch("/v1/predict/hotel-price"' in detail
+    assert '"external_provider_called"' not in detail
+    assert "酒店价格模型估算" in detail
+    assert "这不是实时可订报价" in detail
+    assert 'document.addEventListener("destination-place-loaded"' in detail
+    assert 'document.addEventListener("hotel-real-price-loaded"' in detail
+    assert "current_nightly_price_anchor_usd" in detail
+    assert "verifiedNightlyContext===quoteContext()" in detail
+    assert "clearVerifiedNightly" in detail
+    assert "unsupported property type" in detail
+    assert "6371*2*Math.atan2" in detail
+    assert "car.distance_km" not in detail
     assert '["car","bicycle","foot"]' in detail
     assert 'mode==="bike"||mode==="cycling"' in detail
     assert "transport.options" in detail
